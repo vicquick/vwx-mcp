@@ -1,6 +1,6 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 116 tools, pure Python, no C++ compilation.**
+**Vectorworks 2026 MCP server — 150 tools, pure Python, no C++ compilation.**
 
 Mirrors the QGIS MCP architecture: FastMCP HTTP bridge → TCP socket → Python plugin inside Vectorworks.
 
@@ -10,7 +10,7 @@ Mirrors the QGIS MCP architecture: FastMCP HTTP bridge → TCP socket → Python
 Claude Code
     │ streamable-http :8082
     ▼
-mcp-server/vw_mcp_server.py     (FastMCP)
+mcp-server/vwx_mcp_server.py    (FastMCP)
     │ TCP :9878, JSON newline-delimited (persistent, multi-message)
     ▼
 vwx-plugin/vw_mcp_bridge.py      (runs inside Vectorworks)
@@ -26,14 +26,14 @@ Dialog events observed on VW2026 (for reference): setup=12255, teardown=12256, t
 ## Install
 
 1. Copy `vwx-plugin/` contents to `%APPDATA%\Nemetschek\Vectorworks\2026\Plug-ins\VWX-MCP\`
-2. Copy `mcp-server/vw_mcp_server.py` to `%USERPROFILE%\.local\share\vwx-mcp\`
+2. Copy `mcp-server/vwx_mcp_server.py` to `%USERPROFILE%\.local\share\vwx-mcp\`
 3. Copy `bridge/vwx-mcp.bat` to `%USERPROFILE%\bridge\`
 4. Ensure `python` on PATH. Install deps: `pip install mcp fastmcp`
 
 ## Run
 
 1. Launch Vectorworks 2026
-2. In VW: `File → Scripts → Run Script` → pick `vw_mcp_bridge.py` from plugin dir
+2. In VW: `File → Scripts → Run Script` → pick `vwx_mcp_bridge.py` from plugin dir
 3. Dialog shows **"Active — TCP :9878"** (keeps VW in modal event loop so main-thread pump works)
 4. Outside VW: double-click `bridge\vwx-mcp.bat` → FastMCP listens on `http://127.0.0.1:8082/mcp`
 5. Add MCP client config:

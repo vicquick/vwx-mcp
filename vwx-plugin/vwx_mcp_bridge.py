@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-VW MCP Bridge — runs inside Vectorworks 2026 as a Workspace Script.
+VWX MCP Bridge — runs inside Vectorworks 2026 as a Workspace Script.
 
 Workflow:
-  1. VW -> Scripts menu -> Run Script -> vw_mcp_bridge.py
+  1. VW -> Scripts menu -> Run Script -> vwx_mcp_bridge.py
   2. Dialog appears "Active on :9878 [Stop]"
-  3. Run bridge/vw-mcp.bat outside VW
-  4. Claude Code has 116 tools controlling VW
+  3. Run bridge/vwx-mcp.bat outside VW
+  4. Claude Code has 150 tools controlling VW
 
 ALL vs.* calls happen on VW main thread via RegisterDialogForTimerEvents.
 Socket I/O runs in a background thread. Thread-safe queue bridges them.
