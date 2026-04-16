@@ -110,7 +110,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 
 mcp = FastMCP(
     "vw-mcp",
-    instructions="Vectorworks 2026 integration via MCP — 116 tools controlling live Vectorworks desktop",
+    instructions="Vectorworks 2026 integration via MCP — 125+ tools controlling live Vectorworks desktop. Object IDs are UUIDs (strings) returned by vs.GetObjectUuid.",
     host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("FASTMCP_PORT", "8082")),
     lifespan=server_lifespan
@@ -269,8 +269,8 @@ def get_objects(ctx: Context, layer: str = None, obj_class: str = None,
     return cmd("get_objects", p)
 
 @mcp.tool()
-def get_object_info(ctx: Context, object_id: int) -> str:
-    """Get detailed info for one object by InternalIndex id"""
+def get_object_info(ctx: Context, object_id: str) -> str:
+    """Get detailed info for one object by UUID"""
     return cmd("get_object_info", {"object_id": object_id})
 
 @mcp.tool()
@@ -280,7 +280,7 @@ def get_selected_objects(ctx: Context) -> str:
 
 @mcp.tool()
 def select_objects(ctx: Context, object_ids: list) -> str:
-    """Select objects by their InternalIndex ids"""
+    """Select objects by their UUIDs"""
     return cmd("select_objects", {"object_ids": object_ids})
 
 @mcp.tool()
@@ -289,7 +289,7 @@ def deselect_all(ctx: Context) -> str:
     return cmd("deselect_all")
 
 @mcp.tool()
-def get_object_bounds(ctx: Context, object_id: int) -> str:
+def get_object_bounds(ctx: Context, object_id: str) -> str:
     """Get bounding box of an object in document units"""
     return cmd("get_object_bounds", {"object_id": object_id})
 
@@ -313,12 +313,12 @@ def find_objects_by_name(ctx: Context, name: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def move_object(ctx: Context, object_id: int, dx: float, dy: float) -> str:
+def move_object(ctx: Context, object_id: str, dx: float, dy: float) -> str:
     """Move object by delta dx, dy in document units"""
     return cmd("move_object", {"object_id": object_id, "dx": dx, "dy": dy})
 
 @mcp.tool()
-def rotate_object(ctx: Context, object_id: int, angle: float,
+def rotate_object(ctx: Context, object_id: str, angle: float,
                   cx: float = None, cy: float = None) -> str:
     """Rotate object by angle (degrees). Optional center cx,cy; defaults to object center."""
     p = {"object_id": object_id, "angle": angle}
@@ -327,7 +327,7 @@ def rotate_object(ctx: Context, object_id: int, angle: float,
     return cmd("rotate_object", p)
 
 @mcp.tool()
-def scale_object(ctx: Context, object_id: int, sx: float, sy: float,
+def scale_object(ctx: Context, object_id: str, sx: float, sy: float,
                  cx: float = None, cy: float = None) -> str:
     """Scale object. sx/sy are scale factors. Optional center point."""
     p = {"object_id": object_id, "sx": sx, "sy": sy}
@@ -336,27 +336,27 @@ def scale_object(ctx: Context, object_id: int, sx: float, sy: float,
     return cmd("scale_object", p)
 
 @mcp.tool()
-def delete_object(ctx: Context, object_id: int) -> str:
+def delete_object(ctx: Context, object_id: str) -> str:
     """Delete an object by id"""
     return cmd("delete_object", {"object_id": object_id})
 
 @mcp.tool()
-def duplicate_object(ctx: Context, object_id: int, dx: float = 0, dy: float = 0) -> str:
+def duplicate_object(ctx: Context, object_id: str, dx: float = 0, dy: float = 0) -> str:
     """Duplicate an object, optionally offset by dx/dy"""
     return cmd("duplicate_object", {"object_id": object_id, "dx": dx, "dy": dy})
 
 @mcp.tool()
-def set_object_layer(ctx: Context, object_id: int, layer: str) -> str:
+def set_object_layer(ctx: Context, object_id: str, layer: str) -> str:
     """Move object to a different layer"""
     return cmd("set_object_layer", {"object_id": object_id, "layer": layer})
 
 @mcp.tool()
-def set_object_class(ctx: Context, object_id: int, obj_class: str) -> str:
+def set_object_class(ctx: Context, object_id: str, obj_class: str) -> str:
     """Change object class"""
     return cmd("set_object_class", {"object_id": object_id, "class": obj_class})
 
 @mcp.tool()
-def set_object_name(ctx: Context, object_id: int, name: str) -> str:
+def set_object_name(ctx: Context, object_id: str, name: str) -> str:
     """Set object name"""
     return cmd("set_object_name", {"object_id": object_id, "name": name})
 
@@ -366,12 +366,12 @@ def group_objects(ctx: Context, object_ids: list) -> str:
     return cmd("group_objects", {"object_ids": object_ids})
 
 @mcp.tool()
-def ungroup_object(ctx: Context, object_id: int) -> str:
+def ungroup_object(ctx: Context, object_id: str) -> str:
     """Ungroup a group object"""
     return cmd("ungroup_object", {"object_id": object_id})
 
 @mcp.tool()
-def mirror_object(ctx: Context, object_id: int, axis: str = "vertical",
+def mirror_object(ctx: Context, object_id: str, axis: str = "vertical",
                   x: float = None, y: float = None) -> str:
     """Mirror object. axis: horizontal, vertical, or custom point."""
     p = {"object_id": object_id, "axis": axis}
@@ -472,7 +472,7 @@ def draw_spline(ctx: Context, points: list, layer: str = None, obj_class: str = 
 # ═══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def draw_extrude(ctx: Context, object_id: int, height: float) -> str:
+def draw_extrude(ctx: Context, object_id: str, height: float) -> str:
     """Extrude a 2D object to create a 3D solid. Returns new object id."""
     return cmd("draw_extrude", {"object_id": object_id, "height": height})
 
@@ -510,7 +510,7 @@ def draw_cylinder(ctx: Context, cx: float, cy: float, cz: float,
     return cmd("draw_cylinder", p)
 
 @mcp.tool()
-def boolean_operation(ctx: Context, object_id_a: int, object_id_b: int,
+def boolean_operation(ctx: Context, object_id_a: str, object_id_b: str,
                        operation: str = "add") -> str:
     """3D boolean operation. operation: add (union), subtract, intersect. Returns result object id."""
     return cmd("boolean_operation", {"object_id_a": object_id_a, "object_id_b": object_id_b,
@@ -569,27 +569,27 @@ def rename_symbol(ctx: Context, old_name: str, new_name: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def set_fill_color(ctx: Context, object_id: int, r: int, g: int, b: int) -> str:
+def set_fill_color(ctx: Context, object_id: str, r: int, g: int, b: int) -> str:
     """Set fill color (RGB 0-255)"""
     return cmd("set_fill_color", {"object_id": object_id, "r": r, "g": g, "b": b})
 
 @mcp.tool()
-def set_pen_color(ctx: Context, object_id: int, r: int, g: int, b: int) -> str:
+def set_pen_color(ctx: Context, object_id: str, r: int, g: int, b: int) -> str:
     """Set pen (stroke) color (RGB 0-255)"""
     return cmd("set_pen_color", {"object_id": object_id, "r": r, "g": g, "b": b})
 
 @mcp.tool()
-def set_line_weight(ctx: Context, object_id: int, weight_mm: float) -> str:
+def set_line_weight(ctx: Context, object_id: str, weight_mm: float) -> str:
     """Set line weight in mm (e.g. 0.18, 0.25, 0.35, 0.5)"""
     return cmd("set_line_weight", {"object_id": object_id, "weight_mm": weight_mm})
 
 @mcp.tool()
-def set_fill_pattern(ctx: Context, object_id: int, pattern: int) -> str:
+def set_fill_pattern(ctx: Context, object_id: str, pattern: int) -> str:
     """Set fill pattern. 1=solid, 0=none, 2-71=hatches. See VW pattern picker."""
     return cmd("set_fill_pattern", {"object_id": object_id, "pattern": pattern})
 
 @mcp.tool()
-def set_opacity(ctx: Context, object_id: int, fill_opacity: int = None,
+def set_opacity(ctx: Context, object_id: str, fill_opacity: int = None,
                 pen_opacity: int = None) -> str:
     """Set fill and/or pen opacity (0-100 percent)"""
     p = {"object_id": object_id}
@@ -598,12 +598,12 @@ def set_opacity(ctx: Context, object_id: int, fill_opacity: int = None,
     return cmd("set_opacity", p)
 
 @mcp.tool()
-def get_appearance(ctx: Context, object_id: int) -> str:
+def get_appearance(ctx: Context, object_id: str) -> str:
     """Get fill/pen color, line weight, opacity, pattern for an object"""
     return cmd("get_appearance", {"object_id": object_id})
 
 @mcp.tool()
-def set_marker(ctx: Context, object_id: int, start_marker: str = None, end_marker: str = None) -> str:
+def set_marker(ctx: Context, object_id: str, start_marker: str = None, end_marker: str = None) -> str:
     """Set line end markers. marker: none, arrow, open_arrow, dot, slash"""
     p = {"object_id": object_id}
     if start_marker: p["start_marker"] = start_marker
@@ -621,30 +621,30 @@ def get_record_formats(ctx: Context) -> str:
     return cmd("get_record_formats")
 
 @mcp.tool()
-def get_object_records(ctx: Context, object_id: int) -> str:
+def get_object_records(ctx: Context, object_id: str) -> str:
     """Get all records attached to an object with field names and values"""
     return cmd("get_object_records", {"object_id": object_id})
 
 @mcp.tool()
-def get_record_field(ctx: Context, object_id: int, record_name: str, field_name: str) -> str:
+def get_record_field(ctx: Context, object_id: str, record_name: str, field_name: str) -> str:
     """Get a single record field value"""
     return cmd("get_record_field", {"object_id": object_id,
                                     "record_name": record_name, "field_name": field_name})
 
 @mcp.tool()
-def set_record_field(ctx: Context, object_id: int, record_name: str,
+def set_record_field(ctx: Context, object_id: str, record_name: str,
                      field_name: str, value: str) -> str:
     """Set a record field value"""
     return cmd("set_record_field", {"object_id": object_id, "record_name": record_name,
                                     "field_name": field_name, "value": value})
 
 @mcp.tool()
-def attach_record(ctx: Context, object_id: int, record_name: str) -> str:
+def attach_record(ctx: Context, object_id: str, record_name: str) -> str:
     """Attach a record format to an object"""
     return cmd("attach_record", {"object_id": object_id, "record_name": record_name})
 
 @mcp.tool()
-def detach_record(ctx: Context, object_id: int, record_name: str) -> str:
+def detach_record(ctx: Context, object_id: str, record_name: str) -> str:
     """Detach a record from an object"""
     return cmd("detach_record", {"object_id": object_id, "record_name": record_name})
 
@@ -659,22 +659,22 @@ def create_record_format(ctx: Context, name: str, fields: list) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def get_ifc_entity(ctx: Context, object_id: int) -> str:
+def get_ifc_entity(ctx: Context, object_id: str) -> str:
     """Get IFC entity type assigned to an object (e.g. IfcWall, IfcColumn)"""
     return cmd("get_ifc_entity", {"object_id": object_id})
 
 @mcp.tool()
-def set_ifc_entity(ctx: Context, object_id: int, entity: str) -> str:
+def set_ifc_entity(ctx: Context, object_id: str, entity: str) -> str:
     """Set IFC entity type on an object (e.g. IfcWall)"""
     return cmd("set_ifc_entity", {"object_id": object_id, "entity": entity})
 
 @mcp.tool()
-def get_ifc_properties(ctx: Context, object_id: int) -> str:
+def get_ifc_properties(ctx: Context, object_id: str) -> str:
     """Get all IFC property sets and properties for an object"""
     return cmd("get_ifc_properties", {"object_id": object_id})
 
 @mcp.tool()
-def set_ifc_property(ctx: Context, object_id: int, pset: str, name: str, value: str) -> str:
+def set_ifc_property(ctx: Context, object_id: str, pset: str, name: str, value: str) -> str:
     """Set an IFC property on an object (property set name, property name, value)"""
     return cmd("set_ifc_property", {"object_id": object_id, "pset": pset,
                                     "name": name, "value": value})
@@ -746,7 +746,7 @@ def create_plant(ctx: Context, x: float, y: float,
     return cmd("create_plant", p)
 
 @mcp.tool()
-def update_plant(ctx: Context, object_id: int, botanical_name: str = None,
+def update_plant(ctx: Context, object_id: str, botanical_name: str = None,
                  common_name: str = None, height: float = None,
                  spread: float = None, extra_fields: dict = None) -> str:
     """Update plant parametric record fields. extra_fields: {field_name: value}"""
@@ -807,17 +807,17 @@ def create_viewport(ctx: Context, sheet_layer: str, x: float, y: float,
     return cmd("create_viewport", p)
 
 @mcp.tool()
-def update_viewport(ctx: Context, object_id: int) -> str:
+def update_viewport(ctx: Context, object_id: str) -> str:
     """Update (refresh) a viewport"""
     return cmd("update_viewport", {"object_id": object_id})
 
 @mcp.tool()
-def set_viewport_scale(ctx: Context, object_id: int, scale: float) -> str:
+def set_viewport_scale(ctx: Context, object_id: str, scale: float) -> str:
     """Change viewport drawing scale"""
     return cmd("set_viewport_scale", {"object_id": object_id, "scale": scale})
 
 @mcp.tool()
-def set_viewport_crop(ctx: Context, object_id: int, crop_object_id: int) -> str:
+def set_viewport_crop(ctx: Context, object_id: str, crop_object_id: str) -> str:
     """Set a crop/clipping object on a viewport"""
     return cmd("set_viewport_crop", {"object_id": object_id, "crop_object_id": crop_object_id})
 
@@ -947,7 +947,7 @@ def get_textures(ctx: Context) -> str:
     return cmd("get_textures")
 
 @mcp.tool()
-def apply_texture(ctx: Context, object_id: int, texture_name: str) -> str:
+def apply_texture(ctx: Context, object_id: str, texture_name: str) -> str:
     """Apply a texture to a 3D object"""
     return cmd("apply_texture", {"object_id": object_id, "texture_name": texture_name})
 
@@ -968,6 +968,116 @@ def execute_script(ctx: Context, code: str) -> str:
 def run_menu_command(ctx: Context, menu_name: str) -> str:
     """Trigger a Vectorworks menu command by name (e.g. 'Fit to Objects')"""
     return cmd("run_menu_command", {"menu_name": menu_name})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Alignment / Distribution
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def align_objects(ctx: Context, object_ids: list, mode: str = "center_x",
+                  ref: str = None) -> str:
+    """Align objects. mode: left, right, top, bottom, center_x, center_y, center.
+    ref: optional UUID of a reference object; else aggregate bbox of the set is used."""
+    p = {"object_ids": object_ids, "mode": mode}
+    if ref: p["ref"] = ref
+    return cmd("align_objects", p)
+
+@mcp.tool()
+def distribute_objects(ctx: Context, object_ids: list, axis: str = "x") -> str:
+    """Evenly distribute object centers along axis ('x' or 'y') between the two
+    outermost objects. Requires 3+ objects."""
+    return cmd("distribute_objects", {"object_ids": object_ids, "axis": axis})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Text Style
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def set_text_style(ctx: Context, object_id: str, font: str = None,
+                   size: float = None, style: int = None, justify: str = None,
+                   r: int = None, g: int = None, b: int = None) -> str:
+    """Set text object attributes.
+    style: bitmask — 1=bold 2=italic 4=underline (sum). justify: left/center/right.
+    r/g/b: fill color 0-255 (all three required together)."""
+    p = {"object_id": object_id}
+    for k, v in {"font": font, "size": size, "style": style, "justify": justify,
+                 "r": r, "g": g, "b": b}.items():
+        if v is not None: p[k] = v
+    return cmd("set_text_style", p)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Object Variable Escape Hatch
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def set_object_variable(ctx: Context, object_id: str, index: int,
+                        value, type: str = "int") -> str:
+    """Generic VW ObjectVariable setter. type: int, bool, real, str.
+    index: VW ObjectVariable index (see VW docs; e.g. 540 = pen opacity)."""
+    return cmd("set_object_variable", {"object_id": object_id, "index": index,
+                                        "value": value, "type": type})
+
+@mcp.tool()
+def get_object_variable(ctx: Context, object_id: str, index: int,
+                        type: str = "int") -> str:
+    """Generic VW ObjectVariable getter. type: int, bool, real, str."""
+    return cmd("get_object_variable", {"object_id": object_id, "index": index,
+                                        "type": type})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Criteria-based Query
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def for_each_criteria(ctx: Context, criteria: str, limit: int = 500) -> str:
+    """Select objects via vs.ForEachObject criteria string.
+    Examples: 'T=RECT', \"L='Layer-1'\", '(T=POLY) & (C=None)'.
+    Returns count, UUIDs, and summaries for the first 20 matches."""
+    return cmd("for_each_criteria", {"criteria": criteria, "limit": limit})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Baumkataster (domain helper)
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def baumkataster_set_fields(ctx: Context, object_id: str, fields: dict,
+                            record: str = "Baumkataster") -> str:
+    """Bulk-set record fields on a Baumkataster (tree) object.
+    fields: {FieldName: value}. Attaches the record if missing, then calls ResetObject."""
+    return cmd("baumkataster_set_fields", {"object_id": object_id,
+                                            "record": record, "fields": fields})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Extra 2D Primitives
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def draw_rounded_rect(ctx: Context, x1: float, y1: float, x2: float, y2: float,
+                      radius: float = 10, layer: str = None,
+                      obj_class: str = None) -> str:
+    """Draw a rounded rectangle (polyline with arc vertices). Returns UUID."""
+    p = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "radius": radius}
+    if layer: p["layer"] = layer
+    if obj_class: p["class"] = obj_class
+    return cmd("draw_rounded_rect", p)
+
+@mcp.tool()
+def draw_regular_polygon(ctx: Context, cx: float, cy: float, radius: float,
+                         sides: int, rotation_deg: float = 90,
+                         layer: str = None, obj_class: str = None) -> str:
+    """Draw a regular n-gon inscribed in a circle.
+    rotation_deg=90 puts a vertex at top (pointy top); 0 puts it at the right."""
+    p = {"cx": cx, "cy": cy, "radius": radius, "sides": sides,
+         "rotation_deg": rotation_deg}
+    if layer: p["layer"] = layer
+    if obj_class: p["class"] = obj_class
+    return cmd("draw_regular_polygon", p)
 
 
 def main():

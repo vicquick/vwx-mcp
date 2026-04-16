@@ -28,22 +28,19 @@ def _c255(v):
     return round(v / 257)
 
 def _oid(h):
+    """Return object UUID string. VW2026 uses UUIDs — InternalIndex APIs were removed."""
     if not h: return None
-    try:
-        i = vs.GetObjectVariableInt(h, 1165)
-        return i if i else int(h)
-    except Exception:
-        try: return int(h)
-        except: return None
+    try: return vs.GetObjectUuid(h) or None
+    except Exception: return None
 
 def _h(oid):
+    """Resolve object_id (UUID string) → handle."""
     if oid is None: return None
     try:
-        h = vs.GetObjectByInternalIndex(oid)
+        h = vs.GetObjectByUuid(str(oid))
         if h: return h
     except Exception: pass
-    try: return vs.Handle(oid)
-    except: return None
+    return None
 
 def _safe(fn, default=None):
     try: return fn()
@@ -1221,7 +1218,14 @@ def import_image(p):
 # ── View ────────────────────────────────────────────────────────────────────
 
 def zoom_to_fit(p):
-    vs.FitViewToObjects()
+    try:
+        vs.FitViewToObjects()
+    except AttributeError:
+        # VW2026: FitViewToObjects removed; fall back to menu command
+        try:
+            vs.DoMenuTextByName('Fit To Objects', 0)
+        except Exception as e:
+            return {'error': str(e)}
     return {'status': 'ok'}
 
 def zoom_to_selection(p):
@@ -1276,6 +1280,220 @@ def apply_texture(p):
         return {'status': 'ok'}
     except Exception as e:
         return {'error': str(e)}
+
+
+# ── Alignment / Distribution ────────────────────────────────────────────────
+
+def _bbox_pairs(ids):
+    out = []
+    for oid in ids or []:
+        h = _h(oid)
+        if not h: continue
+        try:
+            p1, p2 = vs.GetBBox(h)
+            out.append((h, p1, p2))
+        except Exception: pass
+    return out
+
+def align_objects(p):
+    """Align objects. mode: left,right,top,bottom,center_x,center_y,center.
+    ref: optional UUID of reference; else uses aggregate bbox of the set."""
+    ids = p.get('object_ids', [])
+    mode = p.get('mode', 'center_x')
+    ref = p.get('ref')
+    items = _bbox_pairs(ids)
+    if not items: return {'error': 'No valid objects'}
+    if ref:
+        rh = _h(ref)
+        if not rh: return {'error': 'ref not found'}
+        rp1, rp2 = vs.GetBBox(rh)
+    else:
+        xs1 = [q1[0] for _, q1, _ in items]; xs2 = [q2[0] for _, _, q2 in items]
+        ys1 = [q1[1] for _, q1, _ in items]; ys2 = [q2[1] for _, _, q2 in items]
+        rp1 = (min(xs1), min(ys1)); rp2 = (max(xs2), max(ys2))
+    rcx = (rp1[0] + rp2[0]) / 2.0
+    rcy = (rp1[1] + rp2[1]) / 2.0
+    moved = 0
+    for h, q1, q2 in items:
+        cx = (q1[0] + q2[0]) / 2.0
+        cy = (q1[1] + q2[1]) / 2.0
+        dx = dy = 0.0
+        if   mode == 'left':     dx = rp1[0] - q1[0]
+        elif mode == 'right':    dx = rp2[0] - q2[0]
+        elif mode == 'top':      dy = rp2[1] - q2[1]
+        elif mode == 'bottom':   dy = rp1[1] - q1[1]
+        elif mode == 'center_x': dx = rcx - cx
+        elif mode == 'center_y': dy = rcy - cy
+        elif mode == 'center':   dx = rcx - cx; dy = rcy - cy
+        else: return {'error': f'unknown mode: {mode}'}
+        if dx or dy:
+            vs.HMove(h, dx, dy)
+            moved += 1
+    vs.ReDrawAll()
+    return {'status': 'ok', 'moved': moved}
+
+def distribute_objects(p):
+    """Evenly distribute centers along x or y between the outermost two objects.
+    Needs 3+ objects."""
+    ids = p.get('object_ids', [])
+    axis = p.get('axis', 'x')
+    items = _bbox_pairs(ids)
+    if len(items) < 3: return {'error': 'need 3+ objects'}
+    def ctr(item):
+        _, q1, q2 = item
+        return (q1[0] + q2[0]) / 2.0 if axis == 'x' else (q1[1] + q2[1]) / 2.0
+    items.sort(key=ctr)
+    first_c = ctr(items[0]); last_c = ctr(items[-1])
+    step = (last_c - first_c) / (len(items) - 1)
+    moved = 0
+    for i, it in enumerate(items[1:-1], start=1):
+        h, q1, q2 = it
+        target = first_c + step * i
+        d = target - ctr(it)
+        if axis == 'x': vs.HMove(h, d, 0)
+        else:           vs.HMove(h, 0, d)
+        moved += 1
+    vs.ReDrawAll()
+    return {'status': 'ok', 'moved': moved}
+
+
+# ── Text Style ──────────────────────────────────────────────────────────────
+
+def set_text_style(p):
+    """Set text attrs. style flags: 1=bold 2=italic 4=underline (sum)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        if p.get('font') is not None:
+            fi = vs.GetFontID(p['font'])
+            vs.SetTextFont(h, 0, -1, fi)
+        if p.get('size') is not None:
+            vs.SetTextSize(h, 0, -1, float(p['size']))
+        if p.get('style') is not None:
+            vs.SetTextStyle(h, 0, -1, int(p['style']))
+        if p.get('justify') is not None:
+            jmap = {'left': 1, 'center': 2, 'right': 3}
+            vs.SetTextJust(h, jmap.get(p['justify'], 1))
+        if all(k in p for k in ('r', 'g', 'b')):
+            col = (_c8(p['r']), _c8(p['g']), _c8(p['b']))
+            vs.SetTextFill(h, 0, -1, col)
+        return {'status': 'ok'}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+# ── Generic Object Variable Access ──────────────────────────────────────────
+
+def set_object_variable(p):
+    """Generic ObjectVariable setter. type: int, bool, real, str."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    idx = int(p.get('index', 0))
+    vtype = p.get('type', 'int')
+    val = p.get('value')
+    try:
+        if   vtype == 'int':  vs.SetObjectVariableInt(h, idx, int(val))
+        elif vtype == 'bool': vs.SetObjectVariableBoolean(h, idx, bool(val))
+        elif vtype == 'real': vs.SetObjectVariableReal(h, idx, float(val))
+        elif vtype == 'str':  vs.SetObjectVariableString(h, idx, str(val))
+        else: return {'error': f'unknown type: {vtype}'}
+        return {'status': 'ok'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def get_object_variable(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    idx = int(p.get('index', 0))
+    vtype = p.get('type', 'int')
+    try:
+        if   vtype == 'int':  v = vs.GetObjectVariableInt(h, idx)
+        elif vtype == 'bool': v = vs.GetObjectVariableBoolean(h, idx)
+        elif vtype == 'real': v = vs.GetObjectVariableReal(h, idx)
+        elif vtype == 'str':  v = vs.GetObjectVariableString(h, idx)
+        else: return {'error': f'unknown type: {vtype}'}
+        return {'value': v}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+# ── Criteria Query ───────────────────────────────────────────────────────────
+
+def for_each_criteria(p):
+    """vs.ForEachObject criteria string (e.g. T=RECT, (L='Layer-1') & (T=POLY))."""
+    criteria = p.get('criteria', '')
+    limit = int(p.get('limit', 500))
+    handles = _collect(criteria, limit)
+    return {
+        'count': len(handles),
+        'ids': [_oid(h) for h in handles],
+        'summaries': [_summary(h) for h in handles[:20]],
+    }
+
+
+# ── Baumkataster Bulk Record Setter ──────────────────────────────────────────
+
+def baumkataster_set_fields(p):
+    """Bulk-set record fields. fields: {FieldName: value}. Default record: Baumkataster."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    rec = p.get('record', 'Baumkataster')
+    fields = p.get('fields', {}) or {}
+    # Attach if not already attached
+    try:
+        vs.SetRecord(h, rec)
+    except Exception: pass
+    done = 0; errs = {}
+    for k, v in fields.items():
+        try:
+            vs.SetRField(h, rec, k, str(v))
+            done += 1
+        except Exception as e:
+            errs[k] = str(e)
+    try: vs.ResetObject(h)
+    except Exception: pass
+    return {'status': 'ok', 'set': done, 'errors': errs}
+
+
+# ── Extra 2D Primitives ──────────────────────────────────────────────────────
+
+def draw_rounded_rect(p):
+    """Polyline with arc-type vertices at each corner (VW 2D arc vertex flag = 3)."""
+    prev = _with_layer_class(p)
+    try:
+        x1 = float(p.get('x1', 0));  y1 = float(p.get('y1', 0))
+        x2 = float(p.get('x2', 100)); y2 = float(p.get('y2', 100))
+        r = float(p.get('radius', 10))
+        vs.ClosePoly()
+        vs.BeginPoly()
+        # Rect corners in CCW order
+        for pt in [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]:
+            vs.Add2DVertex(pt, 3, r)
+        vs.EndPoly()
+        return _newobj_result(p)
+    finally:
+        _restore(prev)
+
+def draw_regular_polygon(p):
+    """Regular n-gon inscribed in circle of given radius.
+    rotation_deg=90 → vertex at top (pointy); 0 → vertex at right."""
+    import math as _m
+    prev = _with_layer_class(p)
+    try:
+        cx = float(p.get('cx', 0)); cy = float(p.get('cy', 0))
+        r = float(p.get('radius', 100))
+        n = max(3, int(p.get('sides', 3)))
+        rot = _m.radians(float(p.get('rotation_deg', 90)))
+        pts = [(cx + r * _m.cos(rot + 2 * _m.pi * i / n),
+                cy + r * _m.sin(rot + 2 * _m.pi * i / n)) for i in range(n)]
+        vs.ClosePoly()
+        vs.BeginPoly()
+        for x, y in pts:
+            vs.Add2DVertex((x, y), 0, 0)
+        vs.EndPoly()
+        return _newobj_result(p)
+    finally:
+        _restore(prev)
 
 
 # ── Script Execution ────────────────────────────────────────────────────────
