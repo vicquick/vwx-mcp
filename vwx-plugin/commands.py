@@ -1375,8 +1375,11 @@ def set_text_style(p):
             jmap = {'left': 1, 'center': 2, 'right': 3}
             vs.SetTextJust(h, jmap.get(p['justify'], 1))
         if all(k in p for k in ('r', 'g', 'b')):
+            # VW2026 has no SetTextFill; text color is the object's fill color.
             col = (_c8(p['r']), _c8(p['g']), _c8(p['b']))
-            vs.SetTextFill(h, 0, -1, col)
+            vs.SetFillFore(h, col)
+            vs.SetFillBack(h, col)
+            vs.SetFPat(h, 1)
         return {'status': 'ok'}
     except Exception as e:
         return {'error': str(e)}
