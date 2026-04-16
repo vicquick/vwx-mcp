@@ -445,10 +445,14 @@ def mirror_object(p):
 
 # ── 2D Drawing ──────────────────────────────────────────────────────────────
 
-def _newobj_result(p):
-    h = vs.LNewObj()
+def _newobj_result(p, fallback=None):
+    """Resolve the 'just created' handle. Prefer an explicit fallback because
+    some creators (notably CreateCustomObjectPath + DTM6_SendToSurface) do NOT
+    advance vs.LNewObj() — the caller must pass the handle it captured."""
+    h = fallback if fallback else vs.LNewObj()
     if h and p.get('class'):
-        vs.SetClass(h, p['class'])
+        try: vs.SetClass(h, p['class'])
+        except Exception: pass
     return {'status': 'ok', 'object_id': _oid(h)}
 
 def draw_line(p):
@@ -1423,7 +1427,13 @@ def get_object_variable(p):
 # ── Criteria Query ───────────────────────────────────────────────────────────
 
 def for_each_criteria(p):
-    """vs.ForEachObject criteria string (e.g. T=RECT, (L='Layer-1') & (T=POLY))."""
+    """vs.ForEachObject criteria string (e.g. T=RECT, (L='Layer-1') & (T=POLY)).
+
+    Gotcha: when building criteria with a variable, do NOT add extra outer parens
+    or ForEachObject silently matches nothing and never errors.
+      good: \"((R in ['Part Info']))\"
+      bad : \"(((R in ['Part Info'])))\"
+    Single-quote record/class/layer names that contain spaces."""
     criteria = p.get('criteria', '')
     limit = int(p.get('limit', 500))
     handles = _collect(criteria, limit)
@@ -1497,6 +1507,1013 @@ def draw_regular_polygon(p):
         return _newobj_result(p)
     finally:
         _restore(prev)
+
+
+# ── PIO (Plug-in Object) creation ────────────────────────────────────────────
+
+def _layer_uuids():
+    """Snapshot every UUID on the active layer. Used by path-PIO creation
+    because CreateCustomObjectPath never triggers IsNewCustomObject TRUE and
+    vs.LNewObj() does NOT return the new PIO — pre/post UUID diff is the
+    reliable way to capture the freshly created handle."""
+    seen = set()
+    h = vs.FActLayer()
+    while h:
+        try:
+            u = vs.GetObjectUuid(h)
+            if u: seen.add(u)
+        except Exception: pass
+        h = vs.NextObj(h)
+    return seen
+
+def _apply_pio_params(h, name, parameters):
+    if not parameters: return
+    for field, value in parameters.items():
+        try: vs.SetRField(h, name, field, str(value))
+        except Exception: pass
+    try: vs.ResetObject(h)
+    except Exception: pass
+
+def create_pio(p):
+    """Create a Plug-in Object (Door, Window, Stair, Fence, Hardscape, Data Tag, …).
+
+    Doors/Windows/Stairs are NOT first-class creators — they are PIOs. Use
+    CreateCustomObjectN with the plug-in's INTERNAL name (e.g. 'Door', 'Window',
+    'Stair', 'Data Tag', 'Fence', 'Hardscape'). Parameters are set via record
+    fields on the record whose name == the PIO name, using the OIP field names
+    (not internal pName). show_pref controls whether the object-preferences
+    dialog is shown (default False)."""
+    prev = _with_layer_class(p)
+    try:
+        name = p.get('name')
+        if not name: return {'error': 'name (PIO internal name) required'}
+        x = float(p.get('x', 0)); y = float(p.get('y', 0))
+        rot = float(p.get('rotation', 0))
+        show_pref = bool(p.get('show_pref', False))
+        try:
+            h = vs.CreateCustomObjectN(name, (x, y), rot, show_pref)
+        except AttributeError:
+            h = vs.CreateCustomObject(name, (x, y), rot)
+        if not h:
+            return {'error': f'PIO "{name}" not created — check plug-in is installed/enabled'}
+        _apply_pio_params(h, name, p.get('parameters'))
+        return _newobj_result(p, fallback=h)
+    finally:
+        _restore(prev)
+
+def create_pio_from_path(p):
+    """Create a path-based PIO (Fence, Hardscape, Planting bed, …).
+
+    vs.CreateCustomObjectPath does NOT advance LNewObj() and does NOT fire
+    IsNewCustomObject TRUE. Fallback strategy: snapshot active-layer UUIDs
+    before and after the call, then take the single new UUID."""
+    prev = _with_layer_class(p)
+    try:
+        name = p.get('name')
+        path_oid = p.get('path_id')
+        if not name or not path_oid:
+            return {'error': 'name and path_id required'}
+        path_h = _h(path_oid)
+        if not path_h: return {'error': 'path not found'}
+        pg_oid = p.get('profile_group_id')
+        pg_h = _h(pg_oid) if pg_oid else None
+        before = _layer_uuids()
+        try:
+            h = vs.CreateCustomObjectPath(name, path_h, pg_h)
+        except Exception as e:
+            return {'error': f'CreateCustomObjectPath failed: {e}'}
+        new_h = h
+        if not new_h:
+            after = _layer_uuids() - before
+            if after:
+                new_h = _h(next(iter(after)))
+        if not new_h:
+            return {'error': 'PIO created but handle could not be resolved'}
+        _apply_pio_params(new_h, name, p.get('parameters'))
+        return {'status': 'ok', 'object_id': _oid(new_h)}
+    finally:
+        _restore(prev)
+
+
+def get_pio_parameters(p):
+    """Read all PIO parameter fields (PIO name == record name on the object)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        rec_h = vs.GetParametricRecord(h)
+        if not rec_h: return {'error': 'Not a PIO (no parametric record)'}
+        rec_name = _safe(lambda: vs.GetName(rec_h))
+        nf = _safe(lambda: vs.NumFields(rec_h), 0)
+        out = {}
+        for i in range(1, nf + 1):
+            fname = _safe(lambda i=i: vs.GetFldName(rec_h, i))
+            val = _safe(lambda fname=fname: vs.GetRField(h, rec_name, fname))
+            if fname: out[fname] = val
+        return {'record': rec_name, 'fields': out}
+    except Exception as e:
+        return {'error': str(e)}
+
+def set_pio_parameter(p):
+    """Set one PIO parameter field. Also ResetObject to trigger regen."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    field = p.get('field'); value = p.get('value')
+    if not field: return {'error': 'field required'}
+    try:
+        rec_h = vs.GetParametricRecord(h)
+        rec_name = vs.GetName(rec_h) if rec_h else p.get('record')
+        if not rec_name: return {'error': 'record name unknown'}
+        vs.SetRField(h, rec_name, field, str(value))
+        vs.ResetObject(h)
+        return {'status': 'ok', 'record': rec_name, 'field': field}
+    except Exception as e:
+        return {'error': str(e)}
+
+def get_pio_style(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        name = vs.GetPluginStyle(h)
+        return {'style': name}
+    except Exception as e:
+        return {'error': str(e)}
+
+def set_pio_style(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    style = p.get('style_name')
+    if not style: return {'error': 'style_name required'}
+    try:
+        vs.SetPluginStyle(h, style)
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def update_all_styled_instances(p):
+    style = p.get('style_name')
+    if not style: return {'error': 'style_name required'}
+    try:
+        vs.UpdateStyledObjects(style)
+        return {'status': 'ok'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def has_plugin(p):
+    name = p.get('name')
+    if not name: return {'error': 'name required'}
+    try:
+        return {'exists': bool(vs.HasPlugin(name))}
+    except Exception as e:
+        return {'error': str(e)}
+
+def get_pio_path(p):
+    """Return UUID of a path-PIO's driving path object, if any."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        ph = vs.GetCustomObjectPath(h)
+        return {'path_id': _oid(ph) if ph else None}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+# ── Dimensions ───────────────────────────────────────────────────────────────
+
+def create_linear_dimension(p):
+    """Create a linear dimension between two points.
+
+    Gotcha: vs.LinearDim's offsetDistance argument is the text offset ALONG the
+    dim line, not a perpendicular offset from the measured object. To center
+    the text on the dim line (no perpendicular displacement), pass
+    zero_text_perp=True — sets OV 43 = 0 then ResetObject.
+
+    dim_type: 771 aligned, 772 horizontal, 773 vertical (VW enum).
+    Pass associate_to=<uuid> to bind the dim to an object (AssociateLinearDimension)."""
+    prev = _with_layer_class(p)
+    try:
+        p1 = (float(p.get('x1', 0)), float(p.get('y1', 0)))
+        p2 = (float(p.get('x2', 100)), float(p.get('y2', 0)))
+        offset = float(p.get('offset', 0))
+        dim_type = int(p.get('dim_type', 771))
+        arrow = int(p.get('arrow', 770))
+        text_flag = int(p.get('text_flag', 0))
+        try:
+            vs.LinearDim(p1, p2, offset, dim_type, arrow, text_flag, offset)
+        except Exception as e:
+            return {'error': str(e)}
+        h = vs.LNewObj()
+        if h and p.get('zero_text_perp'):
+            try:
+                vs.SetObjectVariableReal(h, 43, 0.0)
+                vs.ResetObject(h)
+            except Exception: pass
+        assoc_oid = p.get('associate_to')
+        if h and assoc_oid:
+            ah = _h(assoc_oid)
+            if ah:
+                try: vs.AssociateLinearDimension(h, ah)
+                except Exception: pass
+        return _newobj_result(p, fallback=h)
+    finally:
+        _restore(prev)
+
+
+def create_angular_dimension(p):
+    """Angular dim. cx,cy = vertex; (x1,y1) & (x2,y2) = leg endpoints; offset = arc radius."""
+    prev = _with_layer_class(p)
+    try:
+        cx = float(p.get('cx', 0)); cy = float(p.get('cy', 0))
+        p1 = (float(p.get('x1', 100)), float(p.get('y1', 0)))
+        p2 = (float(p.get('x2', 0)), float(p.get('y2', 100)))
+        offset = float(p.get('offset', 50))
+        arrow = int(p.get('arrow', 770))
+        text_flag = int(p.get('text_flag', 0))
+        try:
+            vs.AngularDim((cx, cy), p1, p2, offset, arrow, text_flag)
+        except Exception as e:
+            return {'error': str(e)}
+        return _newobj_result(p)
+    finally:
+        _restore(prev)
+
+def create_circular_dimension(p):
+    """Radial/diameter dim. mode 'radius' or 'diameter'."""
+    prev = _with_layer_class(p)
+    try:
+        cx = float(p.get('cx', 0)); cy = float(p.get('cy', 0))
+        tip = (float(p.get('x', 100)), float(p.get('y', 0)))
+        mode = p.get('mode', 'radius')
+        arrow = int(p.get('arrow', 770))
+        text_flag = int(p.get('text_flag', 0))
+        try:
+            is_diam = 1 if mode == 'diameter' else 0
+            vs.CircularDim((cx, cy), tip, is_diam, arrow, text_flag)
+        except Exception as e:
+            return {'error': str(e)}
+        return _newobj_result(p)
+    finally:
+        _restore(prev)
+
+def create_chain_dimension(p):
+    """Chain of linear dimensions through a list of points along the same axis."""
+    prev = _with_layer_class(p)
+    try:
+        pts = p.get('points', [])
+        if len(pts) < 2: return {'error': 'need 2+ points'}
+        offset = float(p.get('offset', 0))
+        dim_type = int(p.get('dim_type', 771))
+        arrow = int(p.get('arrow', 770))
+        text_flag = int(p.get('text_flag', 0))
+        try:
+            tpts = [(float(x), float(y)) for x, y in pts]
+            vs.CreateChainDimension(tpts, offset, dim_type, arrow, text_flag)
+        except AttributeError:
+            # Fallback: build pairwise LinearDims
+            created = 0
+            for i in range(len(pts) - 1):
+                a = (float(pts[i][0]), float(pts[i][1]))
+                b = (float(pts[i+1][0]), float(pts[i+1][1]))
+                try:
+                    vs.LinearDim(a, b, offset, dim_type, arrow, text_flag, offset)
+                    created += 1
+                except Exception: pass
+            return {'status': 'ok', 'method': 'fallback', 'created': created}
+        except Exception as e:
+            return {'error': str(e)}
+        return {'status': 'ok'}
+    finally:
+        _restore(prev)
+
+def associate_linear_dim(p):
+    h = _h(p.get('dim_id'))
+    ah = _h(p.get('object_id'))
+    if not h or not ah: return {'error': 'dim_id and object_id required'}
+    try:
+        vs.AssociateLinearDimension(h, ah)
+        return {'status': 'ok'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def get_dim_text(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try: return {'text': vs.GetDimText(h)}
+    except Exception as e: return {'error': str(e)}
+
+def set_dim_text(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        vs.SetDimText(h, str(p.get('text', '')))
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def set_dim_note(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        vs.SetDimNote(h, str(p.get('note', '')))
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Site Model (DTM6_*) ──────────────────────────────────────────────────────
+
+def _active_dtm():
+    try:
+        lay = vs.ActLayer()
+        return vs.DTM6_GetDTMObject(lay, True)
+    except Exception:
+        return None
+
+def send_to_surface(p):
+    """Drape a 2D object onto the site-model surface.
+
+    Gotcha: DTM6_SendToSurface converts the 2D input to a 3D polygon and
+    vs.LNewObj() does NOT point at the result. Use PrevObj(LNewObj()) when the
+    LNewObj handle still matches the input UUID.
+
+    tin_type: 0 existing / 1 proposed / 2 current (default)."""
+    oid = p.get('object_id')
+    h = _h(oid)
+    if not h: return {'error': 'Object not found'}
+    tin_type = int(p.get('tin_type', 2))
+    dtm_oid = p.get('site_model_id')
+    dtm_h = _h(dtm_oid) if dtm_oid else _active_dtm()
+    if not dtm_h:
+        return {'error': 'No site model on active layer (pass site_model_id)'}
+    try:
+        ok = vs.DTM6_SendToSurface(dtm_h, h, tin_type)
+    except Exception as e:
+        return {'error': str(e)}
+    new_h = None
+    try:
+        ln = vs.LNewObj()
+        if ln:
+            try:
+                same = (vs.GetObjectUuid(ln) == oid)
+            except Exception:
+                same = False
+            new_h = vs.PrevObj(ln) if same else ln
+    except Exception: pass
+    return {'status': 'ok' if ok else 'failed',
+            'object_id': _oid(new_h) if new_h else None}
+
+def rise_to_surface(p):
+    """Raise an object to the site-model surface (opposite of send_to_surface).
+    Same LNewObj gotcha applies — see send_to_surface."""
+    oid = p.get('object_id')
+    h = _h(oid)
+    if not h: return {'error': 'Object not found'}
+    tin_type = int(p.get('tin_type', 2))
+    dtm_oid = p.get('site_model_id')
+    dtm_h = _h(dtm_oid) if dtm_oid else _active_dtm()
+    if not dtm_h:
+        return {'error': 'No site model on active layer (pass site_model_id)'}
+    try:
+        ok = vs.DTM6_RiseToSurface(dtm_h, h, tin_type)
+    except Exception as e:
+        return {'error': str(e)}
+    new_h = None
+    try:
+        ln = vs.LNewObj()
+        if ln:
+            try:
+                same = (vs.GetObjectUuid(ln) == oid)
+            except Exception:
+                same = False
+            new_h = vs.PrevObj(ln) if same else ln
+    except Exception: pass
+    return {'status': 'ok' if ok else 'failed',
+            'object_id': _oid(new_h) if new_h else None}
+
+def get_z_at_xy(p):
+    """Z elevation at a planar (x, y) on the site model.
+    tin_type: 0 existing / 1 proposed / 2 current (default)."""
+    dtm_oid = p.get('site_model_id')
+    dtm_h = _h(dtm_oid) if dtm_oid else _active_dtm()
+    if not dtm_h:
+        return {'error': 'No site model on active layer (pass site_model_id)'}
+    x = float(p.get('x', 0)); y = float(p.get('y', 0))
+    tin_type = int(p.get('tin_type', 2))
+    try:
+        ok, z = vs.DTM6_GetZatXY(dtm_h, x, y, tin_type)
+        return {'ok': bool(ok), 'z': z if ok else None}
+    except Exception as e:
+        return {'error': str(e)}
+
+def site_model_on_layer(p):
+    layer = p.get('layer')
+    try:
+        lay_h = vs.GetLayerByName(layer) if layer else vs.ActLayer()
+        dtm = vs.DTM6_GetDTMObject(lay_h, True)
+        return {'object_id': _oid(dtm) if dtm else None}
+    except Exception as e:
+        return {'error': str(e)}
+
+def is_site_model(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try: return {'is_site_model': bool(vs.DTM6_IsDTM6Object(h))}
+    except Exception as e: return {'error': str(e)}
+
+def clear_site_model_cache(p):
+    dtm_oid = p.get('site_model_id')
+    dtm_h = _h(dtm_oid) if dtm_oid else _active_dtm()
+    if not dtm_h: return {'error': 'site model not found'}
+    try:
+        vs.DTM6_ClearModelCache(dtm_h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def make_site_modifier_class(p):
+    try:
+        vs.MakeModifierClass(str(p.get('class_name', '')), int(p.get('modifier_type', 0)))
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Hatches / Vector Fills ───────────────────────────────────────────────────
+
+def list_hatches(p):
+    try:
+        n = vs.NumVectorFills()
+        out = []
+        for i in range(1, n + 1):
+            try: out.append(vs.VectorFillList(i))
+            except Exception: pass
+        return {'count': n, 'names': out}
+    except Exception as e:
+        return {'error': str(e)}
+
+def set_hatch_on_object(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    name = p.get('hatch_name')
+    if not name: return {'error': 'hatch_name required'}
+    try:
+        ok = vs.SetVectorFill(h, name)
+        return {'status': 'ok' if ok else 'failed'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def get_hatch_on_object(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try: return {'hatch_name': vs.GetVectorFill(h)}
+    except Exception as e: return {'error': str(e)}
+
+def create_static_hatch(p):
+    prev = _with_layer_class(p)
+    try:
+        name = p.get('hatch_name')
+        if not name: return {'error': 'hatch_name required'}
+        pt = (float(p.get('x', 0)), float(p.get('y', 0)))
+        angle = float(p.get('angle', 0))
+        try:
+            h = vs.CreateStaticHatch(name, pt, angle)
+        except Exception as e:
+            return {'error': str(e)}
+        return _newobj_result(p, fallback=h)
+    finally:
+        _restore(prev)
+
+def create_static_hatch_from_object(p):
+    prev = _with_layer_class(p)
+    try:
+        src = _h(p.get('source_id'))
+        if not src: return {'error': 'source_id not found'}
+        name = p.get('hatch_name')
+        if not name: return {'error': 'hatch_name required'}
+        angle = float(p.get('angle', 0))
+        try:
+            h = vs.CreateStaticHatchFromObject(src, name, angle)
+        except Exception as e:
+            return {'error': str(e)}
+        return _newobj_result(p, fallback=h)
+    finally:
+        _restore(prev)
+
+def delete_hatch_definition(p):
+    name = p.get('hatch_name')
+    if not name: return {'error': 'hatch_name required'}
+    try:
+        vs.DelVectorFill(name)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Solids ───────────────────────────────────────────────────────────────────
+
+def _solid_op(p, fn_name):
+    a = _h(p.get('object_id_a')); b = _h(p.get('object_id_b'))
+    if not a or not b: return {'error': 'object_id_a and object_id_b required'}
+    fn = getattr(vs, fn_name, None)
+    if not fn: return {'error': f'{fn_name} not available'}
+    try:
+        res = fn(a, b)
+        # VW returns (result_code, new_handle) for solid ops
+        if isinstance(res, tuple):
+            new_h = res[1] if len(res) > 1 else None
+        else:
+            new_h = res
+        return {'status': 'ok', 'object_id': _oid(new_h) if new_h else None}
+    except Exception as e:
+        return {'error': str(e)}
+
+def solid_add(p):        return _solid_op(p, 'AddSolid')
+def solid_subtract(p):   return _solid_op(p, 'SubtractSolid')
+def solid_intersect(p):  return _solid_op(p, 'IntersectSolid')
+
+def solid_shell(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    thickness = float(p.get('thickness', 10))
+    try:
+        nh = vs.CreateShell(h, thickness)
+        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
+    except Exception as e:
+        return {'error': str(e)}
+
+def solid_to_generic(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        vs.CnvrtToGenericSolid(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def get_solid_volume(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try: return {'volume': vs.ObjVolume(h)}
+    except Exception as e: return {'error': str(e)}
+
+def get_solid_surface_area(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try: return {'surface_area': vs.ObjSurfaceArea(h)}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Data Tags ────────────────────────────────────────────────────────────────
+
+def create_data_tag(p):
+    """Data Tag is a PIO — placed via CreateCustomObjectN('Data Tag', ...)."""
+    return create_pio({
+        'name': 'Data Tag',
+        'x': p.get('x', 0), 'y': p.get('y', 0),
+        'rotation': p.get('rotation', 0),
+        'layer': p.get('layer'),
+        'class': p.get('class'),
+        'parameters': p.get('parameters'),
+    })
+
+def associate_data_tag(p):
+    th = _h(p.get('tag_id')); oh = _h(p.get('target_id'))
+    if not th or not oh: return {'error': 'tag_id and target_id required'}
+    try:
+        ok = vs.DT_AssociateWithObj(th, oh)
+        return {'status': 'ok' if ok else 'failed'}
+    except Exception as e: return {'error': str(e)}
+
+def reset_all_data_tags(p):
+    try:
+        vs.DT_ResetAllDataTags()
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def update_tagged_tags(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        vs.DT_UpdateTaggedTags(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Graphic Calculation (landscape gold) ─────────────────────────────────────
+
+def offset_polygon(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    dist = float(p.get('distance', 10))
+    try:
+        nh = vs.OffsetPoly(h, dist)
+        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
+    except Exception as e: return {'error': str(e)}
+
+def _poly_boolean(p, fn_name, a_key='clip_id', b_key='subject_id'):
+    a = _h(p.get(a_key)); b = _h(p.get(b_key))
+    if not a or not b: return {'error': f'{a_key} and {b_key} required'}
+    fn = getattr(vs, fn_name, None)
+    if not fn: return {'error': f'{fn_name} not available'}
+    try:
+        nh = fn(a, b)
+        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
+    except Exception as e: return {'error': str(e)}
+
+def clip_polygon(p):     return _poly_boolean(p, 'ClipPolygon')
+def subtract_polygon(p): return _poly_boolean(p, 'SubtractPolygon', 'object_id_a', 'object_id_b')
+
+def combine_polygons(p):
+    ids = p.get('object_ids', [])
+    handles = [_h(i) for i in ids if _h(i)]
+    if len(handles) < 2: return {'error': 'need 2+ valid polygons'}
+    try:
+        # CombinePolygons iteratively merges
+        acc = handles[0]
+        for h in handles[1:]:
+            nh = vs.CombinePolygons(acc, h)
+            if nh: acc = nh
+        return {'status': 'ok', 'object_id': _oid(acc) if acc else None}
+    except Exception as e: return {'error': str(e)}
+
+def polygon_centroid(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        # vs.Centroid returns (ok, x, y) on VW2026
+        res = vs.Centroid(h)
+        if isinstance(res, tuple):
+            if len(res) >= 3:
+                ok, x, y = res[0], res[1], res[2]
+                return {'ok': bool(ok), 'x': x, 'y': y}
+            if len(res) == 2:
+                return {'ok': True, 'x': res[0], 'y': res[1]}
+        return {'value': res}
+    except Exception as e: return {'error': str(e)}
+
+def polygon_perimeter(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try: return {'perimeter': vs.CalcPolySegLen(h)}
+    except Exception as e: return {'error': str(e)}
+
+def point_in_polygon(p):
+    h = _h(p.get('poly_id'))
+    if not h: return {'error': 'poly_id not found'}
+    pt = (float(p.get('x', 0)), float(p.get('y', 0)))
+    try: return {'inside': bool(vs.PtInPoly(pt, h))}
+    except Exception as e: return {'error': str(e)}
+
+def point_along_polygon(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    dist = float(p.get('distance', 0))
+    try:
+        x, y, seg = vs.PointAlongPoly(h, dist)
+        return {'x': x, 'y': y, 'segment': seg}
+    except Exception as e: return {'error': str(e)}
+
+def convert_to_polygon(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        nh = vs.ConvertToPolygon(h)
+        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
+    except Exception as e: return {'error': str(e)}
+
+def convert_to_polyline(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        nh = vs.ConvertToPolyline(h)
+        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
+    except Exception as e: return {'error': str(e)}
+
+def convert_to_nurbs(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        nh = vs.ConvertToNURBS(h)
+        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
+    except Exception as e: return {'error': str(e)}
+
+def distance(p):
+    try: return {'distance': vs.Distance((p.get('x1', 0), p.get('y1', 0)),
+                                           (p.get('x2', 0), p.get('y2', 0)))}
+    except Exception as e: return {'error': str(e)}
+
+def distance_3d(p):
+    try: return {'distance': vs.Distance3D(
+        (p.get('x1', 0), p.get('y1', 0), p.get('z1', 0)),
+        (p.get('x2', 0), p.get('y2', 0), p.get('z2', 0)))}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Materials ────────────────────────────────────────────────────────────────
+
+def create_material(p):
+    name = p.get('name')
+    if not name: return {'error': 'name required'}
+    simple = bool(p.get('simple', True))
+    try:
+        h = vs.CreateMaterial(name, simple)
+        return {'status': 'ok', 'object_id': _oid(h) if h else None}
+    except Exception as e: return {'error': str(e)}
+
+def assign_material(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    mname = p.get('material_name')
+    if not mname: return {'error': 'material_name required'}
+    try:
+        mh = vs.GetObject(mname)
+        if not mh: return {'error': 'material not found'}
+        vs.SetObjMaterialHandle(h, mh)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def get_material_info(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        mh = vs.GetObjMaterialHandle(h)
+        name = vs.GetObjMaterialName(h) if hasattr(vs, 'GetObjMaterialName') else (vs.GetName(mh) if mh else None)
+        return {
+            'material_name': name,
+            'area':   _safe(lambda: vs.GetMaterialArea(h)),
+            'volume': _safe(lambda: vs.GetMaterialVolume(h)),
+            'is_simple': _safe(lambda: vs.IsMaterialSimple(mh)) if mh else None,
+        }
+    except Exception as e: return {'error': str(e)}
+
+def set_material_texture(p):
+    mname = p.get('material_name'); tname = p.get('texture_name')
+    if not mname or not tname: return {'error': 'material_name and texture_name required'}
+    try:
+        mh = vs.GetObject(mname); th = vs.GetObject(tname)
+        if not mh or not th: return {'error': 'material or texture not found'}
+        vs.SetMaterialTexture(mh, th)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def set_material_fill(p):
+    mname = p.get('material_name'); fill = p.get('fill_name')
+    if not mname or not fill: return {'error': 'material_name and fill_name required'}
+    try:
+        mh = vs.GetObject(mname)
+        if not mh: return {'error': 'material not found'}
+        vs.SetMaterialFillStyle(mh, fill)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Components (walls/slabs/roofs) ───────────────────────────────────────────
+
+def list_components(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        n = vs.GetNumberOfComponents(h)
+    except Exception as e:
+        return {'error': str(e)}
+    comps = []
+    for i in range(1, n + 1):
+        comps.append({
+            'index': i,
+            'name':     _safe(lambda i=i: vs.GetComponentName(h, i)),
+            'width':    _safe(lambda i=i: vs.GetComponentWidth(h, i)),
+            'class':    _safe(lambda i=i: vs.GetComponentClass(h, i)),
+            'function': _safe(lambda i=i: vs.GetComponentFunction(h, i)),
+            'net_area':   _safe(lambda i=i: vs.GetComponentNetArea(h, i)),
+            'net_volume': _safe(lambda i=i: vs.GetComponentNetVolume(h, i)),
+        })
+    return {'count': n, 'components': comps}
+
+def insert_component(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    before = int(p.get('before_index', 1))
+    width = float(p.get('width', 10))
+    fill = int(p.get('fill', 1))
+    lpw = int(p.get('left_pen_weight', 25))
+    rpw = int(p.get('right_pen_weight', 25))
+    lps = int(p.get('left_pen_style', 2))
+    rps = int(p.get('right_pen_style', 2))
+    try:
+        ok = vs.InsertNewComponentN(h, before, width, fill, lpw, rpw, lps, rps)
+        try: vs.ResetObject(h)
+        except Exception: pass
+        return {'status': 'ok' if ok else 'failed'}
+    except Exception as e:
+        return {'error': str(e)}
+
+def delete_component(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    idx = int(p.get('index', 1))
+    try:
+        vs.DeleteComponent(h, idx)
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def delete_all_components(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    try:
+        vs.DeleteAllComponents(h)
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def _set_component_attr(p, fn_name):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    idx = int(p.get('index', 1))
+    fn = getattr(vs, fn_name, None)
+    if not fn: return {'error': f'{fn_name} not available'}
+    try:
+        fn(h, idx, p.get('value'))
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def set_component_name(p):     return _set_component_attr(p, 'SetComponentName')
+def set_component_class(p):    return _set_component_attr(p, 'SetComponentClass')
+def set_component_width(p):    return _set_component_attr(p, 'SetComponentWidth')
+def set_component_function(p): return _set_component_attr(p, 'SetComponentFunction')
+
+def set_component_material(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    idx = int(p.get('index', 1))
+    mname = p.get('material_name')
+    if not mname: return {'error': 'material_name required'}
+    try:
+        mh = vs.GetObject(mname)
+        if not mh: return {'error': 'material not found'}
+        vs.SetComponentMaterial(h, idx, mh)
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def set_component_texture(p):
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    idx = int(p.get('index', 1))
+    tname = p.get('texture_name')
+    if not tname: return {'error': 'texture_name required'}
+    try:
+        th = vs.GetObject(tname)
+        if not th: return {'error': 'texture not found'}
+        vs.SetComponentTexture(h, idx, th)
+        vs.ResetObject(h)
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+
+# ── Viewport Class / Layer Overrides ─────────────────────────────────────────
+
+def _vp_cl_props(h):
+    return {
+        'fill_back':  _safe(lambda: vs.GetVPClOvrdFillBack(h)),
+        'fill_fore':  _safe(lambda: vs.GetVPClOvrdFillFore(h)),
+        'fill_style': _safe(lambda: vs.GetVPClOvrdFillStyle(h)),
+        'pen_back':   _safe(lambda: vs.GetVPClOvrdPenBack(h)),
+        'pen_fore':   _safe(lambda: vs.GetVPClOvrdPenFore(h)),
+        'fill_opacity': _safe(lambda: vs.GetVPClOvrdFillOpty(h)),
+        'pen_opacity':  _safe(lambda: vs.GetVPClOvrdPenOpty(h)),
+    }
+
+def add_vp_class_override(p):
+    vp = _h(p.get('viewport_id'))
+    if not vp: return {'error': 'viewport_id required'}
+    cls = p.get('class_name')
+    if not cls: return {'error': 'class_name required'}
+    try:
+        ovrd = vs.CreateVPClOvrd(vp, cls)
+        if not ovrd: return {'error': 'CreateVPClOvrd failed'}
+        if p.get('fill_fore_rgb'):
+            r, g, b = p['fill_fore_rgb']
+            vs.SetVPClOvrdFillFore(ovrd, (_c8(r), _c8(g), _c8(b)))
+        if p.get('fill_back_rgb'):
+            r, g, b = p['fill_back_rgb']
+            vs.SetVPClOvrdFillBack(ovrd, (_c8(r), _c8(g), _c8(b)))
+        if p.get('pen_fore_rgb'):
+            r, g, b = p['pen_fore_rgb']
+            vs.SetVPClOvrdPenFore(ovrd, (_c8(r), _c8(g), _c8(b)))
+        if p.get('pen_back_rgb'):
+            r, g, b = p['pen_back_rgb']
+            vs.SetVPClOvrdPenBack(ovrd, (_c8(r), _c8(g), _c8(b)))
+        if p.get('fill_opacity') is not None:
+            vs.SetVPClOvrdFillOpty(ovrd, int(p['fill_opacity']))
+        if p.get('pen_opacity') is not None:
+            vs.SetVPClOvrdPenOpty(ovrd, int(p['pen_opacity']))
+        if p.get('fill_style') is not None:
+            vs.SetVPClOvrdFillStyle(ovrd, int(p['fill_style']))
+        try: vs.UpdateVP(vp)
+        except Exception: pass
+        return {'status': 'ok', 'override_id': _oid(ovrd)}
+    except Exception as e:
+        return {'error': str(e)}
+
+def remove_vp_class_override(p):
+    vp = _h(p.get('viewport_id')); cls = p.get('class_name')
+    if not vp or not cls: return {'error': 'viewport_id and class_name required'}
+    try:
+        vs.RemoveVPClOvrd(vp, cls)
+        try: vs.UpdateVP(vp)
+        except Exception: pass
+        return {'status': 'ok'}
+    except Exception as e: return {'error': str(e)}
+
+def list_vp_class_overrides(p):
+    vp = _h(p.get('viewport_id'))
+    if not vp: return {'error': 'viewport_id required'}
+    try:
+        n = vs.GetVPClOvrdCount(vp)
+    except Exception as e:
+        return {'error': str(e)}
+    out = []
+    # No direct iterator — VW returns handles via a per-index function
+    for i in range(1, (n or 0) + 1):
+        oh = _safe(lambda i=i: vs.GetVPClOvrdByIndex(vp, i))
+        if not oh: continue
+        entry = {'index': i, 'class': _safe(lambda: vs.GetVPClOvrdName(oh))}
+        entry.update(_vp_cl_props(oh))
+        out.append(entry)
+    return {'count': n, 'overrides': out}
+
+def add_vp_layer_override(p):
+    vp = _h(p.get('viewport_id')); lay = p.get('layer_name')
+    if not vp or not lay: return {'error': 'viewport_id and layer_name required'}
+    try:
+        ovrd = vs.CreateVPLrOvrd(vp, lay)
+        if not ovrd: return {'error': 'CreateVPLrOvrd failed'}
+        if p.get('fill_fore_rgb'):
+            r, g, b = p['fill_fore_rgb']
+            vs.SetVPLrOvrdFillFore(ovrd, (_c8(r), _c8(g), _c8(b)))
+        if p.get('pen_fore_rgb'):
+            r, g, b = p['pen_fore_rgb']
+            vs.SetVPLrOvrdPenFore(ovrd, (_c8(r), _c8(g), _c8(b)))
+        if p.get('opacity') is not None:
+            vs.SetVPLrOvrdOpty(ovrd, int(p['opacity']))
+        try: vs.UpdateVP(vp)
+        except Exception: pass
+        return {'status': 'ok', 'override_id': _oid(ovrd)}
+    except Exception as e: return {'error': str(e)}
+
+def list_vp_layer_overrides(p):
+    vp = _h(p.get('viewport_id'))
+    if not vp: return {'error': 'viewport_id required'}
+    try:
+        n = vs.GetVPLrOvrdCount(vp)
+    except Exception as e:
+        return {'error': str(e)}
+    out = []
+    for i in range(1, (n or 0) + 1):
+        oh = _safe(lambda i=i: vs.GetVPLrOvrdByIndex(vp, i))
+        if not oh: continue
+        out.append({
+            'index': i,
+            'layer': _safe(lambda: vs.GetVPLrOvrdName(oh)),
+            'fill_fore': _safe(lambda: vs.GetVPLrOvrdFillFore(oh)),
+            'pen_fore':  _safe(lambda: vs.GetVPLrOvrdPenFore(oh)),
+        })
+    return {'count': n, 'overrides': out}
+
+
+# ── Generic Dispatch / Introspection ─────────────────────────────────────────
+
+def list_commands(p):
+    """List all callable commands in this module. Optional filter substring.
+    Agents use this for discovery when the explicit MCP tool set does not cover
+    the verb they need — the full surface is reachable through the `vw`
+    dispatcher (or `execute_script` for truly arbitrary vs.* calls)."""
+    import inspect
+    filt = (p.get('filter') or '').lower()
+    out = []
+    for name, obj in globals().items():
+        if name.startswith('_'): continue
+        if not inspect.isfunction(obj): continue
+        if filt and filt not in name.lower(): continue
+        doc_line = ((obj.__doc__ or '').strip().split('\n')[0])[:140]
+        out.append({'name': name, 'doc': doc_line})
+    out.sort(key=lambda x: x['name'])
+    return {'count': len(out), 'commands': out}
+
+def _batch(p):
+    """Run several commands in one round-trip (all on VW main thread, serial).
+    calls: [{command, params}, ...]. Returns results in order."""
+    results = []
+    for call in p.get('calls') or []:
+        name = call.get('command')
+        params = call.get('params') or {}
+        fn = globals().get(name)
+        if not fn or not callable(fn) or name.startswith('_'):
+            results.append({'error': f'unknown command: {name}'})
+            continue
+        try:
+            results.append(fn(params))
+        except Exception as e:
+            results.append({'error': str(e), 'traceback': traceback.format_exc()})
+    return {'count': len(results), 'results': results}
 
 
 # ── Script Execution ────────────────────────────────────────────────────────

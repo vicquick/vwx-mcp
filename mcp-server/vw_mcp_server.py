@@ -110,7 +110,14 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 
 mcp = FastMCP(
     "vw-mcp",
-    instructions="Vectorworks 2026 integration via MCP — 125+ tools controlling live Vectorworks desktop. Object IDs are UUIDs (strings) returned by vs.GetObjectUuid.",
+    instructions=(
+        "Vectorworks 2026 integration via MCP. Three access layers: "
+        "(1) explicit @tool wrappers for the most common verbs; "
+        "(2) `vw(command, params)` generic dispatcher — reaches every function "
+        "in the bridge's commands.py (use `list_commands` to discover); "
+        "(3) `execute_script` for arbitrary vs.* Python. "
+        "Object IDs are UUIDs (strings) returned by vs.GetObjectUuid."
+    ),
     host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("FASTMCP_PORT", "8082")),
     lifespan=server_lifespan
@@ -968,6 +975,180 @@ def execute_script(ctx: Context, code: str) -> str:
 def run_menu_command(ctx: Context, menu_name: str) -> str:
     """Trigger a Vectorworks menu command by name (e.g. 'Fit to Objects')"""
     return cmd("run_menu_command", {"menu_name": menu_name})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Generic Dispatch — reach the full commands.py surface without schema bloat
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def vw(ctx: Context, command: str, params: dict = None) -> str:
+    """Generic VW command dispatcher.
+
+    Calls ANY function defined in the bridge's commands.py by name. The bridge
+    hot-reloads commands.py on every dispatch, so additions take effect
+    immediately. Use `list_commands(filter)` to discover what's available —
+    typical examples: `vw('create_pio', {'name':'Door','x':0,'y':0})`,
+    `vw('offset_polygon', {'object_id':uuid,'distance':500})`,
+    `vw('send_to_surface', {'object_id':uuid})`, `vw('list_components', {...})`."""
+    return cmd(command, params or {})
+
+@mcp.tool()
+def vw_batch(ctx: Context, calls: list) -> str:
+    """Run multiple VW commands in one round-trip (saves socket + main-thread trips).
+    calls: [{'command': str, 'params': dict}, ...]. Returns list of results in order."""
+    return cmd("_batch", {"calls": calls})
+
+@mcp.tool()
+def list_commands(ctx: Context, filter: str = None) -> str:
+    """List all bridge commands callable via `vw`. Optional substring filter."""
+    p = {}
+    if filter: p["filter"] = filter
+    return cmd("list_commands", p)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# High-frequency new verbs (explicit wrappers — the 80/20 set)
+# ═══════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def create_pio(ctx: Context, name: str, x: float, y: float, rotation: float = 0,
+               show_pref: bool = False, parameters: dict = None,
+               layer: str = None, obj_class: str = None) -> str:
+    """Create a Plug-in Object (Door, Window, Stair, Fence, Hardscape, Data Tag, ...).
+    Uses CreateCustomObjectN so IsNewCustomObject fires correctly.
+    parameters: {field_name: value} applied via SetRField + ResetObject."""
+    p = {"name": name, "x": x, "y": y, "rotation": rotation, "show_pref": show_pref}
+    if parameters: p["parameters"] = parameters
+    if layer: p["layer"] = layer
+    if obj_class: p["class"] = obj_class
+    return cmd("create_pio", p)
+
+@mcp.tool()
+def get_pio_parameters(ctx: Context, object_id: str) -> str:
+    """Read all parameter fields of a PIO (returns {record, fields: {...}})."""
+    return cmd("get_pio_parameters", {"object_id": object_id})
+
+@mcp.tool()
+def set_pio_parameter(ctx: Context, object_id: str, field: str, value) -> str:
+    """Set one PIO parameter field. Triggers ResetObject to force regen."""
+    return cmd("set_pio_parameter", {"object_id": object_id, "field": field, "value": value})
+
+@mcp.tool()
+def create_linear_dimension(ctx: Context, x1: float, y1: float, x2: float, y2: float,
+                            offset: float = 0, dim_type: int = 771,
+                            associate_to: str = None, zero_text_perp: bool = False,
+                            layer: str = None) -> str:
+    """Linear dim between (x1,y1) and (x2,y2).
+    Gotcha: offset is text offset ALONG the dim line, not perpendicular.
+    Pass zero_text_perp=True to center text on the dim line (sets OV 43 = 0).
+    associate_to: UUID to bind dim to an object via AssociateLinearDimension."""
+    p = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "offset": offset,
+         "dim_type": dim_type, "zero_text_perp": zero_text_perp}
+    if associate_to: p["associate_to"] = associate_to
+    if layer: p["layer"] = layer
+    return cmd("create_linear_dimension", p)
+
+@mcp.tool()
+def send_to_surface(ctx: Context, object_id: str, tin_type: int = 2,
+                    site_model_id: str = None) -> str:
+    """Drape a 2D object onto the site model. tin_type: 0 existing / 1 proposed / 2 current.
+    Returns the new 3D poly UUID (uses PrevObj(LNewObj) trick internally)."""
+    p = {"object_id": object_id, "tin_type": tin_type}
+    if site_model_id: p["site_model_id"] = site_model_id
+    return cmd("send_to_surface", p)
+
+@mcp.tool()
+def get_z_at_xy(ctx: Context, x: float, y: float, tin_type: int = 2,
+                site_model_id: str = None) -> str:
+    """Z elevation at planar (x, y) on the site model."""
+    p = {"x": x, "y": y, "tin_type": tin_type}
+    if site_model_id: p["site_model_id"] = site_model_id
+    return cmd("get_z_at_xy", p)
+
+@mcp.tool()
+def list_hatches(ctx: Context) -> str:
+    """List all vector fill (hatch) resources in the document."""
+    return cmd("list_hatches")
+
+@mcp.tool()
+def set_hatch_on_object(ctx: Context, object_id: str, hatch_name: str) -> str:
+    """Apply a named vector fill / hatch to an object."""
+    return cmd("set_hatch_on_object", {"object_id": object_id, "hatch_name": hatch_name})
+
+@mcp.tool()
+def offset_polygon(ctx: Context, object_id: str, distance: float) -> str:
+    """Offset a polygon by distance (signed — +/-). Returns new polygon UUID."""
+    return cmd("offset_polygon", {"object_id": object_id, "distance": distance})
+
+@mcp.tool()
+def polygon_centroid(ctx: Context, object_id: str) -> str:
+    """Centroid (x,y) of a polygon."""
+    return cmd("polygon_centroid", {"object_id": object_id})
+
+@mcp.tool()
+def create_material(ctx: Context, name: str, simple: bool = True) -> str:
+    """Create a new material resource. simple=True for a simple material, False for multi-layer."""
+    return cmd("create_material", {"name": name, "simple": simple})
+
+@mcp.tool()
+def assign_material(ctx: Context, object_id: str, material_name: str) -> str:
+    """Assign a material to an object (SetObjMaterialHandle)."""
+    return cmd("assign_material", {"object_id": object_id, "material_name": material_name})
+
+@mcp.tool()
+def list_components(ctx: Context, object_id: str) -> str:
+    """List wall/slab/roof components with width, class, function, net area/volume."""
+    return cmd("list_components", {"object_id": object_id})
+
+@mcp.tool()
+def insert_component(ctx: Context, object_id: str, before_index: int = 1,
+                     width: float = 10, fill: int = 1,
+                     left_pen_weight: int = 25, right_pen_weight: int = 25,
+                     left_pen_style: int = 2, right_pen_style: int = 2) -> str:
+    """Insert a new component into a wall/slab/roof at before_index (1-based)."""
+    return cmd("insert_component", {"object_id": object_id, "before_index": before_index,
+                                     "width": width, "fill": fill,
+                                     "left_pen_weight": left_pen_weight,
+                                     "right_pen_weight": right_pen_weight,
+                                     "left_pen_style": left_pen_style,
+                                     "right_pen_style": right_pen_style})
+
+@mcp.tool()
+def add_vp_class_override(ctx: Context, viewport_id: str, class_name: str,
+                          fill_fore_rgb: list = None, fill_back_rgb: list = None,
+                          pen_fore_rgb: list = None, pen_back_rgb: list = None,
+                          fill_opacity: int = None, pen_opacity: int = None,
+                          fill_style: int = None) -> str:
+    """Add a class override to a viewport. RGB args are [r,g,b] 0-255."""
+    p = {"viewport_id": viewport_id, "class_name": class_name}
+    for k, v in {"fill_fore_rgb": fill_fore_rgb, "fill_back_rgb": fill_back_rgb,
+                 "pen_fore_rgb": pen_fore_rgb, "pen_back_rgb": pen_back_rgb,
+                 "fill_opacity": fill_opacity, "pen_opacity": pen_opacity,
+                 "fill_style": fill_style}.items():
+        if v is not None: p[k] = v
+    return cmd("add_vp_class_override", p)
+
+@mcp.tool()
+def list_vp_class_overrides(ctx: Context, viewport_id: str) -> str:
+    """List class overrides on a viewport."""
+    return cmd("list_vp_class_overrides", {"viewport_id": viewport_id})
+
+@mcp.tool()
+def solid_boolean(ctx: Context, object_id_a: str, object_id_b: str,
+                  op: str = "add") -> str:
+    """Solid boolean. op: add, subtract, intersect."""
+    fn = {"add": "solid_add", "subtract": "solid_subtract", "intersect": "solid_intersect"}.get(op)
+    if not fn: return '{"error":"op must be add/subtract/intersect"}'
+    return cmd(fn, {"object_id_a": object_id_a, "object_id_b": object_id_b})
+
+@mcp.tool()
+def create_static_hatch(ctx: Context, hatch_name: str, x: float, y: float,
+                        angle: float = 0, layer: str = None) -> str:
+    """Create a static hatch region at (x,y) filled with hatch_name."""
+    p = {"hatch_name": hatch_name, "x": x, "y": y, "angle": angle}
+    if layer: p["layer"] = layer
+    return cmd("create_static_hatch", p)
 
 
 # ═══════════════════════════════════════════════════════════════════
