@@ -726,7 +726,7 @@ def get_walls(ctx: Context, layer: str = None) -> str:
 
 @mcp.tool()
 def get_plants(ctx: Context, layer: str = None, limit: int = 500) -> str:
-    """Get all plant objects with parametric record data (Botanischer Name, H\u00f6he, etc.)"""
+    """Get all plant objects with parametric record data (Botanischer Name, Höhe, etc.)"""
     p = {"limit": limit}
     if layer: p["layer"] = layer
     return cmd("get_plants", p)
