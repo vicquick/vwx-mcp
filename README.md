@@ -13,7 +13,7 @@ Claude Code
 mcp-server/vw_mcp_server.py     (FastMCP)
     │ TCP :9878, JSON newline-delimited (persistent, multi-message)
     ▼
-vw-plugin/vw_mcp_bridge.py      (runs inside Vectorworks)
+vwx-plugin/vw_mcp_bridge.py      (runs inside Vectorworks)
     ├── bg thread: socket I/O only (loops reading framed JSON)
     ├── queue:    cmd_queue / result_map / result_events
     └── main thread: vs.* dispatch via RegisterDialogForTimerEvents (100ms)
@@ -25,7 +25,7 @@ Dialog events observed on VW2026 (for reference): setup=12255, teardown=12256, t
 
 ## Install
 
-1. Copy `vw-plugin/` contents to `%APPDATA%\Nemetschek\Vectorworks\2026\Plug-ins\VWX-MCP\`
+1. Copy `vwx-plugin/` contents to `%APPDATA%\Nemetschek\Vectorworks\2026\Plug-ins\VWX-MCP\`
 2. Copy `mcp-server/vw_mcp_server.py` to `%USERPROFILE%\.local\share\vwx-mcp\`
 3. Copy `bridge/vwx-mcp.bat` to `%USERPROFILE%\bridge\`
 4. Ensure `python` on PATH. Install deps: `pip install mcp fastmcp`

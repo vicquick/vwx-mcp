@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
-vw-plugin/bridge.log
+vwx-plugin/bridge.log
 .vscode/
 .idea/
