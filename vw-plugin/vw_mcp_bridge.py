@@ -25,9 +25,15 @@ import os, sys, socket, threading, queue, json, traceback, time
 try:
     _DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
-    _DIR = os.path.join(os.environ.get('APPDATA', ''),
-                        'Nemetschek', 'Vectorworks', '2026',
-                        'Plug-ins', 'VW-MCP')
+    _base = os.path.join(os.environ.get('APPDATA', ''),
+                         'Nemetschek', 'Vectorworks', '2026', 'Plug-ins')
+    for _name in ('VWX-MCP', 'VW-MCP'):
+        _cand = os.path.join(_base, _name)
+        if os.path.isdir(_cand):
+            _DIR = _cand
+            break
+    else:
+        _DIR = os.path.join(_base, 'VWX-MCP')
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
