@@ -193,6 +193,8 @@ TOOL_TAGS = {
     "stipple_fill": "draw2d",
     "tree_symbol": "draw2d",
     "dashed_route": "draw2d",
+    "create_gradient_fill": "appearance",
+    "apply_resource_fill": "appearance",
 }
 
 # workflow presets -> set of tags to enable (only=True). "full" = no filtering.
