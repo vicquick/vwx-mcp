@@ -188,6 +188,11 @@ TOOL_TAGS = {
     "list_commands": "escape",
     "set_object_variable": "escape",
     "get_object_variable": "escape",
+    # landscape-architecture primitives
+    "path_band": "draw2d",
+    "stipple_fill": "draw2d",
+    "tree_symbol": "draw2d",
+    "dashed_route": "draw2d",
 }
 
 # workflow presets -> set of tags to enable (only=True). "full" = no filtering.
