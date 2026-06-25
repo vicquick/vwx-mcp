@@ -238,6 +238,41 @@ def get_classes(p):
         })
     return {'classes': classes, 'count': len(classes)}
 
+def _class_names_used():
+    """VW2026 dropped GetClassName/GetClName/ClassList — the only reliable way
+    to enumerate class names is to walk objects and collect vs.GetClass(h).
+    Returns sorted unique class names actually used by geometry."""
+    seen = set()
+    def cb(h):
+        try:
+            c = vs.GetClass(h)
+            if c: seen.add(c)
+        except Exception:
+            pass
+    try:
+        vs.ForEachObject(cb, 'ALL')
+    except Exception:
+        pass
+    return sorted(seen)
+
+def get_class_styles(p):
+    """Per-class appearance for QGIS/GIS styling (VW2026-safe).
+    Enumerates classes by walking objects (GetClassName APIs are gone in 2026),
+    or pass {'names': [...]} explicitly. Colors returned as 0-255 RGB."""
+    names = p.get('names') or _class_names_used()
+    out = {}
+    for nm in names:
+        d = {}
+        ff = _safe(lambda: vs.GetClFillFore(nm))
+        d['fill'] = [_c255(ff[0]), _c255(ff[1]), _c255(ff[2])] if ff else None
+        pf = _safe(lambda: vs.GetClPenFore(nm))
+        d['pen'] = [_c255(pf[0]), _c255(pf[1]), _c255(pf[2])] if pf else None
+        d['lineweight'] = _safe(lambda: vs.GetClLW(nm))      # VW mils; mm = lw * 0.0254
+        d['fill_pattern'] = _safe(lambda: vs.GetClFPat(nm))  # 0=none, 1/2=solid, 14=hatch, neg=tile
+        d['visible'] = _safe(lambda: vs.GetCVis(nm) == 0)
+        out[nm] = d
+    return {'count': len(out), 'classes': out}
+
 def create_class(p):
     name = p.get('name', '')
     vs.NameClass(name)
