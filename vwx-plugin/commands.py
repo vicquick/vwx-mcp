@@ -520,18 +520,17 @@ def draw_circle(p):
         _restore(prev)
 
 def draw_arc(p):
-    # VW2026: ArcByCenter may return null UUID for partial arcs too.
-    # vs.Arc(left, top, right, bottom, start_angle, end_angle) is the bbox form.
-    # NOTE: vs.Arc signature is UNVERIFIED against live VW2026 docs — it matches the
-    # pattern used by the VS scripting reference but has not been tested in this session.
-    # If it misbehaves, fall back to ArcByCenter as a last resort.
+    # VW2026: ArcByCenter returns null UUID for partial arcs too — use vs.Arc bbox form.
+    # vs.Arc(left, top, right, bottom, start_angle, sweep_angle). VERIFIED live 2026-06-25:
+    # the 6th arg is the SWEEP (included) angle, not the end angle — GetArc readback of
+    # Arc(...,30,90) returns (30, 90). Pass sweep directly, NOT start+sweep.
     prev = _with_layer_class(p)
     try:
         cx, cy = p.get('cx', 0), p.get('cy', 0)
         r = p.get('radius', 50)
         start = p.get('start_angle', 0)
         sweep = p.get('sweep_angle', 90)
-        vs.Arc(cx - r, cy + r, cx + r, cy - r, start, start + sweep)
+        vs.Arc(cx - r, cy + r, cx + r, cy - r, start, sweep)
         h = vs.LNewObj()
         return _newobj_result(p, fallback=h)
     finally:
