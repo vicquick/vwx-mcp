@@ -11,7 +11,6 @@ from contextlib import asynccontextmanager
 import socket
 import json
 from typing import AsyncIterator, Dict, Any, List, Optional
-from pydantic import BaseModel
 # Migrated bundled mcp.server.fastmcp -> standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md)
 from fastmcp import FastMCP, Context
 
@@ -149,17 +148,15 @@ def vtool(fn=None, **kwargs):
 
 # ── Destructive-action confirmation (elicitation) ─────────────────────────────
 
-class _ConfirmSchema(BaseModel):
-    """Single-field confirmation schema (primitive type per MCP elicitation spec)."""
-    confirmed: bool
-
-
 async def _confirm(ctx: Context, what: str) -> bool:
-    """Elicit user confirmation before a destructive action. True only on accept+confirmed."""
-    result = await ctx.elicit(message=what, schema=_ConfirmSchema)
-    if result.action == "accept":
-        return result.data.confirmed
-    return False  # decline / cancel
+    """Elicit a yes/no confirmation before a destructive action.
+
+    Standalone fastmcp 3.x: ctx.elicit(message, response_type) returns one of
+    AcceptedElicitation (has .data) / DeclinedElicitation / CancelledElicitation.
+    Returns True only when the user accepts AND answers yes.
+    """
+    result = await ctx.elicit(message=what, response_type=bool)
+    return bool(getattr(result, "data", False))  # .data exists only on AcceptedElicitation
 
 
 async def _vw_async(command_type, params=None):
