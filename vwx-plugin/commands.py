@@ -509,21 +509,31 @@ def draw_rectangle(p):
         _restore(prev)
 
 def draw_circle(p):
+    # VW2026: ArcByCenter((cx,cy), r, 0, 360) returns null UUID — use Oval bbox instead.
     prev = _with_layer_class(p)
     try:
         cx, cy, r = p.get('cx', 0), p.get('cy', 0), p.get('radius', 50)
-        vs.ArcByCenter((cx, cy), r, 0, 360)
-        return _newobj_result(p)
+        vs.Oval(cx - r, cy + r, cx + r, cy - r)   # left, top, right, bottom
+        h = vs.LNewObj()
+        return _newobj_result(p, fallback=h)
     finally:
         _restore(prev)
 
 def draw_arc(p):
+    # VW2026: ArcByCenter may return null UUID for partial arcs too.
+    # vs.Arc(left, top, right, bottom, start_angle, end_angle) is the bbox form.
+    # NOTE: vs.Arc signature is UNVERIFIED against live VW2026 docs — it matches the
+    # pattern used by the VS scripting reference but has not been tested in this session.
+    # If it misbehaves, fall back to ArcByCenter as a last resort.
     prev = _with_layer_class(p)
     try:
         cx, cy = p.get('cx', 0), p.get('cy', 0)
         r = p.get('radius', 50)
-        vs.ArcByCenter((cx, cy), r, p.get('start_angle', 0), p.get('sweep_angle', 90))
-        return _newobj_result(p)
+        start = p.get('start_angle', 0)
+        sweep = p.get('sweep_angle', 90)
+        vs.Arc(cx - r, cy + r, cx + r, cy - r, start, start + sweep)
+        h = vs.LNewObj()
+        return _newobj_result(p, fallback=h)
     finally:
         _restore(prev)
 
@@ -648,7 +658,8 @@ def draw_cylinder(p):
     try:
         cx, cy, cz = p.get('cx',0), p.get('cy',0), p.get('cz',0)
         r = p.get('radius', 50); ht = p.get('height', 100)
-        vs.ArcByCenter((cx, cy), r, 0, 360)
+        # VW2026: ArcByCenter returns null UUID — use Oval bbox instead (same fix as draw_circle)
+        vs.Oval(cx - r, cy + r, cx + r, cy - r)   # left, top, right, bottom
         circle = vs.LNewObj()
         eh = vs.CreateExtrude(circle, ht)
         if cz:
