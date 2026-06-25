@@ -71,3 +71,25 @@ If the client is loading too many tools, set `VWX_TOOLSET` (env, in the launcher
 2. Add a `@vtool` wrapper in `mcp-server/vwx_mcp_server.py` calling `cmd("your_verb", {...})`.
 3. Add `"your_verb": "<tag>"` to `mcp-server/tool_tags.py`.
 4. Smoke-test against a live VW (no CI can — every tool hits the running app).
+
+## Environment variables
+
+Set in `bridge/vwx-mcp.bat`.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `VWX_TOOLSET` | `full` | Toolset preset: `full`/`gis`/`modeling`/`baumkataster`/`minimal` |
+| `VWX_CALL_TIMEOUT` | `60` | Per-tool timeout (s) — native `@mcp.tool(timeout=)` on every tool |
+| `VWX_TASKS` | _(off)_ | Opt long-running tools into the MCP Tasks extension. Needs `pip install 'fastmcp[tasks]'` **and** a Tasks-capable client; warns + stays off otherwise |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | If set, exports fastmcp's spans via OTLP. Needs `opentelemetry-exporter-otlp` |
+| `MCP_TRANSPORT` | `stdio` | `streamable-http` for the HTTP server, `stdio` for local |
+| `FASTMCP_HOST` / `FASTMCP_PORT` | `0.0.0.0` / `8082` | HTTP bind |
+| `DESKTOP_HOST` / `VWX_MCP_PORT` | `127.0.0.1` / `9878` | VW bridge socket |
+
+## Reliability & observability notes
+
+- **Concurrency**: the bridge has a single socket shared by all tools; `send_command`
+  serializes one round-trip at a time under a lock. Concurrent tool calls are safe
+  but execute sequentially against VW (VW's `vs.*` runs on one main thread anyway).
+- **Logs**: each call logs `tool=<name> cid=<id> ms=<latency> status=ok|err`. The
+  `cid` also travels in the command envelope (`_cid`) so VW-side logs can be matched.
