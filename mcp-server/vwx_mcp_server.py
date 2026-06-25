@@ -1376,6 +1376,20 @@ def dashed_route(ctx: Context, points: list, dash: float = 0.7, gap: float = 0.4
     if obj_class: p["class"] = obj_class
     return cmd("dashed_route", p)
 
+@vtool
+def create_gradient_fill(ctx: Context, name: str, stops: list = None) -> str:
+    """Create a named gradient fill resource. stops = [[pos0to1, r,g,b], ...] (0-255).
+    Apply to objects with apply_resource_fill (VW2026: SetVectorFill does NOT apply
+    gradients; this path uses SetFPat(Name2Index))."""
+    p = {"name": name}
+    if stops: p["stops"] = stops
+    return cmd("create_gradient_fill", p)
+
+@vtool
+def apply_resource_fill(ctx: Context, object_id: str, name: str) -> str:
+    """Apply a named fill resource (gradient / hatch / tile / vector fill) to an object."""
+    return cmd("apply_resource_fill", {"object_id": object_id, "name": name})
+
 
 def _init_otel():
     """Opt-in OpenTelemetry export. fastmcp already emits server spans; this just

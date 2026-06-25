@@ -2709,3 +2709,34 @@ def dashed_route(p):
         return {'status': 'ok', 'count': count}
     finally:
         _restore(prev)
+
+def create_gradient_fill(p):
+    """Create a named gradient resource. params: name, stops=[[pos0to1, r,g,b], ...].
+    Apply to objects with apply_resource_fill (uses SetFPat(Name2Index) — VW2026:
+    SetVectorFill does NOT apply gradients, only hatches/vector fills)."""
+    name = p.get('name')
+    if not name: return {'error': 'name required'}
+    stops = p.get('stops') or [[0.0, 80, 160, 220], [1.0, 40, 95, 150]]
+    try:
+        idx = vs.Name2Index(name)
+        if not idx:
+            g = vs.CreateGradient(name)
+            for st in stops:
+                vs.InsertGradientData(g, float(st[0]), (_c8(st[1]), _c8(st[2]), _c8(st[3])))
+        return {'status': 'ok', 'name': name, 'index': vs.Name2Index(name)}
+    except Exception as e:
+        return {'error': str(e)}
+
+def apply_resource_fill(p):
+    """Apply a named fill resource (gradient / hatch / tile / vector fill) to an object
+    via SetFPat(object, Name2Index(name)). params: object_id, name."""
+    h = _h(p.get('object_id')); name = p.get('name')
+    if not h: return {'error': 'Object not found'}
+    if not name: return {'error': 'name required'}
+    try:
+        idx = vs.Name2Index(name)
+        if not idx: return {'error': 'resource not found: %s' % name}
+        vs.SetFPat(h, idx)
+        return {'status': 'ok', 'index': idx}
+    except Exception as e:
+        return {'error': str(e)}
