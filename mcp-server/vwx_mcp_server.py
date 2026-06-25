@@ -10,6 +10,9 @@ import logging
 from contextlib import asynccontextmanager
 import socket
 import json
+import time
+import uuid
+import threading
 from typing import AsyncIterator, Dict, Any, List, Optional
 # Migrated bundled mcp.server.fastmcp -> standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md)
 from fastmcp import FastMCP, Context
@@ -30,6 +33,11 @@ class VwxMCPServer:
         self.host = host
         self.port = port
         self.socket = None
+        # The single bridge socket is shared across tools that may run concurrently
+        # (sync tools execute in fastmcp's threadpool, async ones via to_thread).
+        # Serialize one full request/response round-trip at a time, else interleaved
+        # sendall/recv corrupts the stream (WinError 10053 / aborted connection).
+        self._lock = threading.Lock()
 
     def connect(self):
         try:
@@ -48,28 +56,44 @@ class VwxMCPServer:
             self.socket = None
 
     def send_command(self, command_type, params=None):
-        """Send newline-delimited JSON command, read newline-delimited response."""
+        """Send newline-delimited JSON command, read newline-delimited response.
+
+        One round-trip is serialized under self._lock so concurrent tool calls
+        can't interleave on the shared socket. A correlation id (cid) + latency
+        are logged per call; cid also rides in the command envelope so the VW-side
+        plugin log can be matched up.
+        """
+        cid = uuid.uuid4().hex[:8]
         if not self.socket:
-            return {"error": "Not connected to Vectorworks"}
-        command = {"type": command_type, "params": params or {}}
+            return {"error": "Not connected to Vectorworks", "cid": cid}
+        command = {"type": command_type, "params": params or {}, "_cid": cid}
+        t0 = time.perf_counter()
         try:
-            self.socket.sendall(json.dumps(command).encode('utf-8') + b'\n')
-            response_data = b''
-            while True:
-                chunk = self.socket.recv(65536)
-                if not chunk:
-                    break
-                response_data += chunk
-                if b'\n' in response_data:
-                    line = response_data.split(b'\n', 1)[0]
-                    return json.loads(line.decode('utf-8'))
-            if response_data.strip():
-                return json.loads(response_data.strip().decode('utf-8'))
-            return {"error": "Empty response"}
+            with self._lock:
+                self.socket.sendall(json.dumps(command).encode('utf-8') + b'\n')
+                response_data = b''
+                result = None
+                while True:
+                    chunk = self.socket.recv(65536)
+                    if not chunk:
+                        break
+                    response_data += chunk
+                    if b'\n' in response_data:
+                        line = response_data.split(b'\n', 1)[0]
+                        result = json.loads(line.decode('utf-8'))
+                        break
+                if result is None:
+                    result = (json.loads(response_data.strip().decode('utf-8'))
+                              if response_data.strip() else {"error": "Empty response"})
+            ms = (time.perf_counter() - t0) * 1000
+            status = "err" if isinstance(result, dict) and result.get("error") else "ok"
+            logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} status={status}")
+            return result
         except Exception as e:
-            logger.error(f"Error sending command: {e}")
+            ms = (time.perf_counter() - t0) * 1000
+            logger.error(f"tool={command_type} cid={cid} ms={ms:.0f} status=exc err={e}")
             self.disconnect()
-            return {"error": str(e)}
+            return {"error": str(e), "cid": cid}
 
 
 _vwx_connection = None
@@ -1314,7 +1338,31 @@ def draw_regular_polygon(ctx: Context, cx: float, cy: float, radius: float,
     return cmd("draw_regular_polygon", p)
 
 
+def _init_otel():
+    """Opt-in OpenTelemetry export. fastmcp already emits server spans; this just
+    wires an OTLP exporter when OTEL_EXPORTER_OTLP_ENDPOINT is set. No-op otherwise
+    (no collector required for local use). Needs `opentelemetry-exporter-otlp`.
+    """
+    if not os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        return False
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        provider = TracerProvider()
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        trace.set_tracer_provider(provider)
+        logger.info(f"OpenTelemetry export -> {os.environ['OTEL_EXPORTER_OTLP_ENDPOINT']}")
+        return True
+    except Exception as e:
+        logger.warning(f"OTel export requested but not enabled: {e} "
+                       f"(pip install opentelemetry-exporter-otlp)")
+        return False
+
+
 def main():
+    _init_otel()
     # Optional toolset filtering via the fastmcp Visibility API.
     # VWX_TOOLSET=gis|modeling|baumkataster|minimal|full (default full = no filter).
     from tool_tags import preset_tags
