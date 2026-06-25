@@ -5,6 +5,7 @@ Connects to the VWX MCP bridge running inside Vectorworks 2026.
 """
 
 import os
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 import socket
@@ -19,6 +20,9 @@ logger = logging.getLogger("VwxMCPServer")
 
 VWX_HOST = os.environ.get("DESKTOP_HOST", "127.0.0.1")
 VWX_PORT = int(os.environ.get("VWX_MCP_PORT", os.environ.get("VW_MCP_PORT", "9878")))
+# Per-call timeout (seconds) applied to every tool via vtool() -> @mcp.tool(timeout=).
+# Guards against a hung Vectorworks main thread wedging the MCP session.
+VWX_CALL_TIMEOUT = float(os.environ.get("VWX_CALL_TIMEOUT", "60"))
 
 
 class VwxMCPServer:
@@ -131,14 +135,35 @@ from tool_tags import TOOL_TAGS
 
 
 def vtool(fn=None, **kwargs):
-    """@vtool + declarative tag from TOOL_TAGS[fn.__name__]."""
+    """@vtool + declarative tag from TOOL_TAGS[fn.__name__] + native per-call timeout."""
     def deco(f):
         kwargs.setdefault("output_schema", None)
+        kwargs.setdefault("timeout", VWX_CALL_TIMEOUT)   # native fastmcp 3.x per-tool timeout
         tag = TOOL_TAGS.get(f.__name__)
         if tag:
             kwargs["tags"] = set(kwargs.get("tags") or set()) | {tag}
         return mcp.tool(**kwargs)(f)
     return deco(fn) if callable(fn) else deco
+
+
+# ── Destructive-action confirmation (elicitation) ─────────────────────────────
+
+async def _confirm(ctx: Context, what: str) -> bool:
+    """Elicit a yes/no confirmation before a destructive action.
+
+    Standalone fastmcp 3.x: ctx.elicit(message, response_type) returns one of
+    AcceptedElicitation (has .data) / DeclinedElicitation / CancelledElicitation.
+    Returns True only when the user accepts AND answers yes.
+    """
+    result = await ctx.elicit(message=what, response_type=bool)
+    return bool(getattr(result, "data", False))  # .data exists only on AcceptedElicitation
+
+
+async def _vw_async(command_type, params=None):
+    """Run a bridge command off the event loop (for async tools). The native
+    @mcp.tool(timeout=) wrapper cancels this await if VW stalls."""
+    result = await asyncio.to_thread(get_vwx_connection().send_command, command_type, params)
+    return json.dumps(result, indent=2)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -161,9 +186,11 @@ def save_document(ctx: Context) -> str:
     return cmd("save_document")
 
 @vtool
-def save_document_as(ctx: Context, path: str) -> str:
+async def save_document_as(ctx: Context, path: str) -> str:
     """Save document to a new path (absolute .vwx path)"""
-    return cmd("save_document_as", {"path": path})
+    if not await _confirm(ctx, f"Save document as '{path}'? This will overwrite if the file already exists."):
+        return '{"status": "cancelled", "reason": "cancelled by user"}'
+    return await _vw_async("save_document_as", {"path": path})
 
 @vtool
 def get_document_preferences(ctx: Context) -> str:
@@ -201,9 +228,11 @@ def create_layer(ctx: Context, name: str, layer_type: str = "design", scale: flo
     return cmd("create_layer", p)
 
 @vtool
-def delete_layer(ctx: Context, name: str) -> str:
+async def delete_layer(ctx: Context, name: str) -> str:
     """Delete a layer by name"""
-    return cmd("delete_layer", {"name": name})
+    if not await _confirm(ctx, f"Delete layer '{name}' and all its objects? This cannot be undone."):
+        return '{"status": "cancelled", "reason": "cancelled by user"}'
+    return await _vw_async("delete_layer", {"name": name})
 
 @vtool
 def set_active_layer(ctx: Context, name: str) -> str:
@@ -246,9 +275,11 @@ def create_class(ctx: Context, name: str) -> str:
     return cmd("create_class", {"name": name})
 
 @vtool
-def delete_class(ctx: Context, name: str) -> str:
+async def delete_class(ctx: Context, name: str) -> str:
     """Delete a class by name"""
-    return cmd("delete_class", {"name": name})
+    if not await _confirm(ctx, f"Delete class '{name}'? This cannot be undone."):
+        return '{"status": "cancelled", "reason": "cancelled by user"}'
+    return await _vw_async("delete_class", {"name": name})
 
 @vtool
 def set_active_class(ctx: Context, name: str) -> str:
@@ -360,9 +391,11 @@ def scale_object(ctx: Context, object_id: str, sx: float, sy: float,
     return cmd("scale_object", p)
 
 @vtool
-def delete_object(ctx: Context, object_id: str) -> str:
+async def delete_object(ctx: Context, object_id: str) -> str:
     """Delete an object by id"""
-    return cmd("delete_object", {"object_id": object_id})
+    if not await _confirm(ctx, f"Delete object '{object_id}'? This cannot be undone."):
+        return '{"status": "cancelled", "reason": "cancelled by user"}'
+    return await _vw_async("delete_object", {"object_id": object_id})
 
 @vtool
 def duplicate_object(ctx: Context, object_id: str, dx: float = 0, dy: float = 0) -> str:
@@ -578,9 +611,11 @@ def create_symbol_from_objects(ctx: Context, object_ids: list, name: str,
                                                "origin_x": origin_x, "origin_y": origin_y})
 
 @vtool
-def delete_symbol(ctx: Context, name: str) -> str:
+async def delete_symbol(ctx: Context, name: str) -> str:
     """Delete a symbol definition (and optionally all instances)"""
-    return cmd("delete_symbol", {"name": name})
+    if not await _confirm(ctx, f"Delete symbol definition '{name}' and all its instances? This cannot be undone."):
+        return '{"status": "cancelled", "reason": "cancelled by user"}'
+    return await _vw_async("delete_symbol", {"name": name})
 
 @vtool
 def rename_symbol(ctx: Context, old_name: str, new_name: str) -> str:
