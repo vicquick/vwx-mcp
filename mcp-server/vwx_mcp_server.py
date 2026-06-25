@@ -27,6 +27,25 @@ VWX_PORT = int(os.environ.get("VWX_MCP_PORT", os.environ.get("VW_MCP_PORT", "987
 # Guards against a hung Vectorworks main thread wedging the MCP session.
 VWX_CALL_TIMEOUT = float(os.environ.get("VWX_CALL_TIMEOUT", "60"))
 
+# MCP Tasks extension (RC spec, finalizes 2026-07-28). OFF by default: a task=True
+# tool returns a task handle the client must poll (tasks/get), which breaks clients
+# that don't yet support the extension. Also requires the `fastmcp[tasks]` extra
+# (docket). Set VWX_TASKS=1 to opt the long-running tools below into it once both
+# your client is Tasks-capable AND the extra is installed.
+VWX_TASKS = bool(os.environ.get("VWX_TASKS"))
+_TASK_TOOLS = {
+    "export_pdf", "export_dxf", "export_image", "export_ifc", "export_shp",
+    "import_dwg", "import_image", "update_site_model", "batch_update_plants",
+}
+try:                       # the Tasks extra (docket) — gates the opt-in so a bare
+    import docket          # VWX_TASKS=1 without the extra warns instead of crashing
+    _TASKS_AVAILABLE = True
+except Exception:
+    _TASKS_AVAILABLE = False
+if VWX_TASKS and not _TASKS_AVAILABLE:
+    logger.warning("VWX_TASKS=1 set but the Tasks extra is missing — "
+                   "install with: pip install 'fastmcp[tasks]'. Tasks disabled.")
+
 
 class VwxMCPServer:
     def __init__(self, host=VWX_HOST, port=VWX_PORT):
@@ -163,6 +182,8 @@ def vtool(fn=None, **kwargs):
     def deco(f):
         kwargs.setdefault("output_schema", None)
         kwargs.setdefault("timeout", VWX_CALL_TIMEOUT)   # native fastmcp 3.x per-tool timeout
+        if VWX_TASKS and _TASKS_AVAILABLE and f.__name__ in _TASK_TOOLS:
+            kwargs.setdefault("task", True)              # opt-in MCP Tasks for long-running tools
         tag = TOOL_TAGS.get(f.__name__)
         if tag:
             kwargs["tags"] = set(kwargs.get("tags") or set()) | {tag}
