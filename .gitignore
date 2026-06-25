@@ -4,3 +4,8 @@ __pycache__/
 vwx-plugin/bridge.log
 .vscode/
 .idea/
+
+# sketch_to_plan vectorizer outputs (large generated files)
+tools/sketch_to_plan/output/*.png
+tools/sketch_to_plan/output/*.json
+tools/sketch_to_plan/output/*.py

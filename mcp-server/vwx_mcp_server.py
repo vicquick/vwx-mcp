@@ -1328,6 +1328,69 @@ def draw_regular_polygon(ctx: Context, cx: float, cy: float, radius: float,
     return cmd("draw_regular_polygon", p)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Landscape-architecture primitives (drawn-texture toolkit)
+# ═══════════════════════════════════════════════════════════════════
+
+@vtool
+def path_band(ctx: Context, points: list, width: float = 2.0,
+              r: int = 205, g: int = 195, b: int = 185,
+              pen_r: int = 168, pen_g: int = 158, pen_b: int = 138,
+              line_weight: int = 8, layer: str = None, obj_class: str = None) -> str:
+    """Filled curved walkway/path band from a centerline list of [x,y] points (offset polygon)."""
+    p = {"points": points, "width": width, "r": r, "g": g, "b": b,
+         "pen_r": pen_r, "pen_g": pen_g, "pen_b": pen_b, "line_weight": line_weight}
+    if layer: p["layer"] = layer
+    if obj_class: p["class"] = obj_class
+    return cmd("path_band", p)
+
+@vtool
+def stipple_fill(ctx: Context, points: list, width: float = 1.5, per_point: int = 4,
+                 r: int = 178, g: int = 162, b: int = 128,
+                 size_min: float = 0.05, size_max: float = 0.12, seed: int = 7,
+                 layer: str = None, obj_class: str = None) -> str:
+    """Scatter dots along a centerline band — gravel / Schotterrasen texture."""
+    p = {"points": points, "width": width, "per_point": per_point, "r": r, "g": g, "b": b,
+         "size_min": size_min, "size_max": size_max, "seed": seed}
+    if layer: p["layer"] = layer
+    if obj_class: p["class"] = obj_class
+    return cmd("stipple_fill", p)
+
+@vtool
+def tree_symbol(ctx: Context, cx: float, cy: float, radius: float = 1.5,
+                kind: str = "bestand", r: int = 124, g: int = 172, b: int = 98,
+                layer: str = None, obj_class: str = None) -> str:
+    """LA plan tree symbol. kind='bestand' (layered existing-tree canopy) or 'neu' (new-tree circle+cross)."""
+    p = {"cx": cx, "cy": cy, "radius": radius, "kind": kind, "r": r, "g": g, "b": b}
+    if layer: p["layer"] = layer
+    if obj_class: p["class"] = obj_class
+    return cmd("tree_symbol", p)
+
+@vtool
+def dashed_route(ctx: Context, points: list, dash: float = 0.7, gap: float = 0.45,
+                 r: int = 190, g: int = 90, b: int = 70, line_weight: int = 8,
+                 layer: str = None, obj_class: str = None) -> str:
+    """Dashed polyline (e.g. mögliche Wegeführung) along a list of [x,y] points."""
+    p = {"points": points, "dash": dash, "gap": gap, "r": r, "g": g, "b": b, "line_weight": line_weight}
+    if layer: p["layer"] = layer
+    if obj_class: p["class"] = obj_class
+    return cmd("dashed_route", p)
+
+@vtool
+def create_gradient_fill(ctx: Context, name: str, stops: list = None) -> str:
+    """Create a named gradient fill resource. stops = [[pos0to1, r,g,b], ...] (0-255).
+    Apply to objects with apply_resource_fill (VW2026: SetVectorFill does NOT apply
+    gradients; this path uses SetFPat(Name2Index))."""
+    p = {"name": name}
+    if stops: p["stops"] = stops
+    return cmd("create_gradient_fill", p)
+
+@vtool
+def apply_resource_fill(ctx: Context, object_id: str, name: str) -> str:
+    """Apply a named fill resource (gradient / hatch / tile / vector fill) to an object."""
+    return cmd("apply_resource_fill", {"object_id": object_id, "name": name})
+
+
 def _init_otel():
     """Opt-in OpenTelemetry export. fastmcp already emits server spans; this just
     wires an OTLP exporter when OTEL_EXPORTER_OTLP_ENDPOINT is set. No-op otherwise

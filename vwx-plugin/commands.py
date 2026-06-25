@@ -2589,3 +2589,154 @@ def run_menu_command(p):
     cmd = p.get('menu_name') or p.get('command') or ''
     vs.DoMenuTextByName(cmd, p.get('version', 0))
     return {'status': 'ok', 'command': cmd}
+
+
+# ── Landscape-architecture drawing primitives ───────────────────────────────
+import math as _math, random as _random
+
+def _la_offsetpoly(points, width):
+    """Build a closed offset-polygon (constant-width band) around a centerline."""
+    n = len(points); L = []; R = []
+    for i in range(n):
+        x, y = points[i]
+        if i == 0:        dx, dy = points[1][0]-x, points[1][1]-y
+        elif i == n-1:    dx, dy = x-points[i-1][0], y-points[i-1][1]
+        else:             dx, dy = points[i+1][0]-points[i-1][0], points[i+1][1]-points[i-1][1]
+        d = _math.hypot(dx, dy) or 1; nx, ny = -dy/d, dx/d
+        L.append((x+nx*width/2, y+ny*width/2)); R.append((x-nx*width/2, y-ny*width/2))
+    return L + R[::-1]
+
+def _la_setfill(h, r, g, b, pen=None, lw=8):
+    col = (_c8(r), _c8(g), _c8(b))
+    vs.SetFPat(h, 1); vs.SetFillFore(h, col); vs.SetFillBack(h, col)
+    if pen:
+        pc = (_c8(pen[0]), _c8(pen[1]), _c8(pen[2]))
+        vs.SetPenFore(h, pc); vs.SetPenBack(h, pc)
+    vs.SetLW(h, int(lw))
+    return h
+
+def path_band(p):
+    """Filled curved walkway from a centerline. params: points [[x,y]...], width,
+    r,g,b, pen_r/g/b, line_weight, layer, class."""
+    pts = p.get('points') or []
+    if len(pts) < 2: return {'error': 'need >=2 points'}
+    prev = _with_layer_class(p)
+    try:
+        poly = _la_offsetpoly(pts, float(p.get('width', 2.0)))
+        vs.Poly(*[c for pt in poly for c in pt]); h = vs.LNewObj()
+        pen = (p.get('pen_r', 168), p.get('pen_g', 158), p.get('pen_b', 138))
+        _la_setfill(h, p.get('r', 205), p.get('g', 195), p.get('b', 185), pen, p.get('line_weight', 8))
+        return _newobj_result(p, fallback=h)
+    finally:
+        _restore(prev)
+
+def stipple_fill(p):
+    """Scatter dots along a centerline band (gravel / Schotterrasen texture).
+    params: points, width, per_point, r,g,b, size_min, size_max, seed, layer, class."""
+    pts = p.get('points') or []
+    if len(pts) < 2: return {'error': 'need >=2 points'}
+    prev = _with_layer_class(p)
+    try:
+        w = float(p.get('width', 1.5)); per = int(p.get('per_point', 4))
+        r0 = float(p.get('size_min', 0.05)); r1 = float(p.get('size_max', 0.12))
+        col = (_c8(p.get('r', 178)), _c8(p.get('g', 162)), _c8(p.get('b', 128)))
+        _random.seed(int(p.get('seed', 7)))
+        n = len(pts); count = 0
+        for i in range(n):
+            x, y = pts[i]; j0 = max(i-1, 0); j1 = min(i+1, n-1)
+            dx = pts[j1][0]-pts[j0][0]; dy = pts[j1][1]-pts[j0][1]
+            d = _math.hypot(dx, dy) or 1; nx, ny = -dy/d, dx/d
+            for _ in range(per):
+                o = _random.uniform(-w/2, w/2); s = _random.uniform(-0.6, 0.6); rr = _random.uniform(r0, r1)
+                cx = x+nx*o+dx/d*s; cy = y+ny*o+dy/d*s
+                vs.Oval(cx-rr, cy+rr, cx+rr, cy-rr); h = vs.LNewObj()
+                vs.SetFPat(h, 1); vs.SetFillFore(h, col); vs.SetFillBack(h, col); vs.SetLW(h, 2)
+                count += 1
+        return {'status': 'ok', 'count': count}
+    finally:
+        _restore(prev)
+
+def tree_symbol(p):
+    """LA plan tree symbol. params: cx, cy, radius, kind=bestand|neu, r,g,b (canopy),
+    pen_r/g/b, layer, class."""
+    cx = float(p.get('cx', 0)); cy = float(p.get('cy', 0)); r = float(p.get('radius', 1.5))
+    kind = p.get('kind', 'bestand')
+    prev = _with_layer_class(p)
+    try:
+        cr, cg, cb = p.get('r', 124), p.get('g', 172), p.get('b', 98)
+        can = (_c8(cr), _c8(cg), _c8(cb))
+        pen = (_c8(p.get('pen_r', 70)), _c8(p.get('pen_g', 118)), _c8(p.get('pen_b', 60)))
+        trunk = (_c8(110), _c8(82), _c8(52)); count = 0
+        def _circ(x, y, rad): vs.Oval(x-rad, y+rad, x+rad, y-rad); return vs.LNewObj()
+        if kind == 'neu':
+            h = _circ(cx, cy, r); vs.SetFPat(h, 1); vs.SetFillFore(h, can); vs.SetFillBack(h, can); vs.SetPenFore(h, pen); vs.SetLW(h, 6); count += 1
+            for (ax, ay, bx, by) in ((-r*0.55, 0, r*0.55, 0), (0, -r*0.55, 0, r*0.55)):
+                vs.MoveTo(cx+ax, cy+ay); vs.LineTo(cx+bx, cy+by); l = vs.LNewObj(); vs.SetPenFore(l, pen); vs.SetLW(l, 6); count += 1
+        else:
+            coords = []
+            for i in range(28):
+                a = 2*_math.pi*i/28; rr = r*(1+0.12*_math.sin(7*a)); coords += [cx+rr*_math.cos(a), cy+rr*_math.sin(a)]
+            vs.Poly(*coords); h = vs.LNewObj(); vs.SetFPat(h, 1); vs.SetFillFore(h, can); vs.SetFillBack(h, can); vs.SetPenFore(h, pen); vs.SetLW(h, 8); count += 1
+            ic = (_c8(max(cr-26, 0)), _c8(max(cg-22, 0)), _c8(max(cb-16, 0)))
+            h = _circ(cx, cy, r*0.6); vs.SetFPat(h, 1); vs.SetFillFore(h, ic); vs.SetFillBack(h, ic); vs.SetPenFore(h, pen); vs.SetLW(h, 6); count += 1
+            for k in range(16):
+                a = 2*_math.pi*k/16
+                vs.MoveTo(cx+r*0.62*_math.cos(a), cy+r*0.62*_math.sin(a)); vs.LineTo(cx+r*0.97*_math.cos(a), cy+r*0.97*_math.sin(a)); l = vs.LNewObj(); vs.SetPenFore(l, pen); vs.SetLW(l, 4); count += 1
+            h = _circ(cx, cy, r*0.09); vs.SetFPat(h, 1); vs.SetFillFore(h, trunk); vs.SetFillBack(h, trunk); count += 1
+        return {'status': 'ok', 'kind': kind, 'count': count}
+    finally:
+        _restore(prev)
+
+def dashed_route(p):
+    """Dashed polyline (mögliche Wegeführung). params: points, dash, gap, r,g,b,
+    line_weight, layer, class."""
+    pts = p.get('points') or []
+    if len(pts) < 2: return {'error': 'need >=2 points'}
+    prev = _with_layer_class(p)
+    try:
+        dash = float(p.get('dash', 0.7)); gap = float(p.get('gap', 0.45))
+        col = (_c8(p.get('r', 190)), _c8(p.get('g', 90)), _c8(p.get('b', 70)))
+        lw = int(p.get('line_weight', 8)); on = True; count = 0
+        for i in range(len(pts)-1):
+            x1, y1 = pts[i]; x2, y2 = pts[i+1]; seg = _math.hypot(x2-x1, y2-y1); t = 0
+            while t < seg:
+                step = min(dash if on else gap, seg-t)
+                if on:
+                    a = t/seg; b = (t+step)/seg
+                    vs.MoveTo(x1+(x2-x1)*a, y1+(y2-y1)*a); vs.LineTo(x1+(x2-x1)*b, y1+(y2-y1)*b)
+                    l = vs.LNewObj(); vs.SetPenFore(l, col); vs.SetPenBack(l, col); vs.SetLW(l, lw); count += 1
+                t += step; on = not on
+        return {'status': 'ok', 'count': count}
+    finally:
+        _restore(prev)
+
+def create_gradient_fill(p):
+    """Create a named gradient resource. params: name, stops=[[pos0to1, r,g,b], ...].
+    Apply to objects with apply_resource_fill (uses SetFPat(Name2Index) — VW2026:
+    SetVectorFill does NOT apply gradients, only hatches/vector fills)."""
+    name = p.get('name')
+    if not name: return {'error': 'name required'}
+    stops = p.get('stops') or [[0.0, 80, 160, 220], [1.0, 40, 95, 150]]
+    try:
+        idx = vs.Name2Index(name)
+        if not idx:
+            g = vs.CreateGradient(name)
+            for st in stops:
+                vs.InsertGradientData(g, float(st[0]), (_c8(st[1]), _c8(st[2]), _c8(st[3])))
+        return {'status': 'ok', 'name': name, 'index': vs.Name2Index(name)}
+    except Exception as e:
+        return {'error': str(e)}
+
+def apply_resource_fill(p):
+    """Apply a named fill resource (gradient / hatch / tile / vector fill) to an object
+    via SetFPat(object, Name2Index(name)). params: object_id, name."""
+    h = _h(p.get('object_id')); name = p.get('name')
+    if not h: return {'error': 'Object not found'}
+    if not name: return {'error': 'name required'}
+    try:
+        idx = vs.Name2Index(name)
+        if not idx: return {'error': 'resource not found: %s' % name}
+        vs.SetFPat(h, idx)
+        return {'status': 'ok', 'index': idx}
+    except Exception as e:
+        return {'error': str(e)}
