@@ -1,0 +1,2 @@
+# vwx-mcp server deps. Migrated to standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md).
+fastmcp==3.4.2
