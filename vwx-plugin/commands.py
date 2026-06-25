@@ -116,7 +116,7 @@ def get_document_info(p):
     return {
         'name':       _safe(vs.GetFName),
         'path':       _safe(vs.GetFPathName),
-        'vw_version': _safe(vs.GetVWVersion),
+        'vw_version': _safe(lambda: vs.GetVersion()),  # VW2026: GetVWVersion does not exist
     }
 
 def save_document(p):
