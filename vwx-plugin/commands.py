@@ -94,6 +94,45 @@ def _collect(criteria, limit=500):
     vs.ForEachObject(cb, criteria)
     return handles
 
+# containers whose children hold their own attributes/materials — descend into these.
+_CONTAINER_TYPES = (11, 15, 86)  # group, symbol(instance), plug-in object
+
+def _walk_deep(start_h, visit, guard=60000):
+    """Handle-based recursive walk that DESCENDS into groups/symbols/PIOs — the
+    thing vs.ForEachObject (top-level only) and vs.ForEachMaterial (broken callback
+    marshalling in the embedded interpreter) can't do on VW2026. `visit(h)` is
+    called for every object reached. Returns count of objects visited.
+    Bounded by `guard` to stay under the bridge's per-tool timeout."""
+    seen = [0]
+    def rec(h):
+        while h and seen[0] < guard:
+            seen[0] += 1
+            try: visit(h)
+            except Exception: pass
+            t = _safe(lambda: vs.GetTypeN(h), 0)
+            if t in _CONTAINER_TYPES:
+                sub = _safe(lambda: vs.FInGroup(h))
+                if sub: rec(sub)
+            h = _safe(lambda: vs.NextObj(h))
+    rec(start_h)
+    return seen[0]
+
+def _design_layers(names=None):
+    """Yield (name, layerHandle) for design layers, optionally filtered to `names`."""
+    L = _safe(lambda: vs.FLayer())
+    want = set(names) if names else None
+    out = []
+    while L:
+        nm = _safe(lambda: vs.GetLName(L))
+        is_design = _safe(lambda: vs.GetObjectVariableInt(L, 154) == 1)  # 154: layer type (1=design)
+        if (want is None or nm in want) and (is_design or want is not None):
+            out.append((nm, L))
+        L = _safe(lambda: vs.NextLayer(L))
+    return out
+
+def _material_name(mh):
+    return _safe(lambda: vs.GetName(mh)) if mh else None
+
 def _active_class():
     # VW renamed across versions: try current → old
     for name in ('ActiveClass', 'GetActClassN', 'GetClass', 'GetClassN'):
@@ -2264,6 +2303,45 @@ def distance_3d(p):
 
 
 # ── Materials ────────────────────────────────────────────────────────────────
+
+def get_materials(p):
+    """Enumerate materials actually used in the document by deep-walking objects
+    (descends into groups/symbols/PIOs, where landscape material buildups live).
+
+    Params (all optional):
+      layers: list of design-layer names to restrict to (default: all design layers)
+      guard:  max objects to visit per layer (default 60000)
+    Returns distinct material names with usage counts.
+
+    Why not a resource list: VW2026 has no BuildResourceList type for materials and
+    vs.ForEachMaterial's callback is broken in the embedded interpreter, so this
+    walks the geometry instead. GetName() works on material handles; object-level
+    (GetObjMaterialHandle) and component-level (GetComponentMaterial) are both read."""
+    names = p.get('layers')
+    if isinstance(names, str): names = [names]
+    guard = int(p.get('guard', 60000))
+    counts = {}
+    def visit(h):
+        mh = _safe(lambda: vs.GetObjMaterialHandle(h))
+        nm = _material_name(mh)
+        if nm: counts[nm] = counts.get(nm, 0) + 1
+        n = _vw1(_safe(lambda: vs.GetNumberOfComponents(h)))
+        n = int(n or 0)
+        for i in range(1, n + 1):
+            cm = _safe(lambda i=i: vs.GetComponentMaterial(h, i))
+            cn = _material_name(cm)
+            if cn: counts[cn] = counts.get(cn, 0) + 1
+    layers = _design_layers(names)
+    visited = 0
+    for _, lh in layers:
+        visited += _walk_deep(_safe(lambda lh=lh: vs.FInLayer(lh)), visit, guard)
+    ordered = sorted(counts.items(), key=lambda kv: -kv[1])
+    return {
+        'count': len(counts),
+        'objects_visited': visited,
+        'layers_scanned': [nm for nm, _ in layers],
+        'materials': [{'name': k, 'uses': v} for k, v in ordered],
+    }
 
 def create_material(p):
     name = p.get('name')
