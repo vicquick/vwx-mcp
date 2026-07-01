@@ -46,6 +46,17 @@ def _safe(fn, default=None):
     try: return fn()
     except: return default
 
+def _vw1(v):
+    """Several VW2026 getters return a (success_flag, value[, extra]) tuple
+    instead of a bare value (e.g. GetObjMaterialName, GetNumberOfComponents,
+    GetComponentWidth/Class/Function, IFC_GetIFCEntity, IFC_GetEntityProp).
+    Normalise: return the value element, or the raw value if not a flag-tuple."""
+    if isinstance(v, (tuple, list)):
+        if len(v) >= 2 and isinstance(v[0], bool):
+            return v[1]
+        return v[0] if len(v) == 1 else v
+    return v
+
 def _bbox(h):
     try:
         p1, p2 = vs.GetBBox(h)
@@ -57,8 +68,10 @@ OBJ_TYPES = {
     2:'line',3:'rect',4:'oval',5:'polyline',6:'bezier',8:'arc',
     9:'freehand',11:'text',12:'symbol',15:'group',21:'polygon',
     25:'extrude',26:'sweep',28:'sphere',34:'wall',68:'plugin_obj',
-    86:'space',89:'viewport',91:'nurbs',94:'worksheet'
+    86:'plugin_object',89:'viewport',91:'nurbs',94:'worksheet'
 }
+# note: type 86 = plug-in object (PIO: Hardscape, Landscape Area, Plant, walls-as-PIO…);
+# earlier mislabelled 'space'. Confirmed live on VW2026 (PON='Hardscape' objs are T=86).
 
 def _summary(h):
     if not h: return None
@@ -2278,7 +2291,8 @@ def get_material_info(p):
     if not h: return {'error': 'Object not found'}
     try:
         mh = vs.GetObjMaterialHandle(h)
-        name = vs.GetObjMaterialName(h) if hasattr(vs, 'GetObjMaterialName') else (vs.GetName(mh) if mh else None)
+        # GetObjMaterialName returns (isMultiple_flag, name) on VW2026 — take the name.
+        name = _vw1(vs.GetObjMaterialName(h)) if hasattr(vs, 'GetObjMaterialName') else (vs.GetName(mh) if mh else None)
         return {
             'material_name': name,
             'area':   _safe(lambda: vs.GetMaterialArea(h)),
@@ -2314,19 +2328,24 @@ def list_components(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        n = vs.GetNumberOfComponents(h)
+        # GetNumberOfComponents returns (success_flag, count) on VW2026.
+        n = _vw1(vs.GetNumberOfComponents(h))
     except Exception as e:
         return {'error': str(e)}
+    n = int(n or 0)
     comps = []
     for i in range(1, n + 1):
+        mh = _safe(lambda i=i: vs.GetComponentMaterial(h, i))
+        # GetComponent{Name,Width,Class,Function,NetArea,NetVolume} also return (flag, value) tuples.
         comps.append({
             'index': i,
-            'name':     _safe(lambda i=i: vs.GetComponentName(h, i)),
-            'width':    _safe(lambda i=i: vs.GetComponentWidth(h, i)),
-            'class':    _safe(lambda i=i: vs.GetComponentClass(h, i)),
-            'function': _safe(lambda i=i: vs.GetComponentFunction(h, i)),
-            'net_area':   _safe(lambda i=i: vs.GetComponentNetArea(h, i)),
-            'net_volume': _safe(lambda i=i: vs.GetComponentNetVolume(h, i)),
+            'name':     _vw1(_safe(lambda i=i: vs.GetComponentName(h, i))),
+            'width':    _vw1(_safe(lambda i=i: vs.GetComponentWidth(h, i))),
+            'class':    _vw1(_safe(lambda i=i: vs.GetComponentClass(h, i))),
+            'function': _vw1(_safe(lambda i=i: vs.GetComponentFunction(h, i))),
+            'material': _safe(lambda: vs.GetName(mh)) if mh else None,
+            'net_area':   _vw1(_safe(lambda i=i: vs.GetComponentNetArea(h, i))),
+            'net_volume': _vw1(_safe(lambda i=i: vs.GetComponentNetVolume(h, i))),
         })
     return {'count': n, 'components': comps}
 
