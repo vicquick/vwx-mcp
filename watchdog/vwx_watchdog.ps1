@@ -110,12 +110,29 @@ public class VwWd {
         }, IntPtr.Zero);
         return best;
     }
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     public static bool IsForeground(IntPtr h) { return GetForegroundWindow() == h; }
-    // Ctrl+Shift+B — must match the hotkey assigned to "VWX Bridge Start"
+
+    // Ctrl+Shift+B — must match the hotkey assigned to "VWX Bridge Start".
+    // Windows blocks SetForegroundWindow from background processes, so a
+    // plain call silently fails and the keystroke lands in the user's app.
+    // AttachThreadInput to the current foreground thread grants the right;
+    // the previous foreground window is restored right after (~200ms).
     public static void SendPumpHotkey(IntPtr mainWin) {
-        if (!IsForeground(mainWin)) {
+        IntPtr prev = GetForegroundWindow();
+        bool needSwitch = (prev != mainWin);
+        uint self = GetCurrentThreadId();
+        uint fgThread = 0;
+        if (needSwitch) {
+            uint pid; fgThread = GetWindowThreadProcessId(prev, out pid);
+            AttachThreadInput(self, fgThread, true);
             SetForegroundWindow(mainWin);
-            System.Threading.Thread.Sleep(150);
+            System.Threading.Thread.Sleep(120);
+            if (GetForegroundWindow() != mainWin) {          // still refused
+                AttachThreadInput(self, fgThread, false);
+                return;                                       // retry next poll
+            }
         }
         keybd_event(0x11, 0, 0, UIntPtr.Zero);        // Ctrl down
         keybd_event(0x10, 0, 0, UIntPtr.Zero);        // Shift down
@@ -124,6 +141,11 @@ public class VwWd {
         keybd_event(0x42, 0, KEYUP, UIntPtr.Zero);
         keybd_event(0x10, 0, KEYUP, UIntPtr.Zero);
         keybd_event(0x11, 0, KEYUP, UIntPtr.Zero);
+        if (needSwitch) {
+            System.Threading.Thread.Sleep(80);
+            SetForegroundWindow(prev);                        // give focus back
+            AttachThreadInput(self, fgThread, false);
+        }
     }
 }
 "@
@@ -144,8 +166,12 @@ function Write-WdLog([string]$msg) {
 $BadContent = 'Marionette|Traceback|Python Script Error'
 $DismissButtons = @('Schließen', 'OK', 'Close')
 
-Write-WdLog "watchdog v4 start: jobs=$JobsDir poll=${PollMs}ms"
+Write-WdLog "watchdog v7 start: jobs=$JobsDir poll=${PollMs}ms (accelerator trigger, palette-gated)"
 $lastTrigger = [DateTime]::MinValue
+$triggerFails = 0
+$lastQueueCount = 0
+$triggerFails = 0        # consecutive triggers that didn't shrink the queue
+$lastQueueCount = 0
 
 while ($true) {
     Start-Sleep -Milliseconds $PollMs
@@ -170,20 +196,31 @@ while ($true) {
         }
     }
 
-    # 2. Jobs waiting -> fire the pump hotkey (unless a user dialog is open).
-    #    Skipped while the NATIVE palette pump is alive (pump.stamp fresh):
-    #    the palette drains jobs itself; the keystroke is only the fallback.
+    # 2. Jobs waiting -> send Ctrl+Shift+B ('VWX Bridge Start' accelerator).
+    #    A real keyboard accelerator is the ONLY safe general trigger on
+    #    VW2026 — every in-process shortcut (CEF callback, WM_TIMER script,
+    #    DoMenuName-from-timer) crashes/parks on canvas mutations.
+    #    GATE: native palette open + not paused (ipc/native.alive fresh).
     $jobs = @(Get-ChildItem $JobsDir -Filter '*.json' -ErrorAction SilentlyContinue)
-    if ($jobs.Count -eq 0) { continue }
-    if ($foreignDialog) { continue }    # pump can't run now; server will wait
+    if ($jobs.Count -eq 0) { $triggerFails = 0; continue }
+    if ($foreignDialog) { continue }
     $alive = Join-Path $PluginDir 'ipc\native.alive'
     try {
-        $age = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double](Get-Content $alive -ErrorAction Stop)
-        if ($age -lt 15) { continue }   # native palette active — no keystroke needed
-    } catch {}
-    if (((Get-Date) - $lastTrigger).TotalMilliseconds -lt 400) { continue }
+        $parts = (Get-Content $alive -ErrorAction Stop) -split '\s+'
+        $age = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double]$parts[0]
+        if ($age -ge 5) { continue }              # palette closed => bridge off
+        if ($parts.Count -gt 1 -and $parts[1] -eq '1') { continue }  # paused
+    } catch { continue }
+    if ($jobs.Count -lt $lastQueueCount) { $triggerFails = 0 }
+    $lastQueueCount = $jobs.Count
+    $retryMs = if ($triggerFails -ge 8) { 30000 } elseif ($triggerFails -ge 3) { 5000 } else { 900 }
+    if (((Get-Date) - $lastTrigger).TotalMilliseconds -lt $retryMs) { continue }
     $main = [VwWd]::MainWindow($vwpid)
     if ($main -eq [IntPtr]::Zero) { continue }
     [VwWd]::SendPumpHotkey($main)
     $lastTrigger = Get-Date
+    $triggerFails++
+    if ($triggerFails -eq 8) {
+        Write-WdLog "trigger fired 8x without the queue shrinking — is Ctrl+Shift+B assigned to 'VWX Bridge Start' (NOT the palette command)? Backing off to 30s."
+    }
 }

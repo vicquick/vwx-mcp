@@ -9,7 +9,6 @@
   var running = true;
   var done = 0;
   var elState = document.getElementById('state');
-  var elDone  = document.getElementById('done');
   var elQueue = document.getElementById('queue');
   var elLast  = document.getElementById('last');
   var elBtn   = document.getElementById('toggle');
@@ -25,13 +24,11 @@
     }
     window.vwxBridge.pump()
       .then(function (res) {
-        elQueue.textContent = (res && typeof res.jobs === 'number') ? res.jobs : '?';
-        if (res && res.pumped) {
-          done += res.jobs;
-          elDone.textContent = done;
-          elLast.textContent = new Date().toLocaleTimeString();
-        }
-        setState('on', 'active');
+        var q = (res && typeof res.jobs === 'number') ? res.jobs : 0;
+        elQueue.textContent = q;
+        if (q > 0) { elLast.textContent = new Date().toLocaleTimeString(); }
+        if (res && res.paused) { setState('off', 'pausiert'); }
+        else { setState('on', 'active'); }
         setTimeout(tick, POLL_MS);
       })
       .catch(function (err) {
@@ -43,7 +40,7 @@
   elBtn.addEventListener('click', function () {
     running = !running;
     elBtn.textContent = running ? 'Pause' : 'Fortsetzen';
-    setState(running ? 'on' : 'off', running ? 'active' : 'pausiert');
+    window.vwxBridge.pump(!running).catch(function () {});
   });
 
   tick();
