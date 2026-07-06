@@ -2589,3 +2589,273 @@ def run_menu_command(p):
     cmd = p.get('menu_name') or p.get('command') or ''
     vs.DoMenuTextByName(cmd, p.get('version', 0))
     return {'status': 'ok', 'command': cmd}
+
+
+# ── Marionette network introspection & editing ───────────────────────────────
+# Reverse-engineered on VW2026 (2026-07-06). Key facts:
+#   * Marionette wrapper = PIO (type 86) with record 'MarionetteObject2D';
+#     network lives in a child GROUP (type 11); result geometry = other children.
+#   * Node = PIO (type 86) with record 'MarionetteNode'. Param values live in the
+#     node's NodeDef_OIPControls JSON field. Lifted (OIP-visible) params are
+#     mirrored in the wrapper's NodeDef_OIPControls JSON (varName '<X>_<n>_Lifted').
+#   * Ports = type-17 loci children (order = NodeDef_DataPorts JSON order,
+#     inputs first). Wires = type-21 polyline children of the SOURCE node in node-
+#     local coords — but they are only a VISUALIZATION: the real connection store
+#     is private C++ data (deleted wire polylines get redrawn on execution).
+#     vs.SetParent into a node PIO returns False, so wires can NOT be created
+#     programmatically; rewire in the GUI editor only.
+#   * EmitCode field: writable per-node Python override slot (empty on library
+#     nodes). Node scripts themselves are stored in an opaque blob (no script
+#     API access; vs.Mrntte_ExportNodeScriptInFile is a silent no-op here).
+#   * Re-execution trigger: vs.ResetObject/HMove/HScale2D do NOTHING for
+#     Marionette. vs.Scale(1.0,1.0) with ONLY the wrapper selected re-executes
+#     the network (forum-confirmed). WARNING: execution runs on the VW main
+#     thread and re-enters Python — a node error pops a MODAL Marionette report
+#     dialog which blocks this bridge until dismissed (and can kill the socket
+#     thread, requiring the bridge to be re-run in VW). Prefer marionette_recalc
+#     as the LAST call of a batch.
+
+_MRN_NODE = 'MarionetteNode'
+_MRN_WRAP = 'MarionetteObject2D'
+
+def _mrn_is_wrapper(h):
+    return _safe(lambda: vs.GetRField(h, _MRN_WRAP, 'NodeType'), '') == 'Wrapper'
+
+def _mrn_group(w):
+    ch = vs.FIn3D(w)
+    while ch:
+        if vs.GetTypeN(ch) == 11:
+            return ch
+        ch = vs.NextObj(ch)
+    return None
+
+def _mrn_nodes(w):
+    grp = _mrn_group(w)
+    out = []
+    if not grp: return out
+    ch = vs.FIn3D(grp)
+    while ch:
+        if vs.GetTypeN(ch) == 86 and _safe(lambda: vs.GetRField(ch, _MRN_NODE, 'NodeType')):
+            out.append(ch)
+        ch = vs.NextObj(ch)
+    return out
+
+def _mrn_json(h, rec, field):
+    import json as _json
+    raw = _safe(lambda: vs.GetRField(h, rec, field), '') or ''
+    try: return _json.loads(raw)
+    except Exception: return None
+
+def _mrn_ports(nh):
+    """Port list from NodeDef_DataPorts JSON + locus positions (same order:
+    inputs first, then outputs)."""
+    d = _mrn_json(nh, _MRN_NODE, 'NodeDef_DataPorts') or {'data': []}
+    ports = [{'name': e.get('name'), 'loc_name': e.get('locName'),
+              'input': bool(e.get('input')), 'description': e.get('description')}
+             for e in d.get('data', [])]
+    loci = []
+    k = vs.FIn3D(nh)
+    while k:
+        if vs.GetTypeN(k) == 17:
+            loci.append(_safe(lambda: vs.GetLocPt(k)))
+        k = vs.NextObj(k)
+    for i, pt in enumerate(loci):
+        if i < len(ports) and pt:
+            ports[i]['local_xy'] = [round(pt[0], 6), round(pt[1], 6)]
+    return ports
+
+def _mrn_node_info(nh, with_wires=False):
+    info = {
+        'object_id': _oid(nh),
+        'node_type': _safe(lambda: vs.GetRField(nh, _MRN_NODE, 'NodeType')),
+        'node_name': _safe(lambda: vs.GetRField(nh, _MRN_NODE, 'NodeName')),
+        'disabled': _safe(lambda: vs.GetRField(nh, _MRN_NODE, 'DisableNode')),
+        'origin': _safe(lambda: list(vs.GetSymLoc(nh))),
+        'oip_controls': (_mrn_json(nh, _MRN_NODE, 'NodeDef_OIPControls') or {}).get('data', []),
+        'ports': _mrn_ports(nh),
+        'emit_code_len': len(_safe(lambda: vs.GetRField(nh, _MRN_NODE, 'EmitCode'), '') or ''),
+    }
+    if with_wires:
+        wires = []
+        k = vs.FIn3D(nh)
+        while k:
+            if vs.GetTypeN(k) == 21:
+                nv = _safe(lambda: vs.GetVertNum(k), 0) or 0
+                pts = []
+                for i in range(nv):
+                    v = _safe(lambda: vs.GetPolylineVertex(k, i + 1))
+                    if v: pts.append([round(v[0][0], 6), round(v[0][1], 6)])
+                wires.append(pts)
+            k = vs.NextObj(k)
+        # first polyline is the node frame (starts at local 0,0) — callers skip it
+        info['polylines'] = wires
+    return info
+
+def _mrn_find_wrapper(p):
+    h = _h(p.get('object_id'))
+    if not h: return None, {'error': 'Object not found'}
+    if not _mrn_is_wrapper(h):
+        return None, {'error': 'Object is not a Marionette wrapper (no MarionetteObject2D Wrapper record)'}
+    return h, None
+
+def marionette_get_network(p):
+    """Introspect a Marionette wrapper: lifted OIP params + all nodes with ports,
+    values, positions + wire connectivity (resolved geometrically from the wire
+    polylines, which mirror the internal connection store).
+    params: object_id (wrapper UUID). Optional: with_polylines (bool), tolerance."""
+    w, err = _mrn_find_wrapper(p)
+    if err: return err
+    nodes = [_mrn_node_info(nh, with_wires=True) for nh in _mrn_nodes(w)]
+    tol = float(p.get('tolerance', 0.05))
+    port_map = []   # (node_idx, port_idx, world_xy, is_input)
+    for ni, n in enumerate(nodes):
+        o = n.get('origin') or [0, 0]
+        for pi, prt in enumerate(n.get('ports', [])):
+            if 'local_xy' in prt:
+                port_map.append((ni, pi,
+                                 [o[0] + prt['local_xy'][0], o[1] + prt['local_xy'][1]],
+                                 prt['input']))
+    def _nearest(world, want_input):
+        best, bd = None, tol
+        for ni, pi, xy, is_in in port_map:
+            if is_in != want_input: continue
+            d = ((xy[0] - world[0]) ** 2 + (xy[1] - world[1]) ** 2) ** 0.5
+            if d < bd: best, bd = (ni, pi), d
+        return best
+    wires = []
+    for ni, n in enumerate(nodes):
+        o = n.get('origin') or [0, 0]
+        pls = n.pop('polylines', [])
+        keep = [] if p.get('with_polylines') else None
+        for pl in pls:
+            if not pl: continue
+            if abs(pl[0][0]) < 1e-6 and abs(pl[0][1]) < 1e-6:
+                continue   # node frame polyline
+            src = _nearest([o[0] + pl[0][0], o[1] + pl[0][1]], False)
+            dst = _nearest([o[0] + pl[-1][0], o[1] + pl[-1][1]], True)
+            wires.append({
+                'from_node': nodes[src[0]]['object_id'] if src else None,
+                'from_port': nodes[src[0]]['ports'][src[1]]['name'] if src else None,
+                'to_node': nodes[dst[0]]['object_id'] if dst else None,
+                'to_port': nodes[dst[0]]['ports'][dst[1]]['name'] if dst else None,
+                'owner_node': n['object_id'],
+                'resolved': bool(src and dst),
+            })
+            if keep is not None: keep.append(pl)
+        if keep is not None: n['polylines'] = keep
+    return {'status': 'ok',
+            'wrapper': {'object_id': _oid(w),
+                        'label': _safe(lambda: vs.GetRField(w, _MRN_WRAP, '__ObjectLabel')),
+                        'lifted_params': (_mrn_json(w, _MRN_WRAP, 'NodeDef_OIPControls') or {}).get('data', [])},
+            'nodes': nodes, 'wires': wires}
+
+def marionette_get_node(p):
+    """Full detail for one Marionette node incl. EmitCode. params: object_id (node UUID)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    if not _safe(lambda: vs.GetRField(h, _MRN_NODE, 'NodeType')):
+        return {'error': 'Not a Marionette node'}
+    info = _mrn_node_info(h, with_wires=True)
+    info['emit_code'] = _safe(lambda: vs.GetRField(h, _MRN_NODE, 'EmitCode'), '')
+    return {'status': 'ok', 'node': info}
+
+def marionette_set_node_param(p):
+    """Set an OIP control value on a node (the node-local source of truth).
+    params: object_id (node UUID), value; and either index (int into
+    NodeDef_OIPControls data) or var_name. Apply with marionette_recalc."""
+    import json as _json
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    d = _mrn_json(h, _MRN_NODE, 'NodeDef_OIPControls')
+    if not d: return {'error': 'Node has no OIP controls'}
+    tgt = None
+    if p.get('var_name'):
+        for c in d.get('data', []):
+            if c.get('varName') == p['var_name']: tgt = c; break
+    else:
+        i = int(p.get('index', 0))
+        if i < len(d.get('data', [])): tgt = d['data'][i]
+    if tgt is None: return {'error': 'Control not found'}
+    old = tgt.get('value')
+    tgt['value'] = p.get('value')
+    vs.SetRField(h, _MRN_NODE, 'NodeDef_OIPControls', _json.dumps(d))
+    return {'status': 'ok', 'var_name': tgt.get('varName'), 'old': old, 'new': p.get('value'),
+            'note': 'run marionette_recalc on the wrapper to apply'}
+
+def marionette_set_wrapper_param(p):
+    """Set a LIFTED param on a Marionette wrapper AND sync the matching inner
+    input node (matched by OIP label text == node name). params: object_id
+    (wrapper UUID), name (OIP label, e.g. '2 Hoehe Stütze') or var_name
+    (e.g. 'Hoehe_St_tze_50_Lifted'), value."""
+    import json as _json
+    w, err = _mrn_find_wrapper(p)
+    if err: return err
+    d = _mrn_json(w, _MRN_WRAP, 'NodeDef_OIPControls')
+    if not d: return {'error': 'Wrapper has no lifted params'}
+    tgt = None
+    for c in d.get('data', []):
+        if (p.get('var_name') and c.get('varName') == p['var_name']) or \
+           (p.get('name') and c.get('text') == p['name']):
+            tgt = c; break
+    if tgt is None:
+        return {'error': 'Lifted param not found',
+                'available': [(c.get('text'), c.get('varName')) for c in d.get('data', [])]}
+    old = tgt.get('value')
+    tgt['value'] = p.get('value')
+    vs.SetRField(w, _MRN_WRAP, 'NodeDef_OIPControls', _json.dumps(d))
+    synced = None
+    for nh in _mrn_nodes(w):
+        if _safe(lambda: vs.GetRField(nh, _MRN_NODE, 'NodeName')) == tgt.get('text'):
+            nd = _mrn_json(nh, _MRN_NODE, 'NodeDef_OIPControls')
+            if nd and nd.get('data'):
+                nd['data'][0]['value'] = p.get('value')
+                vs.SetRField(nh, _MRN_NODE, 'NodeDef_OIPControls', _json.dumps(nd))
+                synced = _oid(nh)
+            break
+    return {'status': 'ok', 'var_name': tgt.get('varName'), 'old': old,
+            'new': p.get('value'), 'synced_node': synced,
+            'note': 'run marionette_recalc on the wrapper to apply'}
+
+def marionette_set_node_code(p):
+    """Write the EmitCode override of a node (full node script: Params class +
+    RunNode). EXPERIMENTAL: keep port variable names/order identical to the
+    original node or wiring breaks. params: object_id (node UUID), code."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    code = p.get('code', '')
+    vs.SetRField(h, _MRN_NODE, 'EmitCode', code)
+    back = _safe(lambda: vs.GetRField(h, _MRN_NODE, 'EmitCode'), '')
+    return {'status': 'ok', 'stored_len': len(back or ''), 'match': back == code}
+
+def marionette_set_node_name(p):
+    """Rename a node (NodeName drives OIP label + lift matching).
+    params: object_id, name."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    vs.SetRField(h, _MRN_NODE, 'NodeName', p.get('name', ''))
+    return {'status': 'ok', 'name': p.get('name', '')}
+
+def marionette_recalc(p):
+    """Force a Marionette wrapper to re-execute its network via the
+    vs.Scale(1,1) trick (ResetObject does NOT work for Marionette).
+    WARNING: if a node errors, VW pops a MODAL error dialog that blocks the
+    bridge until dismissed (bridge may need re-running). Make this the LAST
+    call in a batch. params: object_id (wrapper UUID)."""
+    w, err = _mrn_find_wrapper(p)
+    if err: return err
+    vs.DSelectAll()
+    vs.SetSelect(w)
+    vs.Scale(1.0, 1.0)
+    vs.DSelectAll()
+    return {'status': 'ok',
+            'traversal_done': _safe(lambda: vs.GetRField(w, _MRN_WRAP, 'TraversalDone'))}
+
+def marionette_duplicate(p):
+    """Duplicate a Marionette wrapper (params can then be varied per copy).
+    params: object_id, dx, dy, name (optional vs.SetName)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    d = vs.HDuplicate(h, float(p.get('dx', 0)), float(p.get('dy', 0)))
+    if not d: return {'error': 'HDuplicate failed'}
+    if p.get('name'): vs.SetName(d, p['name'])
+    return {'status': 'ok', 'object_id': _oid(d)}
