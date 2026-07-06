@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>VWX Bridge</title>
+<style>
+  body { font-family: "Segoe UI", sans-serif; background: #1e1e1e; color: #ddd;
+         margin: 0; padding: 12px 16px; font-size: 13px; user-select: none; }
+  h1   { font-size: 14px; margin: 0 0 8px 0; color: #fff; }
+  .row { display: flex; justify-content: space-between; margin: 3px 0; }
+  .val { color: #9cdcfe; font-variant-numeric: tabular-nums; }
+  #state.on  { color: #6ec26e; }
+  #state.off { color: #e0a030; }
+  #state.err { color: #e05555; }
+  button { margin-top: 10px; background: #333; color: #ddd; border: 1px solid #555;
+           border-radius: 4px; padding: 4px 14px; cursor: pointer; }
+  button:hover { background: #444; }
+  .hint { margin-top: 10px; color: #777; font-size: 11px; line-height: 1.4; }
+</style>
+</head>
+<body>
+  <h1>VWX Bridge <span style="color:#666;font-weight:normal">native pump</span></h1>
+  <div class="row"><span>Status</span><span id="state" class="on">active</span></div>
+  <div class="row"><span>Jobs verarbeitet</span><span class="val" id="done">0</span></div>
+  <div class="row"><span>Warteschlange</span><span class="val" id="queue">–</span></div>
+  <div class="row"><span>Letzter Pump</span><span class="val" id="last">–</span></div>
+  <button id="toggle">Pause</button>
+  <div class="hint">Claude Code steuert Vectorworks über diese Palette.
+    Palette schließen = Bridge aus. VW bleibt frei bedienbar,
+    außer während ein Befehl ausgeführt wird.</div>
+<script src="main.js"></script>
+</body>
+</html>
