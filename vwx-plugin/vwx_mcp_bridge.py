@@ -38,10 +38,12 @@ if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
 _LOG = os.path.join(_DIR, 'bridge.log')
+_loglock = threading.Lock()
 def _log(msg):
     try:
-        with open(_LOG, 'a', encoding='utf-8') as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        with _loglock:
+            with open(_LOG, 'a', encoding='utf-8') as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
     except Exception:
         pass
 
@@ -105,21 +107,49 @@ def _handle(conn):
                 continue
             cmd  = msg.get('type', '')
             prms = msg.get('params', {})
+            # 'poll' is answered in this I/O thread — works even while the VW
+            # main thread is busy IF the GIL is free (i.e. between dispatches).
+            if cmd == 'poll':
+                pcid = int(prms.get('cid', 0))
+                with _lock:
+                    if pcid in _res:
+                        entry = _res.pop(pcid)
+                        _evts.pop(pcid, None)
+                        rv = entry[1] if isinstance(entry, tuple) else entry
+                        result = {'status': 'done', 'cid': pcid, 'result': rv}
+                    elif pcid in _evts:
+                        result = {'status': 'pending', 'cid': pcid}
+                    else:
+                        result = {'status': 'unknown', 'cid': pcid}
+                conn.sendall(json.dumps(result).encode() + b'\n')
+                continue
             with _lock:
                 _ctr[0] += 1
                 cid = _ctr[0]
             evt = threading.Event()
             with _lock:
                 _evts[cid] = evt
-            _q.put((cid, cmd, prms))
+            is_async = bool(msg.get('async') or prms.get('_async'))
+            _q.put((cid, cmd, prms, None if is_async else conn))
             _log(f"Queued cmd cid={cid} type={cmd}")
+            # Async mode: acknowledge immediately; caller fetches via 'poll'.
+            # Use for long dispatches that would exceed the client socket
+            # timeout (big sweeps, exports).
+            if is_async:
+                conn.sendall(json.dumps({'status': 'queued', 'cid': cid}).encode() + b'\n')
+                continue
             if evt.wait(120):
                 with _lock:
-                    result = _res.pop(cid, {'error': 'no result'})
+                    entry = _res.pop(cid, (False, {'error': 'no result'}))
+                sent, result = entry if isinstance(entry, tuple) else (False, entry)
+                if sent:
+                    continue   # pump already sent the response on this conn
             else:
                 with _lock:
-                    _evts.pop(cid, None); _res.pop(cid, None)
-                result = {'error': 'timeout — VW main thread unresponsive'}
+                    _evts.pop(cid, None)   # keep any late result for 'poll'
+                result = {'error': 'timeout — VW main thread unresponsive '
+                                   '(modal dialog or long operation); '
+                                   'try poll with cid', 'cid': cid}
             try:
                 conn.sendall(json.dumps(result).encode() + b'\n')
             except Exception as e:
@@ -160,22 +190,60 @@ def _server():
         try: srv.close()
         except: pass
 
+# Commands that trigger a Marionette network execution. Marionette execution
+# re-enters/reset the Python engine and NEVER RETURNS to this frame (observed
+# VW2026: the bridge's threads+timer die, socket is left dangling). Respond to
+# the client BEFORE dispatching so the caller at least gets an ACK; afterwards
+# the bridge must be re-run in VW (Stop the zombie dialog, run script again).
+_FIRE_AND_FORGET = frozenset({'marionette_recalc'})
+
 # Queue pump (VW main thread — called by timer)
+def _send_direct(conn, cid, result):
+    """Send the response from the MAIN thread, inside the dispatch frame.
+    Critical for commands that re-enter the Marionette/Python engine: when the
+    dispatch frame later returns, VW may tear down this script context and kill
+    the I/O threads BEFORE the handler thread gets to send. Sending here means
+    the client still receives the full result."""
+    if conn is None:
+        return False
+    try:
+        conn.sendall(json.dumps(result).encode() + b'\n')
+        return True
+    except Exception as e:
+        _log(f"Pump direct-send fail cid={cid}: {e}")
+        return False
+
 def _pump():
     n = 0
     while not _q.empty() and n < 20:
         try:
-            cid, cmd, prms = _q.get_nowait()
+            cid, cmd, prms, conn = _q.get_nowait()
         except queue.Empty:
             break
         _log(f"Pump dispatching cid={cid} cmd={cmd}")
+        if cmd in _FIRE_AND_FORGET and not prms.get('_sync'):
+            ack = {'status': 'triggered',
+                   'warning': 'Marionette execution may tear down the bridge '
+                              'Python context on VW2026 — if the next call '
+                              'cannot connect, re-run the bridge script in VW.'}
+            sent = _send_direct(conn, cid, ack)
+            with _lock:
+                _res[cid] = (sent, ack)
+                evt = _evts.pop(cid, None)
+            if evt: evt.set()
+            _log(f"Pump fire-and-forget cid={cid} — dispatching (bridge may die now)")
+            _dispatch(cmd, prms)
+            _log(f"Pump SURVIVED fire-and-forget cid={cid}")   # if we see this, context survived
+            n += 1
+            continue
         result = _dispatch(cmd, prms)
         if isinstance(result, dict) and result.get('error'):
             _log(f"Pump done cid={cid} ERROR={str(result.get('error'))[:200]}")
         else:
             _log(f"Pump done cid={cid} result_keys={list(result.keys()) if isinstance(result,dict) else type(result)}")
+        sent = _send_direct(conn, cid, result)
         with _lock:
-            _res[cid] = result
+            _res[cid] = (sent, result)
             evt = _evts.pop(cid, None)
         if evt: evt.set()
         n += 1
@@ -183,13 +251,15 @@ def _pump():
 # Dialog callback (VW main thread)
 _event_log_count = [0]
 def _cb(item, data):
+    _event_log_count[0] += 1
     # Log first 30 events to identify timer event ID
-    if _event_log_count[0] < 30:
-        _event_log_count[0] += 1
+    if _event_log_count[0] <= 30:
         _log(f"dlg event item={item} data={data}")
-    # Periodic pump health check
-    if item == 13028 and _event_log_count[0] >= 30 and _event_log_count[0] % 100 == 0:
-        _log(f"Pump alive: queue_size={_q.qsize()}")
+    # Periodic heartbeat (~every 60s at 100ms timer) so a dead pump is visible
+    # in the log: heartbeats stop => timer/context died (e.g. after Marionette
+    # execution) => re-run the bridge script.
+    elif _event_log_count[0] % 600 == 0:
+        _log(f"heartbeat: events={_event_log_count[0]} queue={_q.qsize()}")
     if item in _SETUP_IDS:     # Setup (2255 or 12255) — register timer
         try:
             vs.RegisterDialogForTimerEvents(_dlg_id[0], 100)
