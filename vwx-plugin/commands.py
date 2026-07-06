@@ -2859,3 +2859,206 @@ def marionette_duplicate(p):
     if not d: return {'error': 'HDuplicate failed'}
     if p.get('name'): vs.SetName(d, p['name'])
     return {'status': 'ok', 'object_id': _oid(d)}
+
+
+# ── Resource manager (Zubehör-Manager: folders, symbols, Marionette styles) ──
+# Verified on VW2026 (2026-07-06):
+#   * Resource names are GLOBAL and shared with object names — a style cannot
+#     have the same name as a drawing object ("naming hiccups"), and two
+#     folders cannot both be called 'außen'.
+#   * Symbol folders = type 92, symbol defs / plugin styles = type 16.
+#   * vs.SetParent(resource, folderHandle) MOVES resources between folders
+#     (returns True) — this is the reliable way; vs.InsertSymbolInFolder was a
+#     silent no-op in our tests.
+#   * Folder CREATION via script (BeginFolderN etc.) is unreliable — it worked
+#     exactly once (default name 'Bibliotheksordner') and then never again.
+#     resource_create_folder probes the known variants and reports honestly;
+#     the robust path is one GUI-created folder, then script renames/moves.
+#   * Marionette styles clone perfectly: vs.HDuplicate(styleSym, 0, 0) +
+#     SetName + edit the wrapper/node record JSONs inside the symdef.
+#     Placement (drag from Zubehör) pushes the style wrapper's lifted values
+#     into the fresh network.
+#   * Deleting a style resource can DELETE bound instances — unbind first
+#     (vs.SetPluginStyle(h, '')). Pasting a styled object from another file
+#     imports its style resource.
+
+def _res_walk(fld, depth, acc, types):
+    k = vs.FInFolder(fld)
+    while k:
+        t = vs.GetTypeN(k)
+        nm = vs.GetName(k) or ''
+        if t == 92:
+            acc.append({'name': nm, 'type': 'folder', 'depth': depth})
+            _res_walk(k, depth + 1, acc, types)
+        elif not types or t in types:
+            acc.append({'name': nm, 'type': t, 'depth': depth})
+        k = vs.NextObj(k)
+
+def resource_tree(p):
+    """List the resource tree (folders + symbol defs / Marionette styles).
+    params: root (optional folder name to start from), symbols_only (bool)."""
+    acc = []
+    types = [16] if p.get('symbols_only') else None
+    if p.get('root'):
+        fld = vs.GetObject(p['root'])
+        if not fld or vs.GetTypeN(fld) != 92:
+            return {'error': 'folder not found: %s' % p['root']}
+        _res_walk(fld, 0, acc, types)
+    else:
+        sd = vs.FSymDef()
+        while sd:
+            t = vs.GetTypeN(sd)
+            nm = vs.GetName(sd) or ''
+            if t == 92:
+                acc.append({'name': nm, 'type': 'folder', 'depth': 0})
+                _res_walk(sd, 1, acc, types)
+            elif not types or t in types:
+                acc.append({'name': nm, 'type': t, 'depth': 0})
+            sd = vs.NextSymDef(sd)
+    return {'status': 'ok', 'items': acc, 'count': len(acc)}
+
+def resource_move(p):
+    """Move a resource (symbol/style/folder) into a folder via vs.SetParent.
+    params: name, folder (target folder name)."""
+    r = _safe(lambda: vs.GetObject(p.get('name', '')))
+    fld = _safe(lambda: vs.GetObject(p.get('folder', '')))
+    if not r: return {'error': 'resource not found: %s' % p.get('name')}
+    if not fld or vs.GetTypeN(fld) != 92:
+        return {'error': 'target folder not found: %s' % p.get('folder')}
+    ok = vs.SetParent(r, fld)
+    return {'status': 'ok' if ok else 'failed', 'moved': bool(ok)}
+
+def resource_rename(p):
+    """Rename a resource. Names are GLOBAL (shared with drawing objects) —
+    collisions fail silently, so the result is verified. params: name, new_name."""
+    r = _safe(lambda: vs.GetObject(p.get('name', '')))
+    if not r: return {'error': 'resource not found: %s' % p.get('name')}
+    if _safe(lambda: vs.GetObject(p.get('new_name', ''))):
+        return {'error': 'name already in use (global namespace): %s' % p.get('new_name')}
+    vs.SetName(r, p.get('new_name', ''))
+    return {'status': 'ok', 'renamed': vs.GetName(r) == p.get('new_name')}
+
+def resource_delete(p):
+    """Delete a resource. WARNING: deleting a Marionette style deletes bound
+    instances — set unbind_instances=True (default) to unbind them first.
+    params: name, unbind_instances (bool, default True)."""
+    r = _safe(lambda: vs.GetObject(p.get('name', '')))
+    if not r: return {'error': 'resource not found: %s' % p.get('name')}
+    unbound = 0
+    if p.get('unbind_instances', True) and vs.GetTypeN(r) == 16:
+        objs = []
+        def cb(h): objs.append(h)
+        _safe(lambda: vs.ForEachObject(cb, "(T=PLUGINOBJECT)"))
+        for h in objs:
+            if _safe(lambda: vs.GetPluginStyle(h)) == (vs.GetName(r) or ''):
+                _safe(lambda: vs.SetPluginStyle(h, ''))
+                unbound += 1
+    vs.DelObject(r)
+    return {'status': 'ok', 'unbound_instances': unbound}
+
+def resource_create_folder(p):
+    """Try to create a symbol folder by script. UNRELIABLE on VW2026 (see block
+    header) — probes BeginFolder/BeginFolderN and verifies via FSymDef diff.
+    If it fails, create the folder once in the Zubehör-Manager GUI and use
+    resource_move / resource_rename. params: name, parent (optional folder)."""
+    name = p.get('name')
+    if not name: return {'error': 'name required'}
+    if _safe(lambda: vs.GetObject(name)):
+        return {'error': 'name already in use: %s' % name}
+    def snap():
+        s = set()
+        sd = vs.FSymDef()
+        while sd:
+            s.add(vs.GetObjectUuid(sd))
+            sd = vs.NextSymDef(sd)
+        return s
+    before = snap()
+    attempts = [lambda: vs.BeginFolder(), lambda: vs.BeginFolderN(1),
+                lambda: vs.BeginFolderN(2)]
+    for att in attempts:
+        try:
+            att(); vs.EndFolder()
+        except Exception:
+            continue
+        new = snap() - before
+        if new:
+            h = vs.GetObjectByUuid(list(new)[0])
+            if vs.GetTypeN(h) == 92:
+                vs.SetName(h, name)
+                if p.get('parent'):
+                    tgt = vs.GetObject(p['parent'])
+                    if tgt and vs.GetTypeN(tgt) == 92:
+                        vs.SetParent(h, tgt)
+                return {'status': 'ok', 'object_id': _oid(h)}
+            vs.DelObject(h)
+    return {'error': 'folder creation failed (known VW2026 limitation) — '
+                     'create it once in the Zubehör-Manager GUI, then use '
+                     'resource_move/resource_rename'}
+
+def marionette_style_clone(p):
+    """Clone a Marionette object style and set its parameters — the proven bulk
+    path for style libraries. params: template (style name), new_name,
+    folder (optional target), params (dict: OIP label -> value; labels matched
+    with numeric prefixes stripped), node_params (dict varName -> value applied
+    to a node type given in node_type, default 'WinkelWand')."""
+    import json as _json
+    tpl = _safe(lambda: vs.GetObject(p.get('template', '')))
+    if not tpl or vs.GetTypeN(tpl) != 16:
+        return {'error': 'template style not found: %s' % p.get('template')}
+    if _safe(lambda: vs.GetObject(p.get('new_name', ''))):
+        return {'error': 'name already in use: %s' % p.get('new_name')}
+    c = vs.HDuplicate(tpl, 0, 0)
+    if not c: return {'error': 'HDuplicate failed'}
+    vs.SetName(c, p.get('new_name', ''))
+    params = p.get('params') or {}
+    node_params = p.get('node_params') or {}
+    node_type = p.get('node_type', 'WinkelWand')
+    def strip(s):
+        return (s or '').lstrip('0123456789 ').strip()
+    w = vs.FInSymDef(c) if hasattr(vs, 'FInSymDef') else vs.FIn3D(c)
+    while w:
+        if _safe(lambda: vs.GetRField(w, 'MarionetteObject2D', 'NodeType')) == 'Wrapper':
+            if params:
+                d = _json.loads(vs.GetRField(w, 'MarionetteObject2D', 'NodeDef_OIPControls'))
+                for cc in d['data']:
+                    key = strip(cc.get('text'))
+                    if key in params: cc['value'] = params[key]
+                vs.SetRField(w, 'MarionetteObject2D', 'NodeDef_OIPControls', _json.dumps(d))
+            grp = vs.FIn3D(w)
+            ch = vs.FIn3D(grp) if grp else 0
+            while ch:
+                nm = strip(_safe(lambda: vs.GetRField(ch, 'MarionetteNode', 'NodeName')))
+                nt = _safe(lambda: vs.GetRField(ch, 'MarionetteNode', 'NodeType'))
+                if nm in params:
+                    dd = _json.loads(vs.GetRField(ch, 'MarionetteNode', 'NodeDef_OIPControls'))
+                    if dd.get('data'):
+                        dd['data'][0]['value'] = params[nm]
+                        vs.SetRField(ch, 'MarionetteNode', 'NodeDef_OIPControls', _json.dumps(dd))
+                if node_params and nt == node_type:
+                    dd = _json.loads(vs.GetRField(ch, 'MarionetteNode', 'NodeDef_OIPControls'))
+                    for cc in dd['data']:
+                        if cc['varName'] in node_params: cc['value'] = node_params[cc['varName']]
+                    vs.SetRField(ch, 'MarionetteNode', 'NodeDef_OIPControls', _json.dumps(dd))
+                    vs.SetRField(ch, 'MarionetteNode', 'LinkedObj', '')
+                ch = vs.NextObj(ch)
+        w = vs.NextObj(w)
+    if p.get('folder'):
+        fld = vs.GetObject(p['folder'])
+        if fld and vs.GetTypeN(fld) == 92:
+            vs.SetParent(c, fld)
+    return {'status': 'ok', 'object_id': _oid(c)}
+
+def get_object_style(p):
+    """Get the Marionette/plugin style bound to an object. params: object_id."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    return {'status': 'ok', 'style': _safe(lambda: vs.GetPluginStyle(h), '')}
+
+def set_object_style(p):
+    """Bind or unbind a plugin style. params: object_id, style ('' = unbind).
+    NOTE: binding moves the wrapper's inner network into the style; unbinding
+    does NOT restore it — rebuild instances from scratch if needed."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    r = vs.SetPluginStyle(h, p.get('style', ''))
+    return {'status': 'ok', 'result': str(r), 'style_now': _safe(lambda: vs.GetPluginStyle(h), '')}
