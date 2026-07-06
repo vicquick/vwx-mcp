@@ -171,9 +171,16 @@ while ($true) {
     }
 
     # 2. Jobs waiting -> fire the pump hotkey (unless a user dialog is open).
+    #    Skipped while the NATIVE palette pump is alive (pump.stamp fresh):
+    #    the palette drains jobs itself; the keystroke is only the fallback.
     $jobs = @(Get-ChildItem $JobsDir -Filter '*.json' -ErrorAction SilentlyContinue)
     if ($jobs.Count -eq 0) { continue }
     if ($foreignDialog) { continue }    # pump can't run now; server will wait
+    $alive = Join-Path $PluginDir 'ipc\native.alive'
+    try {
+        $age = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double](Get-Content $alive -ErrorAction Stop)
+        if ($age -lt 15) { continue }   # native palette active — no keystroke needed
+    } catch {}
     if (((Get-Date) - $lastTrigger).TotalMilliseconds -lt 400) { continue }
     $main = [VwWd]::MainWindow($vwpid)
     if ($main -eq [IntPtr]::Zero) { continue }
