@@ -113,9 +113,10 @@ def _handle(conn):
                 pcid = int(prms.get('cid', 0))
                 with _lock:
                     if pcid in _res:
-                        result = {'status': 'done', 'cid': pcid,
-                                  'result': _res.pop(pcid)}
+                        entry = _res.pop(pcid)
                         _evts.pop(pcid, None)
+                        rv = entry[1] if isinstance(entry, tuple) else entry
+                        result = {'status': 'done', 'cid': pcid, 'result': rv}
                     elif pcid in _evts:
                         result = {'status': 'pending', 'cid': pcid}
                     else:
@@ -128,17 +129,21 @@ def _handle(conn):
             evt = threading.Event()
             with _lock:
                 _evts[cid] = evt
-            _q.put((cid, cmd, prms))
+            is_async = bool(msg.get('async') or prms.get('_async'))
+            _q.put((cid, cmd, prms, None if is_async else conn))
             _log(f"Queued cmd cid={cid} type={cmd}")
             # Async mode: acknowledge immediately; caller fetches via 'poll'.
             # Use for long dispatches that would exceed the client socket
             # timeout (big sweeps, exports).
-            if msg.get('async') or prms.get('_async'):
+            if is_async:
                 conn.sendall(json.dumps({'status': 'queued', 'cid': cid}).encode() + b'\n')
                 continue
             if evt.wait(120):
                 with _lock:
-                    result = _res.pop(cid, {'error': 'no result'})
+                    entry = _res.pop(cid, (False, {'error': 'no result'}))
+                sent, result = entry if isinstance(entry, tuple) else (False, entry)
+                if sent:
+                    continue   # pump already sent the response on this conn
             else:
                 with _lock:
                     _evts.pop(cid, None)   # keep any late result for 'poll'
@@ -193,21 +198,37 @@ def _server():
 _FIRE_AND_FORGET = frozenset({'marionette_recalc'})
 
 # Queue pump (VW main thread — called by timer)
+def _send_direct(conn, cid, result):
+    """Send the response from the MAIN thread, inside the dispatch frame.
+    Critical for commands that re-enter the Marionette/Python engine: when the
+    dispatch frame later returns, VW may tear down this script context and kill
+    the I/O threads BEFORE the handler thread gets to send. Sending here means
+    the client still receives the full result."""
+    if conn is None:
+        return False
+    try:
+        conn.sendall(json.dumps(result).encode() + b'\n')
+        return True
+    except Exception as e:
+        _log(f"Pump direct-send fail cid={cid}: {e}")
+        return False
+
 def _pump():
     n = 0
     while not _q.empty() and n < 20:
         try:
-            cid, cmd, prms = _q.get_nowait()
+            cid, cmd, prms, conn = _q.get_nowait()
         except queue.Empty:
             break
         _log(f"Pump dispatching cid={cid} cmd={cmd}")
         if cmd in _FIRE_AND_FORGET and not prms.get('_sync'):
+            ack = {'status': 'triggered',
+                   'warning': 'Marionette execution may tear down the bridge '
+                              'Python context on VW2026 — if the next call '
+                              'cannot connect, re-run the bridge script in VW.'}
+            sent = _send_direct(conn, cid, ack)
             with _lock:
-                _res[cid] = {'status': 'triggered',
-                             'warning': 'Marionette execution kills the bridge '
-                                        'Python context on VW2026 — if the next '
-                                        'call cannot connect, re-run the bridge '
-                                        'script in VW.'}
+                _res[cid] = (sent, ack)
                 evt = _evts.pop(cid, None)
             if evt: evt.set()
             _log(f"Pump fire-and-forget cid={cid} — dispatching (bridge may die now)")
@@ -220,8 +241,9 @@ def _pump():
             _log(f"Pump done cid={cid} ERROR={str(result.get('error'))[:200]}")
         else:
             _log(f"Pump done cid={cid} result_keys={list(result.keys()) if isinstance(result,dict) else type(result)}")
+        sent = _send_direct(conn, cid, result)
         with _lock:
-            _res[cid] = result
+            _res[cid] = (sent, result)
             evt = _evts.pop(cid, None)
         if evt: evt.set()
         n += 1
