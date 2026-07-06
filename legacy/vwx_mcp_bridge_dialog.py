@@ -19,9 +19,7 @@ API notes (from vs.py stub, 3071 functions):
   - AttachRecord:       vs.SetRecord(h, recName)  (AttachRecord doesn't exist)
   - IFC prefix:         vs.IFC_GetIFCEntity(h), vs.IFC_ExportNoUI(path)
 """
-import os, sys, socket, threading, queue, json, traceback, time, uuid
-
-BRIDGE_VERSION = '3.0'
+import os, sys, socket, threading, queue, json, traceback, time
 
 # VW Run Script executes as <string> — no __file__. Fallback to plugin dir.
 try:
@@ -40,28 +38,6 @@ if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
 _LOG = os.path.join(_DIR, 'bridge.log')
-_HB  = os.path.join(_DIR, 'bridge.hb')    # heartbeat: epoch written by the timer pump
-_GEN = os.path.join(_DIR, 'bridge.gen')   # generation token: newest bridge instance wins
-
-# Each start() writes a fresh token here. Threads left over from a PREVIOUS
-# bridge context (VW tears down the script context after a Marionette
-# execution, but daemon threads can linger and still hold the port) read this
-# file and exit as soon as they see a token that is not their own.
-_MY_GEN = uuid.uuid4().hex
-
-def _read_gen():
-    try:
-        with open(_GEN, 'r') as f:
-            return f.read().strip()
-    except Exception:
-        return _MY_GEN   # unreadable -> assume we are current (never self-kill on IO error)
-
-def _write_hb():
-    try:
-        with open(_HB, 'w') as f:
-            f.write(str(time.time()))
-    except Exception:
-        pass
 _loglock = threading.Lock()
 def _log(msg):
     try:
@@ -77,14 +53,6 @@ import vs
 
 # Config
 VW_PORT = int(os.environ.get('VW_MCP_PORT', '9878'))
-# The pump dialog is MODAL — while the bridge runs, the VW UI is locked for
-# the user. So the bridge closes itself after this many seconds without
-# commands (0 = never) and the MCP server wakes it back up on demand via the
-# watchdog (bridge.wake -> restart hotkey). Wake-on-demand needs the Windows
-# watchdog; on macOS there is none, so the default there is 0 (classic
-# always-on dialog — see legacy/README.md).
-IDLE_CLOSE = float(os.environ.get('VWX_IDLE_CLOSE',
-                                  '45' if sys.platform == 'win32' else '0'))
 
 # Known non-timer item IDs (setup=12255, teardown=12256, OK=1, Cancel=2,
 # static text items 4 & 5).  Any item NOT in this set is treated as the timer.
@@ -100,8 +68,6 @@ _evts   = {}
 _ctr    = [0]
 _run    = [True]
 _lock   = threading.Lock()
-_last_activity = [time.time()]
-_IDLE = os.path.join(_DIR, 'bridge.idle')   # marker: closed on purpose, not crashed
 
 # Dispatch (main VW thread)
 def _dispatch(cmd, params):
@@ -122,9 +88,6 @@ def _handle(conn):
     conn.settimeout(300.0)   # idle timeout per recv
     try:
         while True:
-            if _read_gen() != _MY_GEN:
-                _log("Handler: newer bridge generation detected — closing conn")
-                return
             # Read until we have at least one full message (\n delimited)
             while b'\n' not in buf:
                 try:
@@ -147,7 +110,6 @@ def _handle(conn):
             # 'poll' is answered in this I/O thread — works even while the VW
             # main thread is busy IF the GIL is free (i.e. between dispatches).
             if cmd == 'poll':
-                _last_activity[0] = time.time()
                 pcid = int(prms.get('cid', 0))
                 with _lock:
                     if pcid in _res:
@@ -161,7 +123,6 @@ def _handle(conn):
                         result = {'status': 'unknown', 'cid': pcid}
                 conn.sendall(json.dumps(result).encode() + b'\n')
                 continue
-            _last_activity[0] = time.time()
             with _lock:
                 _ctr[0] += 1
                 cid = _ctr[0]
@@ -202,32 +163,18 @@ def _handle(conn):
 
 # TCP socket worker (bg thread)
 def _server():
-    # Retry the bind: a zombie server thread from a previous bridge generation
-    # releases the port within ~1s of seeing the new token in bridge.gen.
-    srv = None
-    for attempt in range(8):
-        try:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(('127.0.0.1', VW_PORT))
-            srv.listen(5)
-            srv.settimeout(1.0)
-            _log(f"Socket BOUND on 127.0.0.1:{VW_PORT} (attempt {attempt + 1})")
-            break
-        except Exception as e:
-            try: srv.close()
-            except Exception: pass
-            srv = None
-            _log(f"BIND attempt {attempt + 1} on :{VW_PORT} failed: {e}")
-            time.sleep(1.0)
-    if srv is None:
-        _log(f"BIND FAIL on :{VW_PORT} after retries — giving up")
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', VW_PORT))
+        srv.listen(5)
+        srv.settimeout(1.0)
+        _log(f"Socket BOUND on 127.0.0.1:{VW_PORT}")
+    except Exception as e:
+        _log(f"BIND FAIL on :{VW_PORT}: {e}\n{traceback.format_exc()}")
         return
     try:
         while _run[0]:
-            if _read_gen() != _MY_GEN:
-                _log("Server: newer bridge generation detected — releasing port")
-                break
             try:
                 conn, addr = srv.accept()
                 _log(f"Accept from {addr}")
@@ -313,11 +260,6 @@ def _cb(item, data):
     # execution) => re-run the bridge script.
     elif _event_log_count[0] % 600 == 0:
         _log(f"heartbeat: events={_event_log_count[0]} queue={_q.qsize()}")
-    # File heartbeat every ~2s (20 ticks at 100ms) — the external watchdog
-    # reads its age: stale + port open = main thread blocked (modal dialog /
-    # long op); stale + port dead = context died, send the restart hotkey.
-    if _event_log_count[0] % 20 == 0:
-        _write_hb()
     if item in _SETUP_IDS:     # Setup (2255 or 12255) — register timer
         try:
             vs.RegisterDialogForTimerEvents(_dlg_id[0], 100)
@@ -330,20 +272,6 @@ def _cb(item, data):
         return True            # close dialog
     if item not in _SKIP:      # timer event
         _pump()
-        # Idle auto-close: the modal pump dialog locks the VW UI, so release
-        # it when Claude has been quiet for a while. bridge.idle tells the
-        # watchdog this was deliberate (sleep), not a crash — it then only
-        # restarts on an explicit bridge.wake from the MCP server.
-        if (IDLE_CLOSE > 0 and _q.empty()
-                and time.time() - _last_activity[0] > IDLE_CLOSE):
-            try:
-                with open(_IDLE, 'w') as f:
-                    f.write(str(time.time()))
-            except Exception:
-                pass
-            _run[0] = False
-            _log(f"idle {IDLE_CLOSE}s — closing pump dialog (VW UI released)")
-            return True        # close dialog
     return False
 
 _dlg_id = [None]
@@ -351,27 +279,13 @@ _dlg_id = [None]
 # Entry point
 def start():
     _run[0] = True
-    # Claim the generation: any threads from a previous (dead) bridge context
-    # see the new token and exit, releasing the port for our bind retry loop.
-    try:
-        with open(_GEN, 'w') as f:
-            f.write(_MY_GEN)
-    except Exception as e:
-        _log(f"gen write fail: {e}")
-    for _f in (_IDLE,):
-        try:
-            if os.path.exists(_f): os.remove(_f)
-        except Exception:
-            pass
-    _last_activity[0] = time.time()
-    _write_hb()
     t = threading.Thread(target=_server, daemon=True)
     t.start()
-    _log(f"Server thread started: alive={t.is_alive()} gen={_MY_GEN[:8]} v{BRIDGE_VERSION}")
+    _log(f"Server thread started: alive={t.is_alive()}")
 
     dlg = vs.CreateLayout('VW MCP Bridge', False, '', 'Stop')
     _dlg_id[0] = dlg
-    vs.CreateStaticText(dlg, 4, f'Active v{BRIDGE_VERSION}  -  TCP :{ VW_PORT }', 38)
+    vs.CreateStaticText(dlg, 4, f'Active  -  TCP :{ VW_PORT }', 38)
     vs.CreateStaticText(dlg, 5, 'Claude Code has full VW access', 38)
     vs.SetFirstLayoutItem(dlg, 4)
     vs.SetBelowItem(dlg, 4, 5, 0, 0)

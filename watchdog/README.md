@@ -1,4 +1,8 @@
-# Bridge v3 — self-healing setup
+# Bridge v3 — self-healing setup (Windows)
+
+Full picture incl. idle auto-close / wake-on-demand and the macOS story:
+see [`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) and
+[`legacy/README.md`](../legacy/README.md).
 
 The bridge dies whenever a Marionette network executes (VW tears down the
 Python script context on frame return) and stalls whenever a modal error
@@ -32,7 +36,13 @@ dialog opens. Both are unfixable from inside VW. v3 fixes them from outside:
    - Extras > Arbeitsumgebungen > Anpassen → drag the command into a menu
      (e.g. Extras) and assign the shortcut **Ctrl+Shift+B**
    - Restart VW once so the workspace change is live
-2. **Watchdog**: run `vwx-watchdog.bat` (or add it to shell:startup)
+2. **Watchdog**: run `vwx-watchdog.bat` — starts HIDDEN, logs to
+   `%APPDATA%…\VW-MCP\watchdog.log`; `vwx-watchdog-visible.bat` for a console.
+   Autostart at logon (no admin needed):
+   ```
+   schtasks /Create /F /SC ONLOGON /TN VwxBridgeWatchdog /TR "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Users\<you>\bridge\vwx_watchdog.ps1"
+   ```
+   (remove with `schtasks /Delete /TN VwxBridgeWatchdog /F`)
 
 ## Behavior
 
