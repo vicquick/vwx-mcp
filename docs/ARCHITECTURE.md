@@ -1,81 +1,88 @@
-# vwx-mcp architecture
+# vwx-mcp architecture (bridge v4 — file-IPC pump)
 
 ```
 Claude Code ──HTTP :8082──▶ vwx_mcp_server.py (cmd window, fastmcp)
-                                   │ TCP 127.0.0.1:9878 (newline-JSON)
-                                   ▼
-                            vwx_mcp_bridge.py  ─── runs INSIDE Vectorworks
-                                   │ queue → dialog-timer pump (VW main thread)
-                                   ▼
-                            commands.py (hot-reloaded per dispatch, 200+ verbs)
-
-vwx_watchdog.ps1 (hidden background process, Windows)
-    ├─ dismisses Marionette/Traceback error dialogs (content-matched)
-    ├─ bridge.wake  → sends Ctrl+Shift+B → "VWX Bridge Start" menu command
-    └─ crash detect (heartbeat stale + port dead + no bridge.idle) → restart
+                                 │ writes  ipc/jobs/<ts>-<cid>.json
+                                 │ polls   ipc/results/<cid>.json
+                                 ▼
+   %APPDATA%\…\Plug-ins\VW-MCP\ipc\        (file IPC, same machine)
+                                 ▲
+        vwx_watchdog.ps1 (hidden)│ sees job → sends Ctrl+Shift+B to VW
+                                 ▼
+   Vectorworks: menu command "VWX Bridge Start" → vwx_pump.py
+        claims jobs → commands.py (hot-reload) → writes results → RETURNS
 ```
 
-## The one constraint everything follows from
+**There is no persistent bridge inside Vectorworks anymore.** Each pump run
+is a short-lived script context that drains the queue and exits. Vectorworks
+is fully usable by the user at all times **except while a command actually
+executes** — that limit is physics: every `vs.*` call runs on the VW main
+thread, the same thread that serves the mouse, in any architecture.
 
-**All `vs.*` calls must run on the Vectorworks main thread**, and the only
-periodic main-thread callback VW's Python offers is
-`vs.RegisterDialogForTimerEvents` on a **modal** layout dialog. Consequences:
+## Why v4 (history of the constraint)
 
-1. While the pump dialog is open, the VW UI is locked for the user.
-2. While a command executes, the main thread is busy — the UI would be
-   unresponsive in *any* architecture, including a C++ one.
-3. A Marionette network execution re-enters the Python engine and tears down
-   the bridge's script context on frame return (threads die, port dangles).
-   Unfixable from inside; handled from outside by the watchdog.
-
-## Always-AVAILABLE, not always-running (Windows)
-
-The bridge is alive only while Claude actively works:
-
-- **Wake**: MCP server fails to connect → touches `bridge.wake` → watchdog
-  sends Ctrl+Shift+B → bridge starts → server retries transparently
-  (`VWX_WAKE_TIMEOUT`, default 25s budget).
-- **Work**: commands and polls refresh the idle timer; the pump dialog stays
-  up between commands (VW locked — see constraint above).
-- **Sleep**: after `VWX_IDLE_CLOSE` (default 45s on Windows) without
-  commands, the bridge writes `bridge.idle` and closes its dialog —
-  **VW is fully usable again**. The idle file tells the watchdog this was
-  deliberate, so it does NOT restart until the next wake request.
-- **Crash**: heartbeat stale + port dead + no idle file → watchdog closes the
-  zombie dialog and restarts (measured: dead → back up in 8s).
-
-## State files (in `%APPDATA%\…\Plug-ins\VW-MCP\`)
-
-| File | Writer | Meaning |
+| Version | Model | Problem |
 |---|---|---|
-| `bridge.hb` | bridge pump (every ~2s) | pump alive; age = health |
-| `bridge.gen` | bridge `start()` | generation token — newest instance wins, zombie threads exit |
-| `bridge.idle` | bridge on idle close | sleeping on purpose; don't crash-restart |
-| `bridge.wake` | MCP server | start the bridge now |
-| `bridge.log` / `watchdog.log` | bridge / watchdog | diagnostics |
+| v1/v2 (`legacy/`) | modal dialog + timer pump + TCP :9878 | dialog locks VW UI while bridge alive; Marionette exec tears down the context (bridge dies) |
+| v3 | + heartbeat/generation + watchdog restart + idle auto-close | UI still locked while alive; wake latency |
+| **v4** | **no resident bridge: job files + hotkey-fired pump** | UI free whenever idle; Marionette teardown harmless (fresh context per pump) |
+
+The old failure mode disappeared by design: a Marionette execution may kill
+the pump's Python context on frame return — but the pump already wrote its
+ack (`_FIRE_AND_FORGET`), and the next job simply fires a new pump.
+
+## Command lifecycle
+
+1. Tool call → server writes `ipc/jobs/<ts>-<cid>.json` (atomic tmp+replace).
+2. Watchdog (250ms poll) sees the job → if no user dialog is open in VW,
+   sends **Ctrl+Shift+B** (focuses VW only if not already foreground).
+3. VW runs the menu command → `vwx_pump.py`: atomic-claims each job
+   (`rename` → `.working`), dispatches via hot-reloaded `commands.py`,
+   writes `ipc/results/<cid>.json`, returns. Overhead ≈ 300–500 ms/batch.
+4. Server (30ms poll on the result file) returns the result to the tool.
+   Timeout after `VWX_SOCKET_TIMEOUT` (55s): unclaimed job → removed +
+   "watchdog running?" hint; claimed job → poll with the cid later.
+
+Edge behavior:
+- **User modal dialog open in VW** → watchdog holds triggers (keystroke would
+  land in the dialog); jobs wait; server times out with a clear message.
+- **Error dialogs** (content matches `Marionette|Traceback|Python Script
+  Error`) → auto-dismissed by the watchdog within ~250 ms.
+- **Marionette recalc** → ack result is written *before* dispatch.
+
+## Files
+
+| Path (under `%APPDATA%\…\Plug-ins\VW-MCP\`) | Writer | Meaning |
+|---|---|---|
+| `ipc/jobs/*.json` | server | pending commands |
+| `ipc/jobs/*.working` | pump | claimed (crash ⇒ lost, visible timeout — never re-run) |
+| `ipc/results/<cid>.json` | pump | result, consumed+deleted by server (TTL 1h) |
+| `ipc/pump.stamp` | pump | epoch of last pump run |
+| `bridge.log` / `watchdog.log` | pump / watchdog | diagnostics |
 
 ## Env knobs
 
-| Var | Default | Where |
+| Var | Default | Meaning |
 |---|---|---|
-| `VW_MCP_PORT` | 9878 | bridge + server |
-| `VWX_IDLE_CLOSE` | 45 (win32) / 0 (macOS) | bridge; 0 = classic always-on |
-| `VWX_WAKE_TIMEOUT` | 25 | server; 0 = never wait for wake |
-| `VWX_SOCKET_TIMEOUT` | 55 | server |
-| `VWX_KEEPALIVE` | 600 | server (uvicorn) |
+| `VWX_TRANSPORT` | `file` (win32) / `tcp` (else) | file-IPC pump vs classic TCP bridge |
+| `VWX_SOCKET_TIMEOUT` | 55 | per-command wait (both transports) |
+| `VWX_PLUGIN_DIR` | auto (`VW-MCP`/`VWX-MCP`) | override plugin dir discovery |
+| `VW_MCP_PORT` | 9878 | tcp transport only |
+| `VWX_IDLE_CLOSE` | 45 (win32) / 0 | tcp transport only (v3 idle close) |
+| `VWX_WAKE_TIMEOUT` | 25 | tcp transport only (v3 wake) |
 
-## macOS
+## macOS / remote
 
-No watchdog (Windows-only Win32 automation). Run the current bridge with
-`VWX_IDLE_CLOSE=0` — it behaves exactly like the frozen reference in
-`legacy/vwx_mcp_bridge_dialog.py` (see `legacy/README.md`): always-on modal
-dialog, manual restart after Marionette executions.
+The keystroke trigger + file watcher are Windows-only. Set
+`VWX_TRANSPORT=tcp` and run the classic dialog bridge —
+`vwx-plugin/vwx_mcp_bridge.py` with `VWX_IDLE_CLOSE=0`, or the frozen
+dependency-free reference `legacy/vwx_mcp_bridge_dialog.py`
+(see `legacy/README.md`). A macOS trigger daemon (AppleScript
+`System Events` keystroke) would port v4 — untested.
 
-## Roadmap: true background bridge
+## Roadmap: C++ SDK plugin
 
-The only way to make VW clickable *while the bridge idles armed* AND get
-immunity from Marionette context teardowns is a **C++ SDK plugin**: an
-`kOnIdle`/timer event handler hosting the TCP pump natively, dispatching to
-the Python engine per command. That removes the modal dialog entirely.
-Estimated effort: VW 2026 SDK + VS2022 toolchain, a few days. The Python
-bridge stays as the portable fallback.
+A native plugin with an idle/timer event handler would remove the last two
+gaps: no keystroke channel (direct in-process pump) and sub-100ms latency.
+Effort: VW 2026 SDK + VS2022, a few days. The file-pump stays as the
+zero-toolchain fallback.
