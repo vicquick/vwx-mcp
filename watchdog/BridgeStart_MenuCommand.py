@@ -2,9 +2,14 @@
 # (Plug-in Manager > Eigene Plug-ins > Neu... > Menübefehl, Sprache Python),
 # then add it to a menu in the workspace editor and assign Ctrl+Shift+B.
 #
-# v4: running it drains the file-IPC job queue (vwx_pump.py) and returns
-# immediately — no dialog, Vectorworks stays responsive. The watchdog fires
-# this hotkey automatically whenever the MCP server writes a job.
+# v11: THE ONLY SAFE MUTATION EXECUTOR. Vectorworks' own Python-menu-command
+# runner wraps script execution in a proper document/undo context — the native
+# plugin's raw IPythonScriptEngine::ExecuteScript from DoInterface does NOT
+# (document mutation there crashed VW, verified 2026-07-06). This command
+# drains the ENTIRE job queue via vwx_pump.pump_all() and returns immediately.
+# The native VwxBridge palette triggers it with a Ctrl+Shift+B keystroke when
+# jobs wait and VW is the foreground app; read-only jobs drain in the
+# background without it.
 import os
 import sys
 import importlib
@@ -19,6 +24,9 @@ for _name in ('VW-MCP', 'VWX-MCP'):
         break
 
 import vwx_pump
-# Reload re-executes the module top-level, which runs pump() once: claim
-# job files, execute, write results, return.
 importlib.reload(vwx_pump)
+# v11 pump has NO module-level auto-run: the entry point must be called
+# explicitly. pump_all = full drain incl. document mutation — safe HERE
+# because this is VW's own script-plugin execution context (v4-proven,
+# months of production incl. the 253-object Winkelstützen build).
+vwx_pump.pump_all()

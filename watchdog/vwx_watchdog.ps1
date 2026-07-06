@@ -115,25 +115,18 @@ public class VwWd {
     public static bool IsForeground(IntPtr h) { return GetForegroundWindow() == h; }
 
     // Ctrl+Shift+B — must match the hotkey assigned to "VWX Bridge Start".
-    // Windows blocks SetForegroundWindow from background processes, so a
-    // plain call silently fails and the keystroke lands in the user's app.
-    // AttachThreadInput to the current foreground thread grants the right;
-    // the previous foreground window is restored right after (~200ms).
-    public static void SendPumpHotkey(IntPtr mainWin) {
-        IntPtr prev = GetForegroundWindow();
-        bool needSwitch = (prev != mainWin);
-        uint self = GetCurrentThreadId();
-        uint fgThread = 0;
-        if (needSwitch) {
-            uint pid; fgThread = GetWindowThreadProcessId(prev, out pid);
-            AttachThreadInput(self, fgThread, true);
-            SetForegroundWindow(mainWin);
-            System.Threading.Thread.Sleep(120);
-            if (GetForegroundWindow() != mainWin) {          // still refused
-                AttachThreadInput(self, fgThread, false);
-                return;                                       // retry next poll
-            }
-        }
+    // Win11 blocks foreground stealing even with the AttachThreadInput trick
+    // (verified live), so we type ONLY when a window of the VW process is
+    // already foreground. Otherwise the caller waits — jobs stay queued
+    // until the user focuses Vectorworks.
+    public static bool SendPumpHotkey(IntPtr mainWin) {
+        IntPtr fg = GetForegroundWindow();
+        uint fgPid = 0;
+        GetWindowThreadProcessId(fg, out fgPid);
+        uint vwPid = 0;
+        GetWindowThreadProcessId(mainWin, out vwPid);
+        if (fgPid != vwPid)
+            return false;                       // VW not focused — don't type
         keybd_event(0x11, 0, 0, UIntPtr.Zero);        // Ctrl down
         keybd_event(0x10, 0, 0, UIntPtr.Zero);        // Shift down
         keybd_event(0x42, 0, 0, UIntPtr.Zero);        // B down
@@ -141,11 +134,7 @@ public class VwWd {
         keybd_event(0x42, 0, KEYUP, UIntPtr.Zero);
         keybd_event(0x10, 0, KEYUP, UIntPtr.Zero);
         keybd_event(0x11, 0, KEYUP, UIntPtr.Zero);
-        if (needSwitch) {
-            System.Threading.Thread.Sleep(80);
-            SetForegroundWindow(prev);                        // give focus back
-            AttachThreadInput(self, fgThread, false);
-        }
+        return true;
     }
 }
 "@
@@ -217,7 +206,12 @@ while ($true) {
     if (((Get-Date) - $lastTrigger).TotalMilliseconds -lt $retryMs) { continue }
     $main = [VwWd]::MainWindow($vwpid)
     if ($main -eq [IntPtr]::Zero) { continue }
-    [VwWd]::SendPumpHotkey($main)
+    $sent = [VwWd]::SendPumpHotkey($main)
+    if (-not $sent) {
+        if ($triggerFails -eq 0) { Write-WdLog 'jobs waiting but Vectorworks is not the foreground window — focus VW to let the bridge pump' }
+        $triggerFails = 1     # log the hint only once per queue episode
+        continue
+    }
     $lastTrigger = Get-Date
     $triggerFails++
     if ($triggerFails -eq 8) {
