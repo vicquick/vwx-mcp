@@ -25,6 +25,11 @@ VWX_PORT = int(os.environ.get("VWX_MCP_PORT", os.environ.get("VW_MCP_PORT", "987
 # Per-call timeout (seconds) applied to every tool via vtool() -> @mcp.tool(timeout=).
 # Guards against a hung Vectorworks main thread wedging the MCP session.
 VWX_CALL_TIMEOUT = float(os.environ.get("VWX_CALL_TIMEOUT", "60"))
+# TCP recv timeout towards the VW bridge. Long dispatches (bulk sweeps, imports,
+# exports) legitimately exceed 30s while VW's main thread works and the GIL
+# freezes the bridge's I/O threads. Keep just under VWX_CALL_TIMEOUT so the
+# socket error surfaces before the MCP layer kills the call.
+VWX_SOCKET_TIMEOUT = float(os.environ.get("VWX_SOCKET_TIMEOUT", "55"))
 
 # MCP Tasks extension (RC spec, finalizes 2026-07-28). OFF by default: a task=True
 # tool returns a task handle the client must poll (tasks/get), which breaks clients
@@ -60,11 +65,12 @@ class VwxMCPServer:
     def connect(self):
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(30)
+            self.socket.settimeout(VWX_SOCKET_TIMEOUT)
             self.socket.connect((self.host, self.port))
             return True
         except Exception as e:
             logger.error(f"Error connecting to VW: {e}")
+            self.socket = None
             return False
 
     def disconnect(self):
@@ -82,13 +88,31 @@ class VwxMCPServer:
         plugin log can be matched up.
         """
         cid = uuid.uuid4().hex[:8]
-        if not self.socket:
-            return {"error": "Not connected to Vectorworks", "cid": cid}
         command = {"type": command_type, "params": params or {}, "_cid": cid}
+        payload = json.dumps(command).encode('utf-8') + b'\n'
         t0 = time.perf_counter()
         try:
             with self._lock:
-                self.socket.sendall(json.dumps(command).encode('utf-8') + b'\n')
+                # Send — a stale socket (bridge re-run in VW, idle RST) fails
+                # HERE, before VW saw anything, so one reconnect+resend is safe.
+                # This is the "first call fails, retry works" flakiness, fixed.
+                try:
+                    if not self.socket:
+                        raise ConnectionError("no socket")
+                    self.socket.sendall(payload)
+                except Exception as se:
+                    logger.warning(f"tool={command_type} cid={cid} stale socket "
+                                   f"({se}) — reconnecting")
+                    self.disconnect()
+                    if not self.connect():
+                        raise ConnectionError(
+                            f"Could not connect to Vectorworks at {self.host}:{self.port}. "
+                            "If this followed a marionette_recalc / network execution, the "
+                            "VW-side bridge died — Stop the zombie 'VW MCP Bridge' dialog "
+                            "and re-run vwx_mcp_bridge.py in VW.")
+                    self.socket.sendall(payload)
+                # Receive — NO retry here: the command may already be executing
+                # in VW; resending would double-execute mutating commands.
                 response_data = b''
                 result = None
                 while True:
@@ -107,6 +131,15 @@ class VwxMCPServer:
             status = "err" if isinstance(result, dict) and result.get("error") else "ok"
             logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} status={status}")
             return result
+        except socket.timeout:
+            ms = (time.perf_counter() - t0) * 1000
+            logger.error(f"tool={command_type} cid={cid} ms={ms:.0f} status=timeout")
+            self.disconnect()
+            return {"error": f"timed out after {VWX_SOCKET_TIMEOUT:.0f}s — VW main thread busy "
+                             "(long operation, Marionette execution, or a modal dialog is open "
+                             "in Vectorworks). The command may still complete in VW. "
+                             "Check the VW window for dialogs.",
+                    "cid": cid}
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
             logger.error(f"tool={command_type} cid={cid} ms={ms:.0f} status=exc err={e}")
@@ -120,17 +153,22 @@ _vwx_connection = None
 def get_vwx_connection():
     global _vwx_connection
     if _vwx_connection is not None:
-        try:
-            _vwx_connection.socket.sendall(b'')
+        # NOTE: no sendall(b'') "probe" — sending 0 bytes never fails, even on a
+        # dead socket, so it detected nothing. send_command now reconnects on a
+        # failed send itself.
+        if _vwx_connection.socket is not None:
             return _vwx_connection
-        except Exception:
-            try: _vwx_connection.disconnect()
-            except Exception: pass
-            _vwx_connection = None
+        if _vwx_connection.connect():
+            return _vwx_connection
+        _vwx_connection = None
     _vwx_connection = VwxMCPServer()
     if not _vwx_connection.connect():
         _vwx_connection = None
-        raise Exception(f"Could not connect to Vectorworks at {VWX_HOST}:{VWX_PORT}. Start VW + run bridge script first.")
+        raise Exception(
+            f"Could not connect to Vectorworks at {VWX_HOST}:{VWX_PORT}. Start VW + run "
+            "bridge script first. If it WAS running: the bridge dies whenever a Marionette "
+            "network executes (VW2026 resets the Python engine) — Stop the zombie "
+            "'VW MCP Bridge' dialog in VW and re-run the bridge script.")
     logger.info(f"Connected to Vectorworks at {VWX_HOST}:{VWX_PORT}")
     return _vwx_connection
 
@@ -1368,6 +1406,12 @@ def main():
             transport=transport,
             host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
             port=int(os.environ.get("FASTMCP_PORT", "8082")),
+            # uvicorn's default timeout_keep_alive is 5s: any two tool calls
+            # spaced further apart raced the server's FIN on the idle keep-alive
+            # connection -> sporadic "Unable to connect" on the first call,
+            # instant success on retry. Keep idle connections for 10 minutes.
+            uvicorn_config={"timeout_keep_alive":
+                            int(os.environ.get("VWX_KEEPALIVE", "600"))},
         )
     else:
         mcp.run(transport=transport)
