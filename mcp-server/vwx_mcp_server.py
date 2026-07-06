@@ -51,6 +51,25 @@ if VWX_TASKS and not _TASKS_AVAILABLE:
                    "install with: pip install 'fastmcp[tasks]'. Tasks disabled.")
 
 
+# Wake-on-demand: seconds to wait for the watchdog to start an idle-closed
+# bridge (touching bridge.wake in the VW plugin dir triggers the restart
+# hotkey). Works only on the same machine as VW — for remote setups set
+# VWX_WAKE_TIMEOUT=0 to skip.
+VWX_WAKE_TIMEOUT = float(os.environ.get('VWX_WAKE_TIMEOUT', '25'))
+
+def _wake_file_path():
+    base = os.environ.get('VWX_PLUGIN_DIR')
+    if base and os.path.isdir(base):
+        return os.path.join(base, 'bridge.wake')
+    appdata = os.environ.get('APPDATA', '')
+    for name in ('VW-MCP', 'VWX-MCP'):
+        cand = os.path.join(appdata, 'Nemetschek', 'Vectorworks', '2026',
+                            'Plug-ins', name)
+        if os.path.isdir(cand):
+            return os.path.join(cand, 'bridge.wake')
+    return None
+
+
 class VwxMCPServer:
     def __init__(self, host=VWX_HOST, port=VWX_PORT):
         self.host = host
@@ -62,16 +81,47 @@ class VwxMCPServer:
         # sendall/recv corrupts the stream (WinError 10053 / aborted connection).
         self._lock = threading.Lock()
 
-    def connect(self):
+    def _try_connect(self):
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(VWX_SOCKET_TIMEOUT)
             self.socket.connect((self.host, self.port))
             return True
-        except Exception as e:
-            logger.error(f"Error connecting to VW: {e}")
+        except Exception:
             self.socket = None
             return False
+
+    def connect(self):
+        """Connect; if the bridge is idle-asleep (it closes its modal pump
+        dialog after VWX_IDLE_CLOSE seconds so the VW UI is usable), request a
+        wake-up: touch bridge.wake — the watchdog sends the restart hotkey —
+        and keep retrying for VWX_WAKE_TIMEOUT seconds."""
+        if self._try_connect():
+            return True
+        wake = _wake_file_path()
+        if not wake:
+            logger.error("Error connecting to VW (no wake file path — plugin dir not found)")
+            return False
+        deadline = time.monotonic() + VWX_WAKE_TIMEOUT
+        logger.info(f"bridge down — touching {wake} and waiting for the watchdog to start it")
+        last_touch = 0.0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now - last_touch > 3.0:      # re-touch: survives a watchdog race
+                try:
+                    with open(wake, 'w') as f:
+                        f.write(str(time.time()))
+                except Exception as e:
+                    logger.error(f"cannot write wake file: {e}")
+                    return False
+                last_touch = now
+            time.sleep(1.0)
+            if self._try_connect():
+                logger.info("bridge woke up")
+                return True
+        logger.error(f"Error connecting to VW: bridge did not wake within {VWX_WAKE_TIMEOUT:.0f}s "
+                     "(watchdog not running, or hotkey not assigned?)")
+        return False
 
     def disconnect(self):
         if self.socket:
@@ -106,10 +156,11 @@ class VwxMCPServer:
                     self.disconnect()
                     if not self.connect():
                         raise ConnectionError(
-                            f"Could not connect to Vectorworks at {self.host}:{self.port}. "
-                            "If this followed a marionette_recalc / network execution, the "
-                            "VW-side bridge died — Stop the zombie 'VW MCP Bridge' dialog "
-                            "and re-run vwx_mcp_bridge.py in VW.")
+                            f"Could not connect to Vectorworks at {self.host}:{self.port} "
+                            "and the wake-up request was not answered. Is the watchdog "
+                            "(vwx-watchdog.bat) running and the Ctrl+Shift+B hotkey "
+                            "assigned to 'VWX Bridge Start'? Fallback: run the bridge "
+                            "script manually in VW.")
                     self.socket.sendall(payload)
                 # Receive — NO retry here: the command may already be executing
                 # in VW; resending would double-execute mutating commands.
@@ -165,10 +216,10 @@ def get_vwx_connection():
     if not _vwx_connection.connect():
         _vwx_connection = None
         raise Exception(
-            f"Could not connect to Vectorworks at {VWX_HOST}:{VWX_PORT}. Start VW + run "
-            "bridge script first. If it WAS running: the bridge dies whenever a Marionette "
-            "network executes (VW2026 resets the Python engine) — Stop the zombie "
-            "'VW MCP Bridge' dialog in VW and re-run the bridge script.")
+            f"Could not connect to Vectorworks at {VWX_HOST}:{VWX_PORT} and the wake-up "
+            "request was not answered. Check: VW running? Watchdog (vwx-watchdog.bat) "
+            "running? Ctrl+Shift+B assigned to 'VWX Bridge Start'? Fallback: run the "
+            "bridge script manually in VW.")
     logger.info(f"Connected to Vectorworks at {VWX_HOST}:{VWX_PORT}")
     return _vwx_connection
 

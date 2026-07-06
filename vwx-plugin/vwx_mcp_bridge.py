@@ -77,6 +77,11 @@ import vs
 
 # Config
 VW_PORT = int(os.environ.get('VW_MCP_PORT', '9878'))
+# The pump dialog is MODAL — while the bridge runs, the VW UI is locked for
+# the user. So the bridge closes itself after this many seconds without
+# commands (0 = never). The MCP server wakes it back up on demand via the
+# watchdog (bridge.wake -> restart hotkey).
+IDLE_CLOSE = float(os.environ.get('VWX_IDLE_CLOSE', '120'))
 
 # Known non-timer item IDs (setup=12255, teardown=12256, OK=1, Cancel=2,
 # static text items 4 & 5).  Any item NOT in this set is treated as the timer.
@@ -92,6 +97,8 @@ _evts   = {}
 _ctr    = [0]
 _run    = [True]
 _lock   = threading.Lock()
+_last_activity = [time.time()]
+_IDLE = os.path.join(_DIR, 'bridge.idle')   # marker: closed on purpose, not crashed
 
 # Dispatch (main VW thread)
 def _dispatch(cmd, params):
@@ -137,6 +144,7 @@ def _handle(conn):
             # 'poll' is answered in this I/O thread — works even while the VW
             # main thread is busy IF the GIL is free (i.e. between dispatches).
             if cmd == 'poll':
+                _last_activity[0] = time.time()
                 pcid = int(prms.get('cid', 0))
                 with _lock:
                     if pcid in _res:
@@ -150,6 +158,7 @@ def _handle(conn):
                         result = {'status': 'unknown', 'cid': pcid}
                 conn.sendall(json.dumps(result).encode() + b'\n')
                 continue
+            _last_activity[0] = time.time()
             with _lock:
                 _ctr[0] += 1
                 cid = _ctr[0]
@@ -318,6 +327,20 @@ def _cb(item, data):
         return True            # close dialog
     if item not in _SKIP:      # timer event
         _pump()
+        # Idle auto-close: the modal pump dialog locks the VW UI, so release
+        # it when Claude has been quiet for a while. bridge.idle tells the
+        # watchdog this was deliberate (sleep), not a crash — it then only
+        # restarts on an explicit bridge.wake from the MCP server.
+        if (IDLE_CLOSE > 0 and _q.empty()
+                and time.time() - _last_activity[0] > IDLE_CLOSE):
+            try:
+                with open(_IDLE, 'w') as f:
+                    f.write(str(time.time()))
+            except Exception:
+                pass
+            _run[0] = False
+            _log(f"idle {IDLE_CLOSE}s — closing pump dialog (VW UI released)")
+            return True        # close dialog
     return False
 
 _dlg_id = [None]
@@ -332,6 +355,12 @@ def start():
             f.write(_MY_GEN)
     except Exception as e:
         _log(f"gen write fail: {e}")
+    for _f in (_IDLE,):
+        try:
+            if os.path.exists(_f): os.remove(_f)
+        except Exception:
+            pass
+    _last_activity[0] = time.time()
     _write_hb()
     t = threading.Thread(target=_server, daemon=True)
     t.start()

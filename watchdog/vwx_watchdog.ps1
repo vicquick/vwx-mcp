@@ -32,8 +32,18 @@ param(
     [string]$ProcessName = "Vectorworks2026"
 )
 
-$HbFile  = Join-Path $PluginDir 'bridge.hb'
-$LogFile = Join-Path $PluginDir 'watchdog.log'
+$HbFile   = Join-Path $PluginDir 'bridge.hb'
+$LogFile  = Join-Path $PluginDir 'watchdog.log'
+$IdleFile = Join-Path $PluginDir 'bridge.idle'   # bridge closed deliberately (UI released)
+$WakeFile = Join-Path $PluginDir 'bridge.wake'   # MCP server requests a bridge start
+
+# Single instance — a second watchdog would double-click dialogs and
+# double-send restart hotkeys.
+$script:WdMutex = New-Object System.Threading.Mutex($false, 'Global\VwxBridgeWatchdog')
+if (-not $script:WdMutex.WaitOne(0)) {
+    Write-Host 'vwx watchdog already running — exiting.'
+    exit 0
+}
 
 Add-Type @"
 using System;
@@ -184,17 +194,26 @@ while ($true) {
 
     # 2. Health check
     $age = Get-HbAge
-    if ($age -lt $StaleSeconds) { continue }
+    $wake = Test-Path $WakeFile
+    if (($age -lt $StaleSeconds) -and (-not $wake)) { continue }
     $portUp = Test-BridgePort
 
     if ($portUp) {
         # Main thread blocked (long op or a dialog we don't recognize) — the
         # dismiss pass above already handled known ones. Log only.
+        if ($wake) { Remove-Item $WakeFile -Force -ErrorAction SilentlyContinue }
         if ($age -gt 120) { Write-WdLog "heartbeat stale ${age}s but port open — VW busy (no action)" }
         continue
     }
 
-    # 3. Context died — restart (rate-limited to one attempt / 30s)
+    # Deliberate idle sleep (UI released): only start on explicit wake request.
+    if ((Test-Path $IdleFile) -and (-not $wake)) { continue }
+    if ($wake) {
+        Remove-Item $WakeFile -Force -ErrorAction SilentlyContinue
+        Write-WdLog 'wake requested — starting bridge'
+    }
+
+    # 3. Context died (or wake) — restart (rate-limited to one attempt / 30s)
     if (((Get-Date) - $lastRestart).TotalSeconds -lt 30) { continue }
     $lastRestart = Get-Date
     Write-WdLog "bridge DEAD (hb ${age}s, port closed) — restarting"
