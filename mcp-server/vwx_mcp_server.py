@@ -1406,6 +1406,12 @@ def main():
             transport=transport,
             host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
             port=int(os.environ.get("FASTMCP_PORT", "8082")),
+            # uvicorn's default timeout_keep_alive is 5s: any two tool calls
+            # spaced further apart raced the server's FIN on the idle keep-alive
+            # connection -> sporadic "Unable to connect" on the first call,
+            # instant success on retry. Keep idle connections for 10 minutes.
+            uvicorn_config={"timeout_keep_alive":
+                            int(os.environ.get("VWX_KEEPALIVE", "600"))},
         )
     else:
         mcp.run(transport=transport)
