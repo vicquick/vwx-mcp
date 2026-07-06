@@ -105,12 +105,13 @@ __result__ = vs.GetObjectUuid(vs.LNewObj())
 
 ## Known constraint
 
-The bridge dialog is **modal** — it blocks the VW UI while active. VW Python
-has no non-modal main-thread timer; this is a platform limitation, not a
-design choice. On Windows the bridge therefore auto-closes after 45s idle
-(VW usable again) and is woken on demand by the watchdog — see
+Every `vs.*` call runs on the Vectorworks main thread — the UI is busy while
+a command executes, in any architecture. On Windows the default transport is
+the **file-IPC pump (bridge v4)**: no resident bridge, no modal dialog — VW
+stays fully usable except during actual command execution. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [watchdog/README.md](watchdog/README.md).
-A cross-platform (macOS) always-on reference lives in [legacy/](legacy/README.md).
+The classic TCP dialog bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`,
+[legacy/](legacy/README.md)).
 
 ## Docs
 

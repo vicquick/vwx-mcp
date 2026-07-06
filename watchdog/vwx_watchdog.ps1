@@ -1,44 +1,39 @@
-﻿# vwx_watchdog.ps1 — external self-healing watchdog for the VWX MCP bridge.
+﻿# vwx_watchdog.ps1 — trigger + janitor for the VWX file-IPC pump (bridge v4).
 #
-# The bridge (vwx_mcp_bridge.py) runs inside Vectorworks as a dialog-timer
-# pump. Two failure modes are unfixable from inside VW:
-#   1. Marionette execution tears down the Python script context on frame
-#      return -> bridge threads + timer die, port goes dead.
-#   2. A modal error dialog (e.g. "Marionette" execution errors) suspends the
-#      dialog timer -> pump stalls, requests time out.
-# This watchdog fixes both from the outside:
-#   - dismisses known Marionette/script error dialogs (content-matched, so a
-#     dialog the user is actually working in is never touched)
-#   - when the bridge context died (heartbeat stale AND port dead), closes the
-#     zombie "VW MCP Bridge" dialog and sends the restart hotkey to VW.
+# Since v4 there is NO persistent bridge inside Vectorworks: the MCP server
+# writes job files, this watchdog fires the 'VWX Bridge Start' menu-command
+# hotkey (Ctrl+Shift+B), and vwx_pump.py drains the queue in a short-lived
+# script context. Vectorworks stays responsive for the user except while a
+# command actually executes.
 #
-# ONE-TIME VW SETUP (required for auto-restart):
-#   1. Extras > Plug-ins > Plug-in-Manager > Benutzerdefiniert > Neu...
+# Duties:
+#   1. jobs dir non-empty  -> send the pump hotkey to VW (rate-limited)
+#   2. dismiss Marionette/Traceback error dialogs (content-matched, so a
+#      dialog the user is actually working in is never touched)
+#   3. hold triggers while a foreign modal dialog is open (the keystroke
+#      would land in the dialog and the pump could not run anyway)
+#
+# ONE-TIME VW SETUP:
+#   1. Extras > Plug-ins > Plug-in-Manager > Eigene Plug-ins > Neu...
 #      -> Menübefehl (Python), Name: "VWX Bridge Start"
-#   2. Skript bearbeiten -> paste plugin/BridgeStart_MenuCommand.py
-#   3. Extras > Arbeitsumgebungen > Anpassen -> add the command to a menu
-#      and assign the hotkey Ctrl+Shift+B.
-# Without the hotkey the watchdog still dismisses error dialogs; it just
-# cannot restart the bridge (it will log "restart needed").
+#   2. Code... -> paste watchdog/BridgeStart_MenuCommand.py (runs vwx_pump)
+#   3. Extras > Arbeitsumgebungen > Anpassen -> add to a menu, hotkey
+#      Ctrl+Shift+B. Restart VW once.
 #
-# Run:  powershell -ExecutionPolicy Bypass -File vwx_watchdog.ps1
-# Stop: Ctrl+C (or close the window)
+# Run hidden: vwx-watchdog.bat   (logs to <PluginDir>\watchdog.log)
+# Stop:       close via Task-Manager or schtasks; single-instance mutex.
 
 param(
-    [int]$Port = 9878,
     [string]$PluginDir = "$env:APPDATA\Nemetschek\Vectorworks\2026\Plug-ins\VW-MCP",
-    [int]$StaleSeconds = 15,
-    [int]$PollSeconds = 3,
+    [int]$PollMs = 250,
     [string]$ProcessName = "Vectorworks2026"
 )
 
-$HbFile   = Join-Path $PluginDir 'bridge.hb'
+$JobsDir  = Join-Path $PluginDir 'ipc\jobs'
 $LogFile  = Join-Path $PluginDir 'watchdog.log'
-$IdleFile = Join-Path $PluginDir 'bridge.idle'   # bridge closed deliberately (UI released)
-$WakeFile = Join-Path $PluginDir 'bridge.wake'   # MCP server requests a bridge start
+New-Item -ItemType Directory -Force -Path $JobsDir | Out-Null
 
-# Single instance — a second watchdog would double-click dialogs and
-# double-send restart hotkeys.
+# Single instance — a second watchdog would double-fire hotkeys.
 $script:WdMutex = New-Object System.Threading.Mutex($false, 'Global\VwxBridgeWatchdog')
 if (-not $script:WdMutex.WaitOne(0)) {
     Write-Host 'vwx watchdog already running — exiting.'
@@ -60,11 +55,11 @@ public class VwWd {
     [DllImport("user32.dll", CharSet=CharSet.Auto)] static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr wp, StringBuilder lp);
     [DllImport("user32.dll")] static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     delegate bool EnumProc(IntPtr h, IntPtr lp);
 
     const uint WM_GETTEXT = 0x000D;
-    const uint WM_CLOSE   = 0x0010;
     const uint BM_CLICK   = 0x00F5;
     const uint KEYUP      = 0x0002;
 
@@ -103,9 +98,6 @@ public class VwWd {
         SendMessage(found, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
         return true;
     }
-    public static void CloseWindow(IntPtr h) {
-        SendMessage(h, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-    }
     public static IntPtr MainWindow(uint pid) {
         IntPtr best = IntPtr.Zero; int bestLen = -1;
         EnumWindows((h, lp) => {
@@ -118,14 +110,17 @@ public class VwWd {
         }, IntPtr.Zero);
         return best;
     }
+    public static bool IsForeground(IntPtr h) { return GetForegroundWindow() == h; }
     // Ctrl+Shift+B — must match the hotkey assigned to "VWX Bridge Start"
-    public static void SendRestartHotkey(IntPtr mainWin) {
-        SetForegroundWindow(mainWin);
-        System.Threading.Thread.Sleep(400);
+    public static void SendPumpHotkey(IntPtr mainWin) {
+        if (!IsForeground(mainWin)) {
+            SetForegroundWindow(mainWin);
+            System.Threading.Thread.Sleep(150);
+        }
         keybd_event(0x11, 0, 0, UIntPtr.Zero);        // Ctrl down
         keybd_event(0x10, 0, 0, UIntPtr.Zero);        // Shift down
         keybd_event(0x42, 0, 0, UIntPtr.Zero);        // B down
-        System.Threading.Thread.Sleep(60);
+        System.Threading.Thread.Sleep(40);
         keybd_event(0x42, 0, KEYUP, UIntPtr.Zero);
         keybd_event(0x10, 0, KEYUP, UIntPtr.Zero);
         keybd_event(0x11, 0, KEYUP, UIntPtr.Zero);
@@ -145,91 +140,43 @@ function Write-WdLog([string]$msg) {
     } catch {}
 }
 
-function Test-BridgePort {
-    $client = New-Object Net.Sockets.TcpClient
-    try {
-        $iar = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
-        if ($iar.AsyncWaitHandle.WaitOne(500)) { $client.EndConnect($iar); return $true }
-        return $false
-    } catch { return $false } finally { $client.Close() }
-}
-
-function Get-HbAge {
-    try {
-        $epoch = [double](Get-Content $HbFile -TotalCount 1)
-        $now = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        return $now - $epoch
-    } catch { return 99999 }
-}
-
-# Only dialogs whose CONTENT matches these are auto-dismissed. Never touch a
-# dialog the user is working in.
+# Only dialogs whose CONTENT matches these are auto-dismissed.
 $BadContent = 'Marionette|Traceback|Python Script Error'
 $DismissButtons = @('Schließen', 'OK', 'Close')
 
-Write-WdLog "watchdog start: port=$Port stale=${StaleSeconds}s poll=${PollSeconds}s hb=$HbFile"
-$lastRestart = [DateTime]::MinValue
+Write-WdLog "watchdog v4 start: jobs=$JobsDir poll=${PollMs}ms"
+$lastTrigger = [DateTime]::MinValue
 
 while ($true) {
-    Start-Sleep -Seconds $PollSeconds
+    Start-Sleep -Milliseconds $PollMs
     $vw = Get-Process $ProcessName -ErrorAction SilentlyContinue |
           Where-Object { $_.MainWindowTitle -ne '' } | Select-Object -First 1
     if (-not $vw) { continue }
     $vwpid = [uint32]$vw.Id
 
-    # 1. Dismiss known error dialogs (content-matched)
+    # 1. Dismiss known error dialogs; note whether a FOREIGN dialog is open.
+    $foreignDialog = $false
     foreach ($dlg in [VwWd]::Dialogs($vwpid)) {
-        $title = [VwWd]::Title($dlg)
-        if ($title -eq 'VW MCP Bridge') { continue }
         $content = [VwWd]::AllKidText($dlg)
         if ($content -match $BadContent) {
             foreach ($btn in $DismissButtons) {
                 if ([VwWd]::ClickByText($dlg, $btn)) {
-                    Write-WdLog "dismissed error dialog '$title' via '$btn'"
+                    Write-WdLog "dismissed error dialog '$([VwWd]::Title($dlg))' via '$btn'"
                     break
                 }
             }
+        } else {
+            $foreignDialog = $true      # user dialog — don't type into it
         }
     }
 
-    # 2. Health check
-    $age = Get-HbAge
-    $wake = Test-Path $WakeFile
-    if (($age -lt $StaleSeconds) -and (-not $wake)) { continue }
-    $portUp = Test-BridgePort
-
-    if ($portUp) {
-        # Main thread blocked (long op or a dialog we don't recognize) — the
-        # dismiss pass above already handled known ones. Log only.
-        if ($wake) { Remove-Item $WakeFile -Force -ErrorAction SilentlyContinue }
-        if ($age -gt 120) { Write-WdLog "heartbeat stale ${age}s but port open — VW busy (no action)" }
-        continue
-    }
-
-    # Deliberate idle sleep (UI released): only start on explicit wake request.
-    if ((Test-Path $IdleFile) -and (-not $wake)) { continue }
-    if ($wake) {
-        Remove-Item $WakeFile -Force -ErrorAction SilentlyContinue
-        Write-WdLog 'wake requested — starting bridge'
-    }
-
-    # 3. Context died (or wake) — restart (rate-limited to one attempt / 30s)
-    if (((Get-Date) - $lastRestart).TotalSeconds -lt 30) { continue }
-    $lastRestart = Get-Date
-    Write-WdLog "bridge DEAD (hb ${age}s, port closed) — restarting"
-    foreach ($dlg in [VwWd]::Dialogs($vwpid)) {
-        if ([VwWd]::Title($dlg) -eq 'VW MCP Bridge') {
-            Write-WdLog 'closing zombie bridge dialog'
-            [VwWd]::CloseWindow($dlg)
-            Start-Sleep -Seconds 2
-        }
-    }
+    # 2. Jobs waiting -> fire the pump hotkey (unless a user dialog is open).
+    $jobs = @(Get-ChildItem $JobsDir -Filter '*.json' -ErrorAction SilentlyContinue)
+    if ($jobs.Count -eq 0) { continue }
+    if ($foreignDialog) { continue }    # pump can't run now; server will wait
+    if (((Get-Date) - $lastTrigger).TotalMilliseconds -lt 400) { continue }
     $main = [VwWd]::MainWindow($vwpid)
-    if ($main -ne [IntPtr]::Zero) {
-        [VwWd]::SendRestartHotkey($main)
-        Write-WdLog 'sent Ctrl+Shift+B (VWX Bridge Start)'
-        Start-Sleep -Seconds 8
-        if (Test-BridgePort) { Write-WdLog 'bridge back UP' }
-        else { Write-WdLog 'restart NOT confirmed — is the hotkey assigned to "VWX Bridge Start"?' }
-    }
+    if ($main -eq [IntPtr]::Zero) { continue }
+    [VwWd]::SendPumpHotkey($main)
+    $lastTrigger = Get-Date
 }

@@ -5,6 +5,7 @@ Connects to the VWX MCP bridge running inside Vectorworks 2026.
 """
 
 import os
+import sys
 import logging
 from contextlib import asynccontextmanager
 import socket
@@ -57,17 +58,113 @@ if VWX_TASKS and not _TASKS_AVAILABLE:
 # VWX_WAKE_TIMEOUT=0 to skip.
 VWX_WAKE_TIMEOUT = float(os.environ.get('VWX_WAKE_TIMEOUT', '25'))
 
-def _wake_file_path():
+# Transport: 'file' (default on Windows) = job/result files in the VW plugin
+# dir; the watchdog fires the pump menu command per job, VW stays responsive
+# for the user (no modal bridge dialog). 'tcp' = classic dialog-pump bridge
+# on :9878 (the only option on macOS / remote setups).
+VWX_TRANSPORT = os.environ.get(
+    'VWX_TRANSPORT', 'file' if sys.platform == 'win32' else 'tcp').lower()
+
+def _plugin_dir():
     base = os.environ.get('VWX_PLUGIN_DIR')
     if base and os.path.isdir(base):
-        return os.path.join(base, 'bridge.wake')
+        return base
     appdata = os.environ.get('APPDATA', '')
     for name in ('VW-MCP', 'VWX-MCP'):
         cand = os.path.join(appdata, 'Nemetschek', 'Vectorworks', '2026',
                             'Plug-ins', name)
         if os.path.isdir(cand):
-            return os.path.join(cand, 'bridge.wake')
+            return cand
     return None
+
+def _wake_file_path():
+    base = _plugin_dir()
+    return os.path.join(base, 'bridge.wake') if base else None
+
+
+class VwxFileTransport:
+    """File-IPC to the in-VW pump (bridge v4, Windows).
+
+    send_command writes ipc/jobs/<ts>-<cid>.json; the watchdog's file watcher
+    fires the 'VWX Bridge Start' hotkey; vwx_pump.py executes the job on the
+    VW main thread and writes ipc/results/<cid>.json. VW stays responsive for
+    the user except while a command actually executes.
+    """
+    def __init__(self):
+        base = _plugin_dir()
+        if not base:
+            raise RuntimeError("VW plugin dir not found (set VWX_PLUGIN_DIR)")
+        self.jobs = os.path.join(base, 'ipc', 'jobs')
+        self.results = os.path.join(base, 'ipc', 'results')
+        os.makedirs(self.jobs, exist_ok=True)
+        os.makedirs(self.results, exist_ok=True)
+        self._lock = threading.Lock()
+
+    # keep the VwxMCPServer interface so callers don't care about transport
+    def disconnect(self):
+        pass
+
+    def _read_result(self, cid):
+        rp = os.path.join(self.results, cid + '.json')
+        if not os.path.exists(rp):
+            return None
+        try:
+            with open(rp, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+        except Exception:
+            return None      # writer may be mid-replace; retry next poll
+        try:
+            os.remove(rp)
+        except Exception:
+            pass
+        return result
+
+    def send_command(self, command_type, params=None):
+        cid = uuid.uuid4().hex[:12]
+        t0 = time.perf_counter()
+        # 'poll' (async retrieval): just look for the result file.
+        if command_type == 'poll':
+            pcid = str((params or {}).get('cid', ''))
+            result = self._read_result(pcid)
+            if result is not None:
+                return {'status': 'done', 'cid': pcid, 'result': result}
+            return {'status': 'pending', 'cid': pcid,
+                    'note': 'file transport: result not written yet'}
+        job = {'type': command_type, 'params': params or {}, '_cid': cid,
+               'ts': time.time()}
+        jp = os.path.join(self.jobs, '%013d-%s.json' % (time.time() * 1000, cid))
+        with self._lock:
+            tmp = jp + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(job, f, ensure_ascii=False)
+            os.replace(tmp, jp)
+        deadline = time.monotonic() + VWX_SOCKET_TIMEOUT
+        while time.monotonic() < deadline:
+            result = self._read_result(cid)
+            if result is not None:
+                ms = (time.perf_counter() - t0) * 1000
+                status = ("err" if isinstance(result, dict) and result.get("error")
+                          else "ok")
+                logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} "
+                            f"status={status} transport=file")
+                return result
+            time.sleep(0.03)
+        # timed out: remove the job if the pump never claimed it
+        try:
+            if os.path.exists(jp):
+                os.remove(jp)
+                hint = ("job was never picked up — is the watchdog "
+                        "(vwx-watchdog.bat) running and Ctrl+Shift+B assigned "
+                        "to 'VWX Bridge Start' in VW?")
+            else:
+                hint = ("job is executing but slow (long operation, Marionette "
+                        "execution, or a modal dialog in VW). Retry with "
+                        "command 'poll' and this cid to fetch the result.")
+        except Exception:
+            hint = "unknown"
+        logger.error(f"tool={command_type} cid={cid} status=timeout transport=file")
+        return {'error': f"timed out after {VWX_SOCKET_TIMEOUT:.0f}s — {hint}",
+                'cid': cid}
 
 
 class VwxMCPServer:
@@ -203,6 +300,10 @@ _vwx_connection = None
 
 def get_vwx_connection():
     global _vwx_connection
+    if VWX_TRANSPORT == 'file':
+        if _vwx_connection is None or not isinstance(_vwx_connection, VwxFileTransport):
+            _vwx_connection = VwxFileTransport()
+        return _vwx_connection
     if _vwx_connection is not None:
         # NOTE: no sendall(b'') "probe" — sending 0 bytes never fails, even on a
         # dead socket, so it detected nothing. send_command now reconnects on a
