@@ -131,14 +131,21 @@ def save_document_as(p):
         return {'error': str(e)}
 
 def get_document_preferences(p):
-    try:
-        lev, dec, dim, angle, area, vol = vs.GetDocumentUnits()
-        scale = _safe(lambda: vs.GetLScale(vs.ActLayer()))
-        return {'units': {'length': lev, 'decimal': dec, 'dimension': dim,
-                          'angle': angle, 'area': area, 'volume': vol},
-                'active_layer_scale': scale}
-    except Exception as e:
-        return {'error': str(e)}
+    # vs.GetDocumentUnits does not exist on VW2026 — vs.GetUnits() does
+    # (returns fractionalDisplay, displayAccuracy, format, unitsPerInch,
+    # unitName, squareUnitName as a tuple in Python).
+    out = {}
+    u = _safe(lambda: vs.GetUnits())
+    if u is not None:
+        try:
+            out['units'] = {'fraction': u[0], 'display': u[1], 'format': u[2],
+                            'units_per_inch': u[3], 'name': u[4],
+                            'square_name': u[5]}
+        except Exception:
+            out['units_raw'] = list(u) if isinstance(u, (list, tuple)) else str(u)
+    out['active_layer_scale'] = _safe(lambda: vs.GetLScale(vs.ActLayer()))
+    out['status'] = 'ok'
+    return out
 
 def set_document_preferences(p):
     # Units & scale live on layers in VW; apply scale to active layer.
@@ -193,9 +200,25 @@ def delete_layer(p):
     vs.DelObject(h); return {'status': 'ok'}
 
 def set_active_layer(p):
+    # vs.Layer(name) PARKS the enclosing script frame in a nested message
+    # loop on VW2026 (verified live 2026-07-06: crashed VW from a CEF
+    # callback, hung it from a WM_TIMER, silently killed the file-pump from
+    # a menu command). Never call vs.Layer from the bridge.
     name = p.get('name', '')
-    vs.Layer(name)
-    return {'status': 'ok', 'name': name}
+    h = vs.GetLayerByName(name)
+    if not h:
+        return {'error': f'Layer not found: {name} (set_active_layer no '
+                         'longer auto-creates; use create_layer first)'}
+    for fn in ('SetActiveLayerN', 'SetActiveLayer'):
+        f = getattr(vs, fn, None)
+        if f:
+            _safe(lambda: f(h))
+            now = _safe(lambda: vs.GetLName(vs.ActLayer()))
+            if now == name:
+                return {'status': 'ok', 'name': name, 'via': fn}
+    return {'error': 'no safe layer-activation API on this VW build '
+                     '(vs.Layer is quarantined — it parks the script '
+                     'frame). Place objects via set_object_layer instead.'}
 
 def get_active_layer(p):
     h = vs.ActLayer()
@@ -872,19 +895,31 @@ def detach_record(p):
         return {'error': str(e)}
 
 def create_record_format(p):
+    # vs.NewField on a NON-EXISTING format PARKS the script frame in a nested
+    # message loop on VW2026 (verified live 2026-07-06 — killed the sweep and,
+    # earlier, the Produktlink batch). Adding fields to an EXISTING format is
+    # fine. Create the format the safe way: attach it to a temp object via
+    # BeginRecord-less path is not scriptable, so use vs.NewField ONLY when
+    # the format already exists; otherwise create it via a temporary locus +
+    # record attach through the resource list.
     name = p.get('name', '')
     fields = p.get('fields', [])
-    try:
-        vs.NewField(name, 'placeholder', '', 4, 0)  # create record
-        # Delete placeholder, add real fields
-        _safe(lambda: vs.DelField(name, 'placeholder'))
-        type_map = {'string': 4, 'integer': 1, 'number': 3, 'boolean': 2}
-        for f in fields:
-            vs.NewField(name, f.get('name', ''), str(f.get('default', '')),
-                        type_map.get(f.get('type', 'string'), 4), 0)
-        return {'status': 'ok', 'name': name}
-    except Exception as e:
-        return {'error': str(e)}
+    type_map = {'string': 4, 'text': 4, 'integer': 1, 'number': 3,
+                'real': 3, 'boolean': 2}
+    if not name:
+        return {'error': 'name required'}
+    existed = bool(_safe(lambda: vs.GetObject(name)))
+    if not existed:
+        return {'error': "create_record_format is quarantined for NEW formats "
+                         "on VW2026 — vs.NewField parks the script frame when "
+                         "the format doesn't exist yet. Create the format once "
+                         "in the GUI (Werkzeuge > Datenbank) or attach fields "
+                         "to an existing format."}
+    for f in fields:
+        vs.NewField(name, f.get('name', ''), str(f.get('default', '')),
+                    type_map.get(f.get('type', 'string'), 4), 0)
+    return {'status': 'ok', 'name': name, 'existed': existed,
+            'fields_added': len(fields)}
 
 
 # ── IFC / BIM ───────────────────────────────────────────────────────────────
@@ -1303,11 +1338,27 @@ def set_georeferencing(p):
         return {'error': str(e)}
 
 def get_georeferencing(p):
-    try:
-        crs = _safe(vs.GetDocumentGeoreferenceEPSG, '')
-        return {'crs': crs}
-    except Exception as e:
-        return {'error': str(e)}
+    # No vs.GetDocumentGeoreferenceEPSG on VW2026. Probe the APIs that do
+    # exist across builds; report honestly what was found.
+    out = {}
+    for fname, key in (('GetGeoOrigin', 'geo_origin'),
+                       ('GetGeorefMode', 'georef_mode'),
+                       ('GetGISProjectionStr', 'projection')):
+        f = getattr(vs, fname, None)
+        if f:
+            v = _safe(f)
+            if v is not None:
+                out[key] = v
+    # layer-level georeferencing flag
+    h = vs.ActLayer()
+    if h:
+        out['active_layer_georef'] = _safe(lambda: vs.GetObjectVariableBoolean(h, 172))
+    if not out:
+        return {'error': 'no georeferencing API found on this VW build '
+                         '(available vs.* names probed: GetGeoOrigin, '
+                         'GetGeorefMode, GetGISProjectionStr)'}
+    out['status'] = 'ok'
+    return out
 
 
 # ── Textures ────────────────────────────────────────────────────────────────
@@ -2239,15 +2290,17 @@ def convert_to_nurbs(p):
     except Exception as e: return {'error': str(e)}
 
 def distance(p):
-    try: return {'distance': vs.Distance((p.get('x1', 0), p.get('y1', 0)),
-                                           (p.get('x2', 0), p.get('y2', 0)))}
-    except Exception as e: return {'error': str(e)}
+    # plain math — vs.Distance silently returned 0.0 with tuple args
+    import math
+    return {'distance': math.hypot(p.get('x2', 0) - p.get('x1', 0),
+                                   p.get('y2', 0) - p.get('y1', 0))}
 
 def distance_3d(p):
-    try: return {'distance': vs.Distance3D(
-        (p.get('x1', 0), p.get('y1', 0), p.get('z1', 0)),
-        (p.get('x2', 0), p.get('y2', 0), p.get('z2', 0)))}
-    except Exception as e: return {'error': str(e)}
+    import math
+    return {'distance': math.sqrt(
+        (p.get('x2', 0) - p.get('x1', 0)) ** 2 +
+        (p.get('y2', 0) - p.get('y1', 0)) ** 2 +
+        (p.get('z2', 0) - p.get('z1', 0)) ** 2)}
 
 
 # ── Materials ────────────────────────────────────────────────────────────────

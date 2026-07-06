@@ -25,8 +25,12 @@ extern "C" Sint32 GS_EXTERNAL_ENTRY plugin_module_main(Sint32 action, void* modu
 
 	using namespace VWFC::PluginSupport;
 
+	// NOTE: no side effects here — arming anything from module registration
+	// crashes VW during boot (verified live, twice). The pump timer starts
+	// and stops with the palette's visibility (Bridge/VwxBridgePalette.cpp).
 	REGISTER_Extension<VwxBridge::CExtVwxBridgePalette>( GROUPID_ExtensionWebPalettes, action, moduleInfo, iid, inOutInterface, cbp, reply );
 	REGISTER_Extension<VwxBridge::CExtMenuShowVwxBridge>( GROUPID_ExtensionMenu, action, moduleInfo, iid, inOutInterface, cbp, reply );
+	REGISTER_Extension<VwxBridge::CExtMenuVwxPump>( GROUPID_ExtensionMenu, action, moduleInfo, iid, inOutInterface, cbp, reply );
 
 	return reply;
 }

@@ -23,6 +23,7 @@ namespace VwxBridge
 		virtual		~CVwxJSProvider();
 
 		virtual void OnInit(IInitContext* context);
+		virtual void OnPaletteVisibilityChange(bool visible, IWebPaletteFrame* frame) override;
 
 		DEFINE_WebPalette_DISPATCH_MAP;
 
@@ -55,6 +56,27 @@ namespace VwxBridge
 		virtual		~CExtMenuShowVwxBridge_EventSink();
 
 		virtual void DoInterface();
+	};
+
+	// --------------------------------------------------------------------------------------------------------
+	// Internal pump command — invoked by the palette's timer via
+	// gSDK->DoMenuName(), which routes through VW's real command dispatcher:
+	// the only context where scripts may touch view state (vs.Layer, ...).
+	class CExtMenuVwxPump_EventSink : public VWMenu_EventSink
+	{
+	public:
+					CExtMenuVwxPump_EventSink(IVWUnknown* parent);
+		virtual		~CExtMenuVwxPump_EventSink();
+
+		virtual void DoInterface();
+	};
+
+	class CExtMenuVwxPump : public VWExtensionMenu
+	{
+		DEFINE_VWMenuExtension;
+	public:
+					CExtMenuVwxPump(CallBackPtr cbp);
+		virtual		~CExtMenuVwxPump();
 	};
 
 	// --------------------------------------------------------------------------------------------------------
