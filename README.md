@@ -105,12 +105,16 @@ __result__ = vs.GetObjectUuid(vs.LNewObj())
 
 ## Known constraint
 
-The bridge dialog is **modal** — it blocks the VW UI while active. Click **Stop**
-to reclaim VW. VW Python has no non-modal main-thread timer; this is a platform
-limitation, not a design choice.
+The bridge dialog is **modal** — it blocks the VW UI while active. VW Python
+has no non-modal main-thread timer; this is a platform limitation, not a
+design choice. On Windows the bridge therefore auto-closes after 45s idle
+(VW usable again) and is woken on demand by the watchdog — see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [watchdog/README.md](watchdog/README.md).
+A cross-platform (macOS) always-on reference lives in [legacy/](legacy/README.md).
 
 ## Docs
 
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — bridge lifecycle, watchdog, state files, env knobs.
 - **[AGENTS.md](AGENTS.md)** — agent integration guide + VW2026 API gotchas.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — API expansion plan (→ ~225 tools).
 - **[docs/MIGRATION_fastmcp3.md](docs/MIGRATION_fastmcp3.md)** — bundled→standalone fastmcp migration.

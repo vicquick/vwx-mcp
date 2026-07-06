@@ -79,9 +79,12 @@ import vs
 VW_PORT = int(os.environ.get('VW_MCP_PORT', '9878'))
 # The pump dialog is MODAL — while the bridge runs, the VW UI is locked for
 # the user. So the bridge closes itself after this many seconds without
-# commands (0 = never). The MCP server wakes it back up on demand via the
-# watchdog (bridge.wake -> restart hotkey).
-IDLE_CLOSE = float(os.environ.get('VWX_IDLE_CLOSE', '120'))
+# commands (0 = never) and the MCP server wakes it back up on demand via the
+# watchdog (bridge.wake -> restart hotkey). Wake-on-demand needs the Windows
+# watchdog; on macOS there is none, so the default there is 0 (classic
+# always-on dialog — see legacy/README.md).
+IDLE_CLOSE = float(os.environ.get('VWX_IDLE_CLOSE',
+                                  '45' if sys.platform == 'win32' else '0'))
 
 # Known non-timer item IDs (setup=12255, teardown=12256, OK=1, Cancel=2,
 # static text items 4 & 5).  Any item NOT in this set is treated as the timer.
