@@ -153,9 +153,9 @@ class VwxFileTransport:
         try:
             if os.path.exists(jp):
                 os.remove(jp)
-                hint = ("job was never picked up — is the watchdog "
-                        "(vwx-watchdog.bat) running and Ctrl+Shift+B assigned "
-                        "to 'VWX Bridge Start' in VW?")
+                hint = ("job was never picked up — is the VWX Bridge palette "
+                        "open (bridge on) and Ctrl+Shift+B assigned to "
+                        "'VWX Bridge Start' in VW?")
             else:
                 hint = ("job is executing but slow (long operation, Marionette "
                         "execution, or a modal dialog in VW). Retry with "
@@ -254,10 +254,9 @@ class VwxMCPServer:
                     if not self.connect():
                         raise ConnectionError(
                             f"Could not connect to Vectorworks at {self.host}:{self.port} "
-                            "and the wake-up request was not answered. Is the watchdog "
-                            "(vwx-watchdog.bat) running and the Ctrl+Shift+B hotkey "
-                            "assigned to 'VWX Bridge Start'? Fallback: run the bridge "
-                            "script manually in VW.")
+                            "and the wake-up request was not answered. Is the TCP "
+                            "dialog bridge (vwx_mcp_bridge.py) running in VW? "
+                            "Fallback: run the bridge script manually in VW.")
                     self.socket.sendall(payload)
                 # Receive — NO retry here: the command may already be executing
                 # in VW; resending would double-execute mutating commands.
@@ -318,9 +317,9 @@ def get_vwx_connection():
         _vwx_connection = None
         raise Exception(
             f"Could not connect to Vectorworks at {VWX_HOST}:{VWX_PORT} and the wake-up "
-            "request was not answered. Check: VW running? Watchdog (vwx-watchdog.bat) "
-            "running? Ctrl+Shift+B assigned to 'VWX Bridge Start'? Fallback: run the "
-            "bridge script manually in VW.")
+            "request was not answered. Check: VW running? TCP dialog bridge "
+            "(vwx_mcp_bridge.py) running in VW? Fallback: run the bridge script "
+            "manually in VW. (Windows default is the file-IPC pump, not this path.)")
     logger.info(f"Connected to Vectorworks at {VWX_HOST}:{VWX_PORT}")
     return _vwx_connection
 
@@ -1281,6 +1280,110 @@ def vs_index_stats(ctx: Context) -> str:
     """Size + per-category counts of the loaded `vs.*` knowledge index.
     Confirms vs_index.json is deployed and current."""
     return cmd("vs_index_stats")
+
+# ── SDK enrichment tools (3D modeling, 2D surfaces, graphic calc) ────────────
+
+@vtool
+def create_extrude_along_path(ctx: Context, path_id: str, profile_id: str) -> str:
+    """Sweep a 2D profile along a 2D/3D path object (path extrude / solid sweep)."""
+    return cmd("create_extrude_along_path", {"path_id": path_id, "profile_id": profile_id})
+
+@vtool
+def create_tapered_extrude(ctx: Context, object_id: str, angle: float = 10, height: float = 100) -> str:
+    """Extrude a 2D profile with a draft/taper angle (deg) to the given height."""
+    return cmd("create_tapered_extrude", {"object_id": object_id, "angle": angle, "height": height})
+
+@vtool
+def create_loft(ctx: Context, group_id: str, ruled: bool = False, closed: bool = False, solid: bool = False) -> str:
+    """Loft/skin NURBS surfaces through a GROUP of cross-section curves."""
+    return cmd("create_loft", {"group_id": group_id, "ruled": ruled, "closed": closed, "solid": solid})
+
+@vtool
+def draw_locus(ctx: Context, x: float = 0, y: float = 0) -> str:
+    """Draw a 2D reference point (locus)."""
+    return cmd("draw_locus", {"x": x, "y": y})
+
+@vtool
+def draw_locus_3d(ctx: Context, x: float = 0, y: float = 0, z: float = 0) -> str:
+    """Draw a 3D reference point."""
+    return cmd("draw_locus_3d", {"x": x, "y": y, "z": z})
+
+@vtool
+def rotate_object_3d(ctx: Context, object_id: str, x_angle: float = 0, y_angle: float = 0,
+                     z_angle: float = 0, cx: float = 0, cy: float = 0, cz: float = 0) -> str:
+    """Rotate a 3D object about a 3D point by x/y/z angles (deg)."""
+    return cmd("rotate_object_3d", {"object_id": object_id, "x_angle": x_angle, "y_angle": y_angle,
+                                    "z_angle": z_angle, "cx": cx, "cy": cy, "cz": cz})
+
+@vtool
+def get_3d_info(ctx: Context, object_id: str) -> str:
+    """Bounding height/width/depth of a 3D object."""
+    return cmd("get_3d_info", {"object_id": object_id})
+
+@vtool
+def get_centroid_3d(ctx: Context, object_id: str) -> str:
+    """Center of gravity (x,y,z) of a 3D solid."""
+    return cmd("get_centroid_3d", {"object_id": object_id})
+
+@vtool
+def add_surface(ctx: Context, object_id_a: str, object_id_b: str) -> str:
+    """Union two 2D surfaces into one."""
+    return cmd("add_surface", {"object_id_a": object_id_a, "object_id_b": object_id_b})
+
+@vtool
+def clip_surface(ctx: Context, object_id_a: str, object_id_b: str) -> str:
+    """Subtract 2D surface B from surface A."""
+    return cmd("clip_surface", {"object_id_a": object_id_a, "object_id_b": object_id_b})
+
+@vtool
+def intersect_surface(ctx: Context, object_id_a: str, object_id_b: str) -> str:
+    """Keep only the overlap of two 2D surfaces."""
+    return cmd("intersect_surface", {"object_id_a": object_id_a, "object_id_b": object_id_b})
+
+@vtool
+def combine_into_surface(ctx: Context, x: float = 0, y: float = 0) -> str:
+    """Paint-bucket: build a polyline from the bounded region around a point."""
+    return cmd("combine_into_surface", {"x": x, "y": y})
+
+@vtool
+def add_hole(ctx: Context, object_id: str, hole_id: str) -> str:
+    """Cut a hole in object using hole_id as template (template consumed)."""
+    return cmd("add_hole", {"object_id": object_id, "hole_id": hole_id})
+
+@vtool
+def polygonize(ctx: Context, object_id: str, segment_length: float = 10, straight: bool = False) -> str:
+    """Convert a polyline/polygon's arcs into straight segments."""
+    return cmd("polygonize", {"object_id": object_id, "segment_length": segment_length, "straight": straight})
+
+@vtool
+def line_line_intersection(ctx: Context, a1: List[float], a2: List[float],
+                           b1: List[float], b2: List[float]) -> str:
+    """Intersection point of two lines (each by 2 [x,y] points). Pure math."""
+    return cmd("line_line_intersection", {"a1": a1, "a2": a2, "b1": b1, "b2": b2})
+
+@vtool
+def circle_circle_intersection(ctx: Context, c1: List[float], r1: float,
+                               c2: List[float], r2: float) -> str:
+    """Intersection points of two circles (centers [x,y] + radii). Pure math."""
+    return cmd("circle_circle_intersection", {"c1": c1, "r1": r1, "c2": c2, "r2": r2})
+
+@vtool
+def line_circle_intersection(ctx: Context, p1: List[float], p2: List[float],
+                             center: List[float], radius: float) -> str:
+    """Intersection points of a line (2 [x,y] pts) and a circle. Pure math."""
+    return cmd("line_circle_intersection", {"p1": p1, "p2": p2, "center": center, "radius": radius})
+
+@vtool
+def three_point_center(ctx: Context, p1: List[float], p2: List[float], p3: List[float]) -> str:
+    """Center [x,y] of the circle passing through 3 points. Pure math."""
+    return cmd("three_point_center", {"p1": p1, "p2": p2, "p3": p3})
+
+@vtool
+def polygon_area_at_point(ctx: Context, x: float = 0, y: float = 0) -> str:
+    """Area of the smallest bounded polygon surrounding a point (paint-bucket measure)."""
+    return cmd("polygon_area_at_point", {"x": x, "y": y})
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════

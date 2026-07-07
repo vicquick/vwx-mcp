@@ -1,4 +1,4 @@
-# vwx-mcp architecture (bridge v12 — native palette, context-split, true background)
+# vwx-mcp architecture (bridge v13 — native palette, context-split, true background, auto-dismiss)
 
 ```
 Claude Code ──HTTP :8082──▶ vwx_mcp_server.py (cmd window, fastmcp)
@@ -85,12 +85,12 @@ Python-context teardown after a Marionette run loses nothing.
 
 | Piece | Path | Role |
 |---|---|---|
-| MCP server | `mcp-server/vwx_mcp_server.py` | 150 tools, fastmcp, file transport; `VWX_TRANSPORT=tcp` for the legacy dialog bridge |
+| MCP server | `mcp-server/vwx_mcp_server.py` | 171 tools, fastmcp, file transport; `VWX_TRANSPORT=tcp` for the legacy dialog bridge |
 | Native palette | `native/` → build `VwxBridge.vlb`+`.vwr`, deploy to `C:\Program Files\Vectorworks 2026\Plug-ins\` via `~\bridge\deploy_native_bridge.bat` (VW closed, UAC) | trigger + heartbeat + status UI |
 | Pump | `vwx-plugin/vwx_pump.py` → `%APPDATA%\…\Plug-ins\VW-MCP\` | `pump_readonly()` / `pump_all()`; **no module-level auto-run** |
-| Executor | `watchdog/BridgeStart_MenuCommand.py` | paste into a Python menu-command plugin "VWX Bridge Start", accelerator Ctrl+Shift+B |
+| Executor | `vwx-plugin/BridgeStart_MenuCommand.py` | paste into a Python menu-command plugin "VWX Bridge Start", accelerator Ctrl+Shift+B |
 | Commands | `vwx-plugin/commands.py` | all verb implementations, mtime-gated hot-reload |
-| Watchdog | `watchdog/vwx_watchdog.ps1` | **OBSOLETE since v12** — reference only, do not run |
+| Knowledge index | `vwx-plugin/vs_index.json` (`tools/build_vs_index.py`) | 3071 `vs.*` signatures for validation + `vs_signature` |
 
 Build: `msbuild native/VwxBridge2026.vcxproj -p:Configuration=Release
 -p:Platform=x64` with `VWSDK2026` pointing at the SDK root that contains
