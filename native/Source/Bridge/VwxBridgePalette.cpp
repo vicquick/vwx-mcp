@@ -416,8 +416,11 @@ static bool WindowTextContainsError(HWND dlg)
 		int n = GetWindowTextW( ch, buf, 1024 );
 		if ( n > 0 ) {
 			// German + English error signatures VW uses.
+			// NOTE: "Marionette" alone was here once and ATE the Marionette
+			// script-editor dialog (its text contains the word) — never match
+			// on product names, only on unambiguous ERROR phrases.
 			if ( wcsstr( buf, L"Script-Fehler" ) || wcsstr( buf, L"Traceback" ) ||
-			     wcsstr( buf, L"Script Error" )  || wcsstr( buf, L"Marionette" ) ||
+			     wcsstr( buf, L"Script Error" ) ||
 			     wcsstr( buf, L"Handle variable is NIL" ) ||
 			     wcsstr( buf, L"Invalid number of parameters" ) ||
 			     // VW compile/runtime error dialog ("Beim Kompilieren bzw.
@@ -489,7 +492,10 @@ static void CALLBACK PumpTimerProc(HWND, UINT, UINT_PTR, DWORD)
 {
 	RestoreKeyState();            // undo last tick's background-hotkey key state
 	                              // (posted keys have since been translated)
-	DismissErrorDialogs();        // keep unattended background ops unblocked
+	if ( !gPaused )
+		DismissErrorDialogs();    // keep unattended background ops unblocked
+		                          // (paused = hands-off: user may be editing
+		                          //  node scripts / working in dialogs)
 	TXString pluginDir = VwxPluginDir();
 	WriteAlive( pluginDir );
 	gLastQueue = CountJobs( pluginDir );
