@@ -12,7 +12,7 @@ must be running first (see README). `ping` confirms the full chain is live.
 
 ## Three access layers — pick the narrowest that works
 
-1. **Explicit tools** (171). Typed, documented, safe. Prefer these.
+1. **Explicit tools** (170). Typed, documented, safe. Prefer these.
 2. **`vwx(command, params)`** — generic dispatcher to any verb in `commands.py`.
    Call `list_commands` to discover. Use when no explicit wrapper exists but a
    `commands.py` verb does.
@@ -116,6 +116,24 @@ New capability wrapped from untapped `vs.*` domains (all live-tested):
 Surface booleans **consume** their inputs (VW replaces them with the result) —
 re-fetch handles afterwards, don't reuse `object_id_a/b`.
 
+Live-testing findings (all reproduced):
+
+- **`create_loft` recipe**: the group must contain **NURBS curves**, not planar
+  ovals/polys. `vs.ConvertToNURBS(h, keepOrig)` **returns** the new handle (does
+  NOT advance `LNewObj`; arg 2 is keepOrig, not delete). Working pattern:
+  `BeginGroup()` → per section: create curve → `nh = ConvertToNURBS(c, False)` →
+  `Move3DObj(nh, 0, 0, z)` → `EndGroup()` → `LNewObj()` is the group. Loft of
+  three circles at z=0/80/160 → type-84 solid, depth = z-span.
+- **`create_extrude_along_path`**: profile and path must NOT be coplanar
+  (degenerate sweep → nil). Use a 3D path (`BeginPoly3D`/`Add3DPt`) rising out
+  of the profile plane; the verb returns a clear error for the coplanar case.
+- **`vs.Centroid3D`** returns a FLATTENED `(ok, x, y, z)` 4-tuple on VW2026 —
+  not `(ok, point)`. `get_centroid_3d` handles both.
+- **`combine_into_surface` is quarantined** (no `@vtool`; `vwx` dispatch refuses
+  without `force:true`): `vs.CombineIntoSurface` runs a document-wide region
+  resolve on VW's main thread — measured **215 s frozen UI** on a small test doc
+  before returning. Draw a closed polygon instead.
+
 ## Server internals (for tool authors)
 
 - **`@mcp.tool(output_schema=None)`**, never `structured_output=False`. The server
@@ -126,7 +144,7 @@ re-fetch handles afterwards, don't reuse `object_id_a/b`.
 - New tools are registered via the **`vtool`** wrapper (in `vwx_mcp_server.py`),
   which forwards to `mcp.tool(output_schema=None)` and injects the tool's tag from
   `tool_tags.py` by function name. Add the new tool name to `tool_tags.py` too
-  (a probe asserts every tool is tagged — currently 171/171).
+  (a probe asserts every tool is tagged — currently 170/170).
 - Tags must be set at **registration** (decorator) for the Visibility API; mutating
   `tool.tags` afterward does not affect `enable/disable`.
 - Tool bodies return a JSON **string** via `cmd(command_type, params)`; the actual

@@ -732,6 +732,11 @@ def create_extrude_along_path(p):
     if not path or not prof:
         return {'error': 'path_id and profile_id (both existing objects) required'}
     eh = vs.ExtrudeAlongPath(path, prof)
+    if not eh:
+        return {'error': 'ExtrudeAlongPath produced no solid — profile and path '
+                'are likely COPLANAR (degenerate sweep). The profile plane must '
+                'be ~perpendicular to the path start; use a 3D path that rises in '
+                'Z, or a profile on a different plane.'}
     return {'status': 'ok', 'object_id': _oid(eh)}
 
 def create_tapered_extrude(p):
@@ -795,12 +800,14 @@ def get_centroid_3d(p):
     if not h: return {'error': 'Object not found'}
     r = _safe(lambda: vs.Centroid3D(h))
     if r is None: return {'error': 'no centroid (not a solid?)'}
-    # Python: (ok, centerPt) — normalise to {x,y,z}
-    pt = r[1] if isinstance(r, (list, tuple)) and len(r) >= 2 and isinstance(r[1], (list, tuple)) else r
-    try:
-        return {'status': 'ok', 'x': pt[0], 'y': pt[1], 'z': pt[2]}
-    except Exception:
-        return {'status': 'ok', 'centroid': r}
+    # VW2026 Python: Centroid3D returns a FLATTENED (ok, x, y, z) 4-tuple, or a
+    # nested (ok, point) — handle both.
+    if isinstance(r, (list, tuple)):
+        if len(r) >= 4 and all(isinstance(v, (int, float)) for v in r[1:4]):
+            return {'status': 'ok', 'x': r[1], 'y': r[2], 'z': r[3]}
+        if len(r) >= 2 and isinstance(r[1], (list, tuple)) and len(r[1]) >= 3:
+            return {'status': 'ok', 'x': r[1][0], 'y': r[1][1], 'z': r[1][2]}
+    return {'status': 'ok', 'centroid': r}
 
 # ── SDK enrichment: 2D surface booleans (paint-bucket style) ────────────────
 
@@ -826,8 +833,14 @@ def intersect_surface(p):
     return {'status': 'ok', 'object_id': _oid(h)}
 
 def combine_into_surface(p):
-    """Paint-bucket: build a polyline from the bounded region around a point.
-    params: {x, y}."""
+    """DISABLED. vs.CombineIntoSurface (paint-bucket) WEDGES VW's main thread when
+    the point is not inside a cleanly bounded, fillable region — the call never
+    returns, freezing VW (verified). No safe headless precondition exists, so this
+    verb refuses by default. Pass force=True to run it anyway at your own risk."""
+    if not p.get('force'):
+        return {'error': 'combine_into_surface is disabled: vs.CombineIntoSurface '
+                'can hang VW main thread on an unbounded/unfillable region. '
+                'Draw a CLOSED filled polygon instead, or pass force=True to override.'}
     h = vs.CombineIntoSurface((float(p.get('x', 0)), float(p.get('y', 0))))
     return {'status': 'ok', 'object_id': _oid(h)}
 
