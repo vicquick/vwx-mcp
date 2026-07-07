@@ -79,13 +79,14 @@ Python-context teardown after a Marionette run loses nothing.
 | v4 | job files + external watchdog fires hotkey | watchdog process + VW focus needed (Win11 blocks background `keybd_event`); focus flashing |
 | v5–v10 | native C++ palette experiments | mapped every context that crashes on mutation (table above) |
 | v11 | context-split pump: reads background, writes foreground-keystroke | writes still needed a focus moment |
-| **v12** | **+ posted-key accelerator via VW's own thread key-state** | **none known** |
+| v12 | + posted-key accelerator via VW's own thread key-state | VW error dialogs could still block the pump |
+| **v13** | **+ auto-dismiss of VW error dialogs (content-matched, incl. the engine-level "Beim Kompilieren … Error Output" dialog)** | **long-running vs.* calls block the UI for their duration (by VW design)** |
 
 ## Components
 
 | Piece | Path | Role |
 |---|---|---|
-| MCP server | `mcp-server/vwx_mcp_server.py` | 237 tools, fastmcp, file transport; `VWX_TRANSPORT=tcp` for the legacy dialog bridge |
+| MCP server | `mcp-server/vwx_mcp_server.py` | 248 tools, fastmcp, file transport; `VWX_TRANSPORT=tcp` for the legacy dialog bridge |
 | Native palette | `native/` → build `VwxBridge.vlb`+`.vwr`, deploy to `C:\Program Files\Vectorworks 2026\Plug-ins\` via `~\bridge\deploy_native_bridge.bat` (VW closed, UAC) | trigger + heartbeat + status UI |
 | Pump | `vwx-plugin/vwx_pump.py` → `%APPDATA%\…\Plug-ins\VW-MCP\` | `pump_readonly()` / `pump_all()`; **no module-level auto-run** |
 | Executor | `vwx-plugin/BridgeStart_MenuCommand.py` | paste into a Python menu-command plugin "VWX Bridge Start", accelerator Ctrl+Shift+B |
@@ -128,10 +129,12 @@ dependency-free reference `legacy/vwx_mcp_bridge_dialog.py`
 
 ## Verification
 
-Full 221-verb sweep (10 phases, one blank-document session): 157 ok /
-59 handled-error (intentional bad-input tests) / remainder test-fixture noise;
-zero crashes. Background write verified live: `draw_rectangle` executed in
-33ms while VW was backgrounded and the user worked in another application.
+Full command sweep (10 phases, one blank-document session): **164 ok / 56
+handled-error** (intentional bad-input tests) / dialog-only verbs skipped; zero
+crashes — see [TOOL_COVERAGE.md](TOOL_COVERAGE.md). The three SDK-enrichment
+batches (85 further verbs) were each live-tested the same way on landing.
+Background write verified live: `draw_rectangle` executed in 33ms while VW was
+backgrounded and the user worked in another application.
 
 ## Roadmap
 

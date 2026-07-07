@@ -1,6 +1,6 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 237 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
+**Vectorworks 2026 MCP server — 248 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
 
 Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
 Desktop, …) **while you work in another app**: reads drain invisibly via VW's
@@ -94,32 +94,34 @@ path.
 
 ## Toolset presets (tame tool-overload)
 
-237 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
+248 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
 `bridge/vwx-mcp.bat` to expose only one workflow's tools via the fastmcp
 Visibility API (tags live in `mcp-server/tool_tags.py`):
 
 | `VWX_TOOLSET` | tools | for |
 |---|---|---|
-| `full` (default) | 237 | everything |
-| `gis` | 96 | georef / layers / classes / appearance / export |
-| `modeling` | 154 | 2D+3D draw / manipulate / BIM / symbols |
+| `full` (default) | 248 | everything |
+| `gis` | 101 | georef / layers / classes / appearance / export |
+| `modeling` | 160 | 2D+3D draw / manipulate / BIM / symbols |
 | `baumkataster` | 70 | tree register: plants / records / query / IO |
 | `minimal` | 40 | document / query / escape hatch |
 
-## Tools (237)
+## Tools (248)
 
 19 tag groups — counts in parentheses:
 
 `bim` (31, incl. IFC deep: psets, bulk classification, walls, roofs) ·
-`worksheets` (23, incl. criteria-driven report generation) · `query` (21) ·
-`appearance` (23, incl. textures + lights) · `manipulate` (20) · `draw3d` (19) ·
-`draw2d` (18) · `layers` (11) · `document` (10, incl. doc-default styling) ·
-`escape` (9, incl. `vs_signature`) · `classes` (7) · `records` (7) ·
-`viewports` (7) · `symbols` (6) · `landscape` (6, Baumkataster) · `io` (6) ·
-`view` (6) · `site` (5) · `geo` (2)
+`manipulate` (26, incl. polygon vertex editing) · `worksheets` (23, incl.
+criteria-driven report generation) · `query` (21, incl. the criteria engine) ·
+`draw3d` (19, incl. loft / shell / path-extrude / NURBS) · `draw2d` (18, incl.
+surface booleans) · `appearance` (23, incl. textures + lights) · `layers` (11) ·
+`document` (10, incl. doc-default styling) · `escape` (9, incl. `vs_signature`) ·
+`geo` (7, incl. lat/lon ⇄ drawing conversion + EPSG georef) · `classes` (7) ·
+`records` (7) · `viewports` (7) · `symbols` (6) · `landscape` (6, Baumkataster) ·
+`io` (6) · `view` (6) · `site` (5)
 
 Three access layers (see [AGENTS.md](AGENTS.md)):
-1. **Explicit tools** — the 237 wrappers above.
+1. **Explicit tools** — the 248 wrappers above.
 2. **`vwx(command, params)`** — generic dispatcher reaching every verb in
    `commands.py` (use `list_commands` to discover).
 3. **`execute_script`** — arbitrary `vs.*` Python.
