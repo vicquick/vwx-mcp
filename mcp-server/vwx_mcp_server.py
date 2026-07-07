@@ -1589,6 +1589,239 @@ def get_document_units(ctx: Context) -> str:
     """Current document unit settings (name, units-per-inch, precision flags)."""
     return cmd("get_document_units")
 
+
+# ── SDK enrichment 3: report worksheets, IFC deep, textures, doc defaults ───
+
+@vtool
+def create_report_worksheet(ctx: Context, name: str, criteria: str,
+                            columns: List[Dict[str, str]],
+                            place_at: Optional[Dict[str, float]] = None) -> str:
+    """One-call criteria-driven report: worksheet + header row + DATABASE(criteria)
+    row + column formulas + recalc (+ optional placement on the drawing).
+    columns=[{header, formula}]; formulas: '=N' name, '=AREA', '=PERIM',
+    "='Rec'.'Field'" record field, '=C' class, '=L' layer. Auto-populates one
+    subrow per matching object — THE tool for Baumkataster lists / part tables."""
+    p = {"name": name, "criteria": criteria, "columns": columns}
+    if place_at: p["place_at"] = place_at
+    return cmd("create_report_worksheet", p)
+
+@vtool
+def set_worksheet_database_row(ctx: Context, worksheet: str, row: int, criteria: str) -> str:
+    """Bind a worksheet row to DATABASE(criteria); auto-populates subrows."""
+    return cmd("set_worksheet_database_row", {"worksheet": worksheet, "row": row, "criteria": criteria})
+
+@vtool
+def get_worksheet_subrow_count(ctx: Context, worksheet: str, row: int = 2) -> str:
+    """Subrow count of a database row (= number of matching objects)."""
+    return cmd("get_worksheet_subrow_count", {"worksheet": worksheet, "row": row})
+
+@vtool
+def get_worksheet_subrow_cell(ctx: Context, worksheet: str, row: int, subrow: int, column: int) -> str:
+    """Read one database SUBROW cell (string + numeric)."""
+    return cmd("get_worksheet_subrow_cell", {"worksheet": worksheet, "row": row, "subrow": subrow, "column": column})
+
+@vtool
+def get_worksheet_cell_formula(ctx: Context, worksheet: str, row: int, column: int) -> str:
+    """Formula stored in a worksheet cell."""
+    return cmd("get_worksheet_cell_formula", {"worksheet": worksheet, "row": row, "column": column})
+
+@vtool
+def set_worksheet_cell_alignment(ctx: Context, worksheet: str, row: int, column: int,
+                                 alignment: int = 4, to_row: Optional[int] = None,
+                                 to_column: Optional[int] = None) -> str:
+    """Horizontal alignment of a cell range. 1=general 2=left 3=right 4=center."""
+    p = {"worksheet": worksheet, "row": row, "column": column, "alignment": alignment}
+    if to_row is not None: p["to_row"] = to_row
+    if to_column is not None: p["to_column"] = to_column
+    return cmd("set_worksheet_cell_alignment", p)
+
+@vtool
+def set_worksheet_cell_text_format(ctx: Context, worksheet: str, row: int, column: int,
+                                   size: int = 10, style: int = 0, font: Optional[str] = None,
+                                   to_row: Optional[int] = None, to_column: Optional[int] = None) -> str:
+    """Font/size/style of a cell range. style: 0=plain 1=bold 2=italic."""
+    p = {"worksheet": worksheet, "row": row, "column": column, "size": size, "style": style}
+    if font: p["font"] = font
+    if to_row is not None: p["to_row"] = to_row
+    if to_column is not None: p["to_column"] = to_column
+    return cmd("set_worksheet_cell_text_format", p)
+
+@vtool
+def set_worksheet_cell_number_format(ctx: Context, worksheet: str, row: int, column: int,
+                                     style: int = 1, accuracy: int = 2, leader: str = "",
+                                     trailer: str = "", to_row: Optional[int] = None,
+                                     to_column: Optional[int] = None) -> str:
+    """Number format of a cell range. style: 0=general 1=decimal 4=dimension; trailer e.g. ' m2'."""
+    p = {"worksheet": worksheet, "row": row, "column": column, "style": style,
+         "accuracy": accuracy, "leader": leader, "trailer": trailer}
+    if to_row is not None: p["to_row"] = to_row
+    if to_column is not None: p["to_column"] = to_column
+    return cmd("set_worksheet_cell_number_format", p)
+
+@vtool
+def set_worksheet_cell_fill(ctx: Context, worksheet: str, row: int, column: int,
+                            bg_color: int = 0, style: int = 1, to_row: Optional[int] = None,
+                            to_column: Optional[int] = None) -> str:
+    """Cell background fill (color index)."""
+    p = {"worksheet": worksheet, "row": row, "column": column, "bg_color": bg_color, "style": style}
+    if to_row is not None: p["to_row"] = to_row
+    if to_column is not None: p["to_column"] = to_column
+    return cmd("set_worksheet_cell_fill", p)
+
+@vtool
+def set_worksheet_row_height(ctx: Context, worksheet: str, from_row: int, height: int,
+                             to_row: Optional[int] = None, lock: bool = False) -> str:
+    """Worksheet row height."""
+    p = {"worksheet": worksheet, "from_row": from_row, "height": height, "lock": lock}
+    if to_row is not None: p["to_row"] = to_row
+    return cmd("set_worksheet_row_height", p)
+
+@vtool
+def merge_worksheet_cells(ctx: Context, worksheet: str, row: int, column: int,
+                          to_row: int, to_column: int) -> str:
+    """Merge a worksheet cell range into one cell."""
+    return cmd("merge_worksheet_cells", {"worksheet": worksheet, "row": row, "column": column,
+                                         "to_row": to_row, "to_column": to_column})
+
+@vtool
+def place_worksheet_on_drawing(ctx: Context, worksheet: str, x: float = 0, y: float = 0) -> str:
+    """Place (or find) the worksheet's on-drawing image object."""
+    return cmd("place_worksheet_on_drawing", {"worksheet": worksheet, "x": x, "y": y})
+
+@vtool
+def ifc_list_psets(ctx: Context, object_id: str, all: bool = True) -> str:
+    """Property sets on an object. all=True includes inherited/standard psets."""
+    return cmd("ifc_list_psets", {"object_id": object_id, "all": all})
+
+@vtool
+def ifc_get_pset_prop(ctx: Context, object_id: str, pset: str, prop: str) -> str:
+    """Read one IFC pset property value."""
+    return cmd("ifc_get_pset_prop", {"object_id": object_id, "pset": pset, "prop": prop})
+
+@vtool
+def ifc_attach_pset(ctx: Context, object_id: str, pset: str) -> str:
+    """Attach a defined pset to an object."""
+    return cmd("ifc_attach_pset", {"object_id": object_id, "pset": pset})
+
+@vtool
+def ifc_remove_pset(ctx: Context, object_id: str, pset: Optional[str] = None) -> str:
+    """Remove one pset from an object — omit pset to clear ALL."""
+    p = {"object_id": object_id}
+    if pset: p["pset"] = pset
+    else: p["all"] = True
+    return cmd("ifc_remove_pset", p)
+
+@vtool
+def ifc_define_pset(ctx: Context, name: str, members: List[Dict[str, str]]) -> str:
+    """Define a custom pset schema (document-wide). members=[{name, type}],
+    type: 'IfcLabel' | 'IfcReal' | 'IfcBoolean' | 'IfcLengthMeasure' ..."""
+    return cmd("ifc_define_pset", {"name": name, "members": members})
+
+@vtool
+def ifc_get_entity_prop(ctx: Context, object_id: str, prop: str) -> str:
+    """Read a direct IFC entity attribute (Name, Description, Tag, ...)."""
+    return cmd("ifc_get_entity_prop", {"object_id": object_id, "prop": prop})
+
+@vtool
+def ifc_set_entity_prop(ctx: Context, object_id: str, prop: str, value: str) -> str:
+    """Set a direct IFC entity attribute."""
+    return cmd("ifc_set_entity_prop", {"object_id": object_id, "prop": prop, "value": value})
+
+@vtool
+def ifc_bulk_set_pset(ctx: Context, criteria: str, pset: str, prop: str, value: str,
+                      entity: Optional[str] = None) -> str:
+    """Set an IFC pset property on EVERY object matching criteria — the bulk
+    classification tool (DIN276 KG pipelines). Optionally assigns `entity`
+    (e.g. 'IfcSlab') first. Auto-attaches the pset where needed."""
+    p = {"criteria": criteria, "pset": pset, "prop": prop, "value": value}
+    if entity: p["entity"] = entity
+    return cmd("ifc_bulk_set_pset", p)
+
+@vtool
+def create_texture(ctx: Context, name: str, size: Optional[float] = None) -> str:
+    """Create a texture resource (plain color shader; edit look in Resource Manager)."""
+    p = {"name": name}
+    if size is not None: p["size"] = size
+    return cmd("create_texture", p)
+
+@vtool
+def get_texture_info(ctx: Context, texture: str) -> str:
+    """Texture resource info (size, shader) by name."""
+    return cmd("get_texture_info", {"texture": texture})
+
+@vtool
+def set_texture_size(ctx: Context, texture: str, size: float) -> str:
+    """Real-world size of a texture resource."""
+    return cmd("set_texture_size", {"texture": texture, "size": size})
+
+@vtool
+def set_object_texture(ctx: Context, object_id: str, texture: str = "",
+                       part: int = 0, layer: int = 0) -> str:
+    """Apply a texture (resource name) to an object part; empty name removes.
+    Texture read-back is meaningful on 3D objects."""
+    return cmd("set_object_texture", {"object_id": object_id, "texture": texture,
+                                      "part": part, "layer": layer})
+
+@vtool
+def get_object_texture(ctx: Context, object_id: str, part: int = 0, layer: int = 0,
+                       resolve_by_class: bool = True) -> str:
+    """Texture applied to an object part (ref index + resource name)."""
+    return cmd("get_object_texture", {"object_id": object_id, "part": part,
+                                      "layer": layer, "resolve_by_class": resolve_by_class})
+
+@vtool
+def set_texture_mapping(ctx: Context, object_id: str, selector: int = 4, value: float = 1,
+                        part: int = 0, layer: int = 0) -> str:
+    """Texture mapping value (SetTexMapRealN codes: 1=offsetX 2=offsetY 3=rotation 4=scale2D)."""
+    return cmd("set_texture_mapping", {"object_id": object_id, "selector": selector,
+                                       "value": value, "part": part, "layer": layer})
+
+@vtool
+def get_texture_mapping(ctx: Context, object_id: str, selector: int = 4,
+                        part: int = 0, layer: int = 0) -> str:
+    """Read a texture mapping value."""
+    return cmd("get_texture_mapping", {"object_id": object_id, "selector": selector,
+                                       "part": part, "layer": layer})
+
+@vtool
+def set_default_attributes(ctx: Context, fill_color: Optional[List[int]] = None,
+                           pen_color: Optional[List[int]] = None,
+                           fill_back: Optional[List[int]] = None,
+                           pen_back: Optional[List[int]] = None,
+                           line_weight: Optional[int] = None,
+                           fill_pattern: Optional[int] = None,
+                           pen_pattern: Optional[int] = None) -> str:
+    """Document DEFAULT attributes for NEW objects (attribute palette state).
+    Colors as [r,g,b] 0-255; line_weight in mils; fill_pattern 1=solid."""
+    p = {}
+    if fill_color: p["fill_color"] = fill_color
+    if pen_color: p["pen_color"] = pen_color
+    if fill_back: p["fill_back"] = fill_back
+    if pen_back: p["pen_back"] = pen_back
+    if line_weight is not None: p["line_weight"] = line_weight
+    if fill_pattern is not None: p["fill_pattern"] = fill_pattern
+    if pen_pattern is not None: p["pen_pattern"] = pen_pattern
+    return cmd("set_default_attributes", p)
+
+@vtool
+def set_default_text_style(ctx: Context, font: Optional[str] = None, size: Optional[float] = None,
+                           justification: Optional[int] = None, spacing: Optional[int] = None,
+                           face: Optional[int] = None) -> str:
+    """Document DEFAULT text style for NEW text. justification 1=left 2=center 3=right;
+    spacing 2=single 3=1.5 4=double; face 0=plain 1=bold 2=italic."""
+    p = {}
+    if font: p["font"] = font
+    if size is not None: p["size"] = size
+    if justification is not None: p["justification"] = justification
+    if spacing is not None: p["spacing"] = spacing
+    if face is not None: p["face"] = face
+    return cmd("set_default_text_style", p)
+
+@vtool
+def set_default_marker(ctx: Context, style: int = 0, size: float = 3, angle: int = 15) -> str:
+    """Document DEFAULT arrowhead/marker for new dimensions and leaders."""
+    return cmd("set_default_marker", {"style": style, "size": size, "angle": angle})
+
 @vtool
 def get_materials(ctx: Context, layers: Optional[List[str]] = None, guard: int = 60000) -> str:
     """Distinct materials USED in the document with usage counts — deep-walks
