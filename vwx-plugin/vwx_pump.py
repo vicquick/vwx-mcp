@@ -88,10 +88,26 @@ def _write_json(path, obj):
     os.replace(tmp, path)      # atomic: the reader never sees a partial file
 
 
+def _get_commands():
+    """Import commands.py once; reload ONLY when the file changed on disk.
+    The old code reloaded the ~2500-line module on EVERY dispatch — tens of ms
+    per call, seconds across a sweep. The mtime marker lives on the commands
+    module object (persists in sys.modules across vwx_pump reloads), so warm
+    calls are near-free yet an edited/redeployed commands.py hot-reloads at
+    once."""
+    import importlib, commands
+    try:
+        mt = os.path.getmtime(os.path.join(_DIR, 'commands.py'))
+    except Exception:
+        mt = 0.0
+    if getattr(commands, '_vwx_loaded_mtime', None) != mt:
+        importlib.reload(commands)
+        commands._vwx_loaded_mtime = mt
+    return commands
+
 def _dispatch(cmd, params):
     try:
-        import commands, importlib
-        importlib.reload(commands)      # hot-reload, same as ever
+        commands = _get_commands()
         fn = getattr(commands, cmd, None)
         if fn is None:
             return {'error': 'Unknown command: %s' % cmd}

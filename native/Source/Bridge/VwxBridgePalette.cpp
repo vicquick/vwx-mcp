@@ -44,6 +44,8 @@ static UINT          gPumpCmdId     = 0;        // WM_COMMAND id of our pump men
 static HWND          gVwCmdWnd      = nullptr;  // the VW window that owns that menu
 static HWND          gVwMainWnd     = nullptr;
 static int           gDispatchCount = 0;        // times DoInterface actually ran (trigger proof)
+static bool          gKeyStateDirty = false;    // background-hotkey key state needs restoring
+static BYTE          gSavedKeyState[256] = {0};
 static const StatusData kVwxMagic   = 0x56575850;   // 'VWXP' — filters our own notifications
 
 // --------------------------------------------------------------------------------------------------------
@@ -274,12 +276,57 @@ static void SendForegroundHotkey()
 	keybd_event( VK_CONTROL, 0, KEYEVENTF_KEYUP, 0 );
 }
 
+// BACKGROUND keystroke: we run ON VW's main thread, so SetKeyboardState here
+// edits VW's own per-thread key-state table (other apps untouched), and a
+// PostMessage'd WM_KEYDOWN lands in VW's queue no matter which app is
+// foreground. VW's TranslateAccelerator pulls it from the queue, reads the
+// thread key state (Ctrl+Shift down) and fires the Ctrl+Shift+B accelerator ->
+// 'VWX Bridge Start' -> pump_all. keybd_event could never do this: it injects
+// into the GLOBAL input stream, which routes to the foreground app only.
+// Zero crash risk: if the accelerator doesn't fire, jobs simply stay queued.
+static HWND FindVwMainWndForKeys()
+{
+	if ( gVwMainWnd != nullptr && IsWindow( gVwMainWnd ) )
+		return gVwMainWnd;
+	return nullptr;
+}
+
+static void PostBackgroundHotkey()
+{
+	HWND wnd = FindVwMainWndForKeys();
+	if ( wnd == nullptr )
+		return;
+	BYTE oldState[256], newState[256];
+	if ( !GetKeyboardState( oldState ) )
+		return;
+	memcpy( newState, oldState, 256 );
+	newState[VK_CONTROL] |= 0x80;
+	newState[VK_SHIFT]   |= 0x80;
+	SetKeyboardState( newState );
+	UINT scan = MapVirtualKeyW( 0x42, MAPVK_VK_TO_VSC );
+	::PostMessage( wnd, WM_KEYDOWN, 0x42, 1 | (scan << 16) );
+	::PostMessage( wnd, WM_KEYUP,   0x42, 1 | (scan << 16) | (1u << 30) | (1u << 31) );
+	// NOTE: state is restored by the next timer tick (RestoreKeyState below),
+	// AFTER the posted messages have been translated — restoring immediately
+	// here would clear the modifiers before TranslateAccelerator sees them.
+	gKeyStateDirty = true;
+	memcpy( gSavedKeyState, oldState, 256 );
+}
+
+static void RestoreKeyState()
+{
+	if ( gKeyStateDirty ) {
+		SetKeyboardState( gSavedKeyState );
+		gKeyStateDirty = false;
+	}
+}
+
 // Fire triggers. Called from the heartbeat timer when jobs are queued.
 static bool ModalDialogOpen();
 static void TriggerPump()
 {
 	DWORD now = GetTickCount();
-	if ( now - gLastTrigTick < 400 )
+	if ( now - gLastTrigTick < 120 )        // snappier writes (was 400ms)
 		return;
 	if ( ModalDialogOpen() )
 		return;                                  // a real modal is up — hold
@@ -290,14 +337,15 @@ static void TriggerPump()
 	gSDK->NotifyLayerChange( kVwxMagic );
 	gNotifyInCall = false;
 
-	// B) Writes need the 'VWX Bridge Start' Python menu command (the only
-	//    proven mutation context). Reach its Ctrl+Shift+B accelerator with a
-	//    keystroke — but only when VW is already the foreground app (Win11
-	//    forbids background keystroke injection; jobs stay queued until the
-	//    user focuses VW). No crash risk either way: pump_all never runs in
-	//    an unsafe context.
+	// B) Writes reach the 'VWX Bridge Start' Ctrl+Shift+B accelerator ->
+	//    pump_all. Foreground: a real keystroke (most reliable). Background:
+	//    edit VW's own thread key-state + PostMessage the key into VW's queue
+	//    so TranslateAccelerator fires it without VW being the foreground app.
+	//    No crash risk either way — pump_all runs only in DoInterface.
 	if ( VwIsForeground() )
 		SendForegroundHotkey();
+	else
+		PostBackgroundHotkey();
 }
 
 // --------------------------------------------------------------------------------------------------------
@@ -316,7 +364,7 @@ static void CALLBACK PumpTimerProc(HWND, UINT, UINT_PTR, DWORD);
 void VwxBridge_StartPumpTimer()
 {
 	if ( gPumpTimer == 0 ) {
-		gPumpTimer = SetTimer( nullptr, 0, 250, PumpTimerProc );
+		gPumpTimer = SetTimer( nullptr, 0, 100, PumpTimerProc );   // 100ms: snappier pickup
 		gSDK->RegisterNotificationProcedure( VwxNotifyProc, kNotifyLayerChange );
 		TryFindPumpMenuCommandId();
 		LogLine( "bridge on (palette open)" );
@@ -357,8 +405,11 @@ static bool ModalDialogOpen()
 // (WM_TIMER is NOT command context — mutations park it, verified live).
 // TriggerPump() posts a deferred notification / WM_COMMAND; the actual drain
 // runs later, at the top of VW's message loop.
+static void RestoreKeyState();
 static void CALLBACK PumpTimerProc(HWND, UINT, UINT_PTR, DWORD)
 {
+	RestoreKeyState();            // undo last tick's background-hotkey key state
+	                              // (posted keys have since been translated)
 	TXString pluginDir = VwxPluginDir();
 	WriteAlive( pluginDir );
 	gLastQueue = CountJobs( pluginDir );

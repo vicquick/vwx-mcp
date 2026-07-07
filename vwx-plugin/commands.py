@@ -120,7 +120,9 @@ def get_document_info(p):
     }
 
 def save_document(p):
-    vs.SaveDocument(); return {'status': 'ok'}
+    # VW2026: no SaveDocument. Drive the Save menu command (keeps path/format).
+    _safe(lambda: vs.DoMenuTextByName('Save', 0))
+    return {'status': 'ok'}
 
 def save_document_as(p):
     path = p.get('path', '')
@@ -314,8 +316,12 @@ def set_active_class(p):
     return {'status': 'ok'}
 
 def set_class_visibility(p):
+    # VW2026: no SetClassVisibility. Use ShowClass / HideClass by name.
     name = p.get('name', '')
-    vs.SetClassVisibility(name, 0 if p.get('visible', True) else 1)
+    if p.get('visible', True):
+        vs.ShowClass(name)
+    else:
+        vs.HideClass(name)
     return {'status': 'ok'}
 
 def rename_class(p):
@@ -493,16 +499,17 @@ def mirror_object(p):
     bb = _bbox(h)
     cx = p.get('x', (bb['x1']+bb['x2'])/2 if bb else 0)
     cy = p.get('y', (bb['y1']+bb['y2'])/2 if bb else 0)
-    # HMirror(h, (p1), (p2))  — mirror line through two points
+    dup = bool(p.get('duplicate', False))
+    # VW2026: no HMirror. MirrorN(h, dup, p1, p2, preserveMatrix) — axis
+    # through two points; preserveMatrix=True keeps symbol/PIO matrices sane.
     if axis == 'horizontal':
-        vs.HMirror(h, (cx-10, cy), (cx+10, cy))
+        r = vs.MirrorN(h, dup, (cx-10, cy), (cx+10, cy), True)
     else:
-        vs.HMirror(h, (cx, cy-10), (cx, cy+10))
-    return {'status': 'ok'}
-
-
-# ── 2D Drawing ──────────────────────────────────────────────────────────────
-
+        r = vs.MirrorN(h, dup, (cx, cy-10), (cx, cy+10), True)
+    out = {'status': 'ok'}
+    if dup and r:
+        out['object_id'] = _oid(r)
+    return out
 def _newobj_result(p, fallback=None):
     """Resolve the 'just created' handle. Prefer an explicit fallback because
     some creators (notably CreateCustomObjectPath + DTM6_SendToSurface) do NOT
@@ -603,9 +610,10 @@ def draw_text(p):
 def draw_dimension(p):
     prev = _with_layer_class(p)
     try:
-        vs.LinDimN((p.get('x1',0), p.get('y1',0)),
-                   (p.get('x2',100), p.get('y2',0)),
-                   p.get('offset', 20), 0)
+        # VW2026: no LinDimN. LinearDim(start, end, offset, dimType, arrow, textFlag, textOffset)
+        vs.LinearDim((p.get('x1',0), p.get('y1',0)),
+                     (p.get('x2',100), p.get('y2',0)),
+                     p.get('offset', 20), 1, 0, 0, 0.0)
         return _newobj_result(p)
     finally:
         _restore(prev)
@@ -630,7 +638,7 @@ def draw_spline(p):
 def draw_extrude(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': '2D object not found'}
-    eh = vs.CreateExtrude(h, p.get('height', 100))
+    eh = vs.HExtrude(h, 0, p.get('height', 100))   # VW2026: CreateExtrude does not exist
     return {'status': 'ok', 'object_id': _oid(eh)}
 
 def draw_box(p):
@@ -640,9 +648,7 @@ def draw_box(p):
         w, d, ht = p.get('width', 100), p.get('depth', 100), p.get('height', 100)
         vs.Rect((x, y), (x+w, y+d))
         rh = vs.LNewObj()
-        bh = vs.CreateExtrude(rh, ht)
-        if z:
-            vs.Move3DObj(bh, 0, 0, z)
+        bh = vs.HExtrude(rh, z, z + ht)   # VW2026: CreateExtrude does not exist; z baked in
         return {'status': 'ok', 'object_id': _oid(bh)}
     finally:
         _restore(prev)
@@ -683,9 +689,7 @@ def draw_cylinder(p):
         # VW2026: ArcByCenter returns null UUID — use Oval bbox instead (same fix as draw_circle)
         vs.Oval(cx - r, cy + r, cx + r, cy - r)   # left, top, right, bottom
         circle = vs.LNewObj()
-        eh = vs.CreateExtrude(circle, ht)
-        if cz:
-            vs.Move3DObj(eh, 0, 0, cz)
+        eh = vs.HExtrude(circle, cz, cz + ht)   # VW2026: CreateExtrude does not exist; cz baked in
         return {'status': 'ok', 'object_id': _oid(eh)}
     finally:
         _restore(prev)
@@ -742,14 +746,25 @@ def get_symbol_instances(p):
     return {'objects': [_summary(h) for h in hs], 'count': len(hs)}
 
 def create_symbol_from_objects(p):
-    vs.DSelectAll()
-    for oid in p.get('object_ids', []):
+    # VW2026: no SymbolCreate. BeginSym/EndSym captures objects CREATED between
+    # the calls into a new symbol def; duplicate the source objects into that
+    # scope so the originals stay on the drawing.
+    name = p.get('name', 'NewSymbol')
+    ids = p.get('object_ids', [])
+    if not ids:
+        return {'error': 'object_ids required'}
+    vs.BeginSym(name)
+    made = 0
+    for oid in ids:
         h = _h(oid)
-        if h: vs.SetSelect(h)
-    vs.SymbolCreate(p.get('name', 'NewSymbol'),
-                    (p.get('origin_x', 0), p.get('origin_y', 0)),
-                    False, False)
-    return {'status': 'ok'}
+        if h:
+            d = _safe(lambda h=h: vs.HDuplicate(h, 0, 0))
+            if d:
+                made += 1
+    vs.EndSym()
+    if made == 0:
+        return {'error': 'no source objects resolved'}
+    return {'status': 'ok', 'name': name, 'objects': made}
 
 def delete_symbol(p):
     name = p.get('name', '')
@@ -959,9 +974,10 @@ def set_ifc_property(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        vs.IFC_SetPSetAttribute(h, p.get('pset', ''),
+        # VW2026: IFC_SetPsetProp(h, pset, prop, value:STRING)
+        ok = vs.IFC_SetPsetProp(h, p.get('pset', ''),
                                 p.get('name', ''), str(p.get('value', '')))
-        return {'status': 'ok'}
+        return {'status': 'ok' if ok else 'error'}
     except Exception as e:
         return {'error': str(e)}
 
@@ -976,18 +992,40 @@ def export_ifc(p):
 
 # ── Architectural ───────────────────────────────────────────────────────────
 
+def _wall_trace(step):
+    # create_wall hard-crashed VW2026 (sweep 2026-07-06). Each step is traced
+    # so a future crash names its exact line in bridge.log.
+    try:
+        import os, time
+        d = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(d, 'bridge.log'), 'a', encoding='utf-8') as f:
+            f.write('[%s] create_wall: %s\n' % (time.strftime('%H:%M:%S'), step))
+    except Exception:
+        pass
+
 def create_wall(p):
+    # v11 rewrite: documented wall APIs only. The old version pushed magic
+    # prefs (vs.SetPrefReal(85), vs.SetPref(68)) before vs.Wall and killed
+    # VW hard. Now: SetWallWidth (documented default-width setter) -> Wall ->
+    # per-wall SetWallThickness/SetWallHeights on the unstyled wall.
     prev = _with_layer_class(p)
     try:
         height = p.get('height', 2500)
-        thick = p.get('thickness', 200)
-        vs.SetPrefReal(85, height)   # wall height pref (best-effort)
-        vs.SetPref(68, True)         # use pref thickness
+        thick  = p.get('thickness', 200)
+        _wall_trace('begin h=%s t=%s' % (height, thick))
+        _safe(lambda: vs.SetWallWidth(thick))          # document default width
+        _wall_trace('SetWallWidth ok')
         vs.Wall((p.get('x1',0), p.get('y1',0)),
                 (p.get('x2',1000), p.get('y2',0)))
+        _wall_trace('Wall ok')
         h = vs.LNewObj()
+        _wall_trace('LNewObj ok h=%s' % bool(h))
         if h:
-            _safe(lambda: vs.SetObjectVariableReal(h, 173, height))  # height
+            _safe(lambda: vs.SetWallThickness(h, thick))
+            _wall_trace('SetWallThickness ok')
+            _safe(lambda: vs.SetWallHeights(h, height, height))
+            _wall_trace('SetWallHeights ok')
+        _wall_trace('done')
         return {'status': 'ok', 'object_id': _oid(h)}
     finally:
         _restore(prev)
@@ -1226,8 +1264,9 @@ def get_worksheet_data(p):
 def set_worksheet_cell(p):
     ws = _safe(lambda: vs.GetObject(p.get('name', '')))
     if not ws: return {'error': 'Worksheet not found'}
-    vs.SetWSCellValue(ws, p.get('row', 1), p.get('col', 1),
-                      str(p.get('value', '')))
+    # VW2026: no SetWSCellValue. SetWSCellFormula(ws, topR, leftC, botR, rightC, formula)
+    r = p.get('row', 1); c = p.get('col', 1)
+    vs.SetWSCellFormula(ws, r, c, r, c, str(p.get('value', '')))
     return {'status': 'ok'}
 
 def recalculate_worksheet(p):
@@ -1313,7 +1352,10 @@ def zoom_to_fit(p):
     return {'status': 'ok'}
 
 def zoom_to_selection(p):
-    vs.ZoomToSel()
+    # VW2026: no ZoomToSel. Drive the 'Fit To Objects' menu command, which
+    # fits the current selection when objects are selected.
+    _safe(lambda: vs.DoMenuTextByName('Fit To Objects', 0))
+    _safe(lambda: vs.ReDrawAll())
     return {'status': 'ok'}
 
 def set_zoom(p):
@@ -2367,7 +2409,8 @@ def list_components(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        n = vs.GetNumberOfComponents(h)
+        r = vs.GetNumberOfComponents(h)   # VW2026: returns (ok, count)
+        n = r[1] if isinstance(r, (list, tuple)) else int(r)
     except Exception as e:
         return {'error': str(e)}
     comps = []
