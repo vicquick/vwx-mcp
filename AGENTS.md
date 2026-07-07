@@ -12,7 +12,7 @@ must be running first (see README). `ping` confirms the full chain is live.
 
 ## Three access layers — pick the narrowest that works
 
-1. **Explicit tools** (170). Typed, documented, safe. Prefer these.
+1. **Explicit tools** (206). Typed, documented, safe. Prefer these.
 2. **`vwx(command, params)`** — generic dispatcher to any verb in `commands.py`.
    Call `list_commands` to discover. Use when no explicit wrapper exists but a
    `commands.py` verb does.
@@ -134,6 +134,37 @@ Live-testing findings (all reproduced):
   resolve on VW's main thread — measured **215 s frozen UI** on a small test doc
   before returning. Draw a closed polygon instead.
 
+## SDK enrichment 2 — architecture, lights, criteria, worksheets, text, edit
+
+36 more verbs (35/36 passed the live batch on first run — index-driven authoring):
+
+- **Architecture**: `create_roof` (footprint edges + slope/eave, one call),
+  `create_slab`, `join_walls` (T/L), `add_symbol_to_wall` (doors/windows),
+  `set_wall_style`/`get_wall_style`.
+- **Lights**: `create_light` (directional/point/spot), `set_light_info`,
+  `get_light_info`.
+- **Criteria engine (bulk power)**: `criteria_count`, `select_by_criteria`,
+  `deselect_by_criteria`, `eval_expression` (AREA/PERIM/VOLUME/record fields
+  on one object — the worksheet formula engine, headless).
+- **Worksheets (deep)**: `get_worksheet_cell` (string + numeric),
+  `get_worksheet_size`, `insert/delete_worksheet_rows`,
+  `insert_worksheet_columns`, `set_worksheet_column_width`.
+- **Text**: `get_text`, `set_text`, `set_text_size_all`.
+- **Edit/convert**: `convert_to_polygon` (tessellate), `convert_to_polyline`
+  (arcs kept), `set_stacking_order` (front/forward/backward/back),
+  `move_object_3d`.
+- **NURBS/solids**: `create_shell` (surface -> solid), `revolve_with_rail`
+  (geometry-sensitive: degenerate setups error out cleanly), `offset_nurbs`,
+  `extend_nurbs_curve`.
+- **Layers/view/doc**: `set/get_layer_elevation` (Z + deltaZ),
+  `set_view_angles` (flyover-style), `set_projection`, `get_object_metrics`
+  (area+perimeter), `get_document_units`.
+
+One more auto-dismiss signature learned: the VW compile/runtime error dialog
+("Beim Kompilieren … Error Output anzeigen") appears when a `vs.*` call fails at
+the ENGINE level (bad geometry args) — added to the native palette's dismiss
+list (rebuild + redeploy `VwxBridge.vlb` to activate).
+
 ## Server internals (for tool authors)
 
 - **`@mcp.tool(output_schema=None)`**, never `structured_output=False`. The server
@@ -144,7 +175,7 @@ Live-testing findings (all reproduced):
 - New tools are registered via the **`vtool`** wrapper (in `vwx_mcp_server.py`),
   which forwards to `mcp.tool(output_schema=None)` and injects the tool's tag from
   `tool_tags.py` by function name. Add the new tool name to `tool_tags.py` too
-  (a probe asserts every tool is tagged — currently 170/170).
+  (a probe asserts every tool is tagged — currently 206/206).
 - Tags must be set at **registration** (decorator) for the Visibility API; mutating
   `tool.tags` afterward does not affect `enable/disable`.
 - Tool bodies return a JSON **string** via `cmd(command_type, params)`; the actual
