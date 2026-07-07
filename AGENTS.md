@@ -12,7 +12,7 @@ must be running first (see README). `ping` confirms the full chain is live.
 
 ## Three access layers — pick the narrowest that works
 
-1. **Explicit tools** (207). Typed, documented, safe. Prefer these.
+1. **Explicit tools** (237). Typed, documented, safe. Prefer these.
 2. **`vwx(command, params)`** — generic dispatcher to any verb in `commands.py`.
    Call `list_commands` to discover. Use when no explicit wrapper exists but a
    `commands.py` verb does.
@@ -165,6 +165,36 @@ One more auto-dismiss signature learned: the VW compile/runtime error dialog
 the ENGINE level (bad geometry args) — added to the native palette's dismiss
 list (rebuild + redeploy `VwxBridge.vlb` to activate).
 
+## SDK enrichment 3 — report worksheets, IFC deep, textures, doc defaults
+
+30 more verbs, all live-tested (28 first-run; 2 IFC parse fixes below):
+
+- **Report worksheets (the auto-report engine)**: `create_report_worksheet` —
+  ONE call = worksheet + header + `=DATABASE(criteria)` row + column formulas +
+  recalc + optional on-drawing placement. One subrow per matching object.
+  Plus: `set_worksheet_database_row`, `get_worksheet_subrow_count/cell`,
+  `get_worksheet_cell_formula`, cell alignment / text format / number format /
+  fill / row height / merge, `place_worksheet_on_drawing`.
+- **IFC deep**: `ifc_list_psets`, `ifc_get_pset_prop`, `ifc_attach_pset`,
+  `ifc_remove_pset`, `ifc_define_pset` (custom schema), `ifc_get/set_entity_prop`,
+  **`ifc_bulk_set_pset`** (criteria → entity + pset prop on every match; the
+  DIN276 KG bulk classifier — verified 3/3 with read-back).
+- **Textures**: `create_texture`, `get_texture_info`, `set_texture_size`,
+  `set_object_texture` (by resource name via `Name2Index`), `get_object_texture`,
+  `set/get_texture_mapping` (SetTexMapRealN selectors: 1=offsetX 2=offsetY
+  3=rotation 4=scale2D). Read-back is meaningful on 3D objects.
+- **Doc defaults**: `set_default_attributes` (RGB → `RGBToColorIndex`, values
+  ×257 to 16-bit), `set_default_text_style` (font via `GetFontID`),
+  `set_default_marker`.
+
+IFC gotchas (verified live):
+- `IFC_GetPsetProp`/`IFC_GetEntityProp` return **`(ok, value, ifcTypeCode)`** —
+  value is index 1, NOT last.
+- `IFC_SetPsetProp` returns False until the pset is **attached** to that object
+  — attach + retry (both `set_ifc_property` and the bulk verb do this).
+- Worksheet DATABASE binding: cell formula `=DATABASE((criteria))` on column 0
+  of the row; subrows appear after `RecalculateWS`.
+
 ## Server internals (for tool authors)
 
 - **`@mcp.tool(output_schema=None)`**, never `structured_output=False`. The server
@@ -175,7 +205,7 @@ list (rebuild + redeploy `VwxBridge.vlb` to activate).
 - New tools are registered via the **`vtool`** wrapper (in `vwx_mcp_server.py`),
   which forwards to `mcp.tool(output_schema=None)` and injects the tool's tag from
   `tool_tags.py` by function name. Add the new tool name to `tool_tags.py` too
-  (a probe asserts every tool is tagged — currently 207/207).
+  (a probe asserts every tool is tagged — currently 237/237).
 - Tags must be set at **registration** (decorator) for the Visibility API; mutating
   `tool.tags` afterward does not affect `enable/disable`.
 - Tool bodies return a JSON **string** via `cmd(command_type, params)`; the actual

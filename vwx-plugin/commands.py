@@ -1323,6 +1323,384 @@ def set_projection(p):
                   float(p.get('clip2', 0)))
     return {'status': 'ok'}
 
+# ── SDK enrichment 3: report worksheets, IFC deep, textures, doc defaults ───
+
+def _col_letter(i):
+    """1 -> A, 2 -> B, ... 27 -> AA (worksheet column letters)."""
+    s = ''
+    while i > 0:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def create_report_worksheet(p):
+    """One-call criteria-driven report (database worksheet): creates the
+    worksheet, writes header row, binds row 2 to a DATABASE(criteria) and fills
+    the column formulas, recalculates, optionally places it on the drawing.
+    params: {name, criteria, columns:[{header, formula}], place_at:{x,y}?}
+    Formula examples: '=N' (object name), '=AREA', '=PERIM',
+    "='Rec'.'Field'" (record field), '=C' (class), '=L' (layer), '=COUNT'.
+    Returns worksheet name, subrow count (matching objects) + image id if placed."""
+    name = p.get('name') or 'Report'
+    crit = p.get('criteria')
+    cols = p.get('columns') or []
+    if not crit: return {'error': 'criteria required, e.g. "(T=RECT)" or "((R IN [\'Baumkataster\']))"'}
+    if not cols: return {'error': "columns required: [{header, formula}, ...]"}
+    old = vs.GetObject(name)
+    if old: return {'error': "worksheet '%s' already exists — pick another name" % name}
+    ws = vs.CreateWS(name, 2, max(1, len(cols)))
+    if not ws: return {'error': 'CreateWS failed'}
+    for i, c in enumerate(cols, start=1):
+        vs.SetWSCellFormula(ws, 1, i, 1, i, str(c.get('header', 'Col%d' % i)))
+    # row 2 col 0 = the database row binding
+    vs.SetWSCellFormula(ws, 2, 0, 2, 0, '=DATABASE(%s)' % crit)
+    for i, c in enumerate(cols, start=1):
+        f = str(c.get('formula', ''))
+        if f: vs.SetWSCellFormula(ws, 2, i, 2, i, f)
+    vs.RecalculateWS(ws)
+    sub = _safe(lambda: vs.GetWSSubrowCount(ws, 2))
+    out = {'status': 'ok', 'worksheet': name, 'columns': len(cols),
+           'subrows': (sub if isinstance(sub, int) else (sub[0] if sub else 0))}
+    pa = p.get('place_at')
+    if pa:
+        img = vs.CreateWSImage(ws, (float(pa.get('x', 0)), float(pa.get('y', 0))))
+        out['image_id'] = _oid(img)
+    return out
+
+def set_worksheet_database_row(p):
+    """Bind a worksheet row to a criteria database. params: {worksheet(name),
+    row, criteria}. Row then auto-populates one subrow per matching object."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    crit = p.get('criteria')
+    if not crit: return {'error': 'criteria required'}
+    r = int(p.get('row', 2))
+    vs.SetWSCellFormula(ws, r, 0, r, 0, '=DATABASE(%s)' % crit)
+    vs.RecalculateWS(ws)
+    sub = _safe(lambda: vs.GetWSSubrowCount(ws, r))
+    return {'status': 'ok', 'subrows': (sub if isinstance(sub, int) else (sub[0] if sub else 0))}
+
+def get_worksheet_subrow_count(p):
+    """Subrow count of a database row. params: {worksheet(name), row}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r = int(p.get('row', 2))
+    if not _safe(lambda: vs.IsWSDatabaseRow(ws, r)):
+        return {'error': 'row %d is not a database row' % r}
+    sub = vs.GetWSSubrowCount(ws, r)
+    return {'status': 'ok', 'subrows': (sub if isinstance(sub, int) else (sub[0] if sub else 0))}
+
+def get_worksheet_subrow_cell(p):
+    """Read one database SUBROW cell (string + numeric).
+    params: {worksheet(name), row (database row), subrow (1-based), column}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r, sr, c = int(p.get('row', 2)), int(p.get('subrow', 1)), int(p.get('column', 1))
+    return {'status': 'ok',
+            'text': vs.GetWSSubrowCellString(ws, r, c, sr),
+            'value': _safe(lambda: vs.GetWSSubrowCellValue(ws, r, c, sr))}
+
+def get_worksheet_cell_formula(p):
+    """Formula stored in a cell. params: {worksheet(name), row, column}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    return {'status': 'ok', 'formula': vs.GetWSCellFormula(ws, int(p.get('row', 1)), int(p.get('column', 1)))}
+
+def set_worksheet_cell_alignment(p):
+    """Horizontal alignment of cell range. params: {worksheet(name), row, column,
+    to_row?, to_column?, alignment (1=general 2=left 3=right 4=center)}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r, c = int(p.get('row', 1)), int(p.get('column', 1))
+    vs.SetWSCellAlignment(ws, r, c, int(p.get('to_row', r)), int(p.get('to_column', c)),
+                          int(p.get('alignment', 4)))
+    return {'status': 'ok'}
+
+def set_worksheet_cell_text_format(p):
+    """Font/size/style of cell range. params: {worksheet(name), row, column,
+    to_row?, to_column?, font(name)?, size(pt), style (0=plain 1=bold 2=italic ...)}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r, c = int(p.get('row', 1)), int(p.get('column', 1))
+    fid = vs.GetFontID(p['font']) if p.get('font') else -1
+    vs.SetWSCellTextFormat(ws, r, c, int(p.get('to_row', r)), int(p.get('to_column', c)),
+                           fid, int(p.get('size', 10)), int(p.get('style', 0)))
+    return {'status': 'ok'}
+
+def set_worksheet_cell_number_format(p):
+    """Number format of cell range. params: {worksheet(name), row, column,
+    to_row?, to_column?, style (0=general 1=decimal 2=scientific 3=fractional
+    4=dimension 5=angle ...), accuracy (decimals), leader?, trailer?}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r, c = int(p.get('row', 1)), int(p.get('column', 1))
+    vs.SetWSCellNumberFormat(ws, r, c, int(p.get('to_row', r)), int(p.get('to_column', c)),
+                             int(p.get('style', 1)), int(p.get('accuracy', 2)),
+                             str(p.get('leader', '')), str(p.get('trailer', '')))
+    return {'status': 'ok'}
+
+def set_worksheet_cell_fill(p):
+    """Cell background fill. params: {worksheet(name), row, column, to_row?,
+    to_column?, style(0=none 1=solid), bg_color(index), fg_color(index), pattern}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r, c = int(p.get('row', 1)), int(p.get('column', 1))
+    vs.SetWSCellFill(ws, r, c, int(p.get('to_row', r)), int(p.get('to_column', c)),
+                     int(p.get('style', 1)), int(p.get('bg_color', 0)),
+                     int(p.get('fg_color', 255)), int(p.get('pattern', 1)))
+    return {'status': 'ok'}
+
+def set_worksheet_row_height(p):
+    """Row height. params: {worksheet(name), from_row, to_row?, height, lock(bool)}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    fr = int(p.get('from_row', 1))
+    vs.SetWSRowHeight(ws, fr, int(p.get('to_row', fr)), int(p.get('height', 18)),
+                      True, bool(p.get('lock', False)))
+    return {'status': 'ok'}
+
+def merge_worksheet_cells(p):
+    """Merge a cell range into one cell. params: {worksheet(name), row, column,
+    to_row, to_column}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    ok = vs.WorksheetMergeCells(ws, int(p.get('row', 1)), int(p.get('column', 1)),
+                                int(p.get('to_row', 1)), int(p.get('to_column', 2)))
+    return {'status': 'ok', 'merged': bool(ok)}
+
+def place_worksheet_on_drawing(p):
+    """Place (or find) the worksheet's on-drawing image. params: {worksheet(name),
+    x, y}. Returns the image object id."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    existing = _safe(lambda: vs.GetWSImage(ws))
+    if existing: return {'status': 'ok', 'object_id': _oid(existing), 'existed': True}
+    img = vs.CreateWSImage(ws, (float(p.get('x', 0)), float(p.get('y', 0))))
+    return {'status': 'ok', 'object_id': _oid(img), 'existed': False}
+
+# ---- IFC deep ----------------------------------------------------------------
+
+def ifc_list_psets(p):
+    """List property sets attached to an object (name + property count).
+    params: {object_id, all(bool: include inherited/type psets)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    ball = bool(p.get('all', True))
+    n = _safe(lambda: vs.IFC_GetNumPsets2(h, ball))
+    if isinstance(n, (list, tuple)): n = n[-1] if n else 0
+    n = int(n or 0)
+    psets = []
+    for i in range(n):
+        info = _safe(lambda i=i: vs.IFC_GetPsetInfoAt(h, ball, i))
+        # VW2026: (ok, name, flags) tuple — keep only real entries
+        if isinstance(info, (list, tuple)) and len(info) >= 2 and info[0] and info[1]:
+            psets.append(info[1])
+        elif isinstance(info, str) and info:
+            psets.append(info)
+    return {'status': 'ok', 'count': len(psets), 'psets': psets}
+
+def ifc_get_pset_prop(p):
+    """Read one pset property value. params: {object_id, pset, prop}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    r = _safe(lambda: vs.IFC_GetPsetProp(h, p.get('pset', ''), p.get('prop', '')))
+    # VW2026: (ok, value, ifcTypeCode) — value is index 1, NOT last
+    if isinstance(r, (list, tuple)) and len(r) >= 2:
+        return {'status': 'ok', 'found': bool(r[0]), 'value': r[1],
+                'ifc_type': (r[2] if len(r) > 2 else None)}
+    return {'status': 'ok', 'value': r}
+
+def ifc_attach_pset(p):
+    """Attach an (existing/defined) pset to an object. params: {object_id, pset}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    ok = vs.IFC_AttachPset(h, p.get('pset', ''))
+    return {'status': 'ok', 'attached': bool(ok)}
+
+def ifc_remove_pset(p):
+    """Remove one pset (or ALL) from an object. params: {object_id, pset?} —
+    omit pset (or pass all:true) to clear everything."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    if p.get('pset') and not p.get('all'):
+        ok = vs.IFC_ClearPset(h, p['pset'])
+    else:
+        ok = vs.IFC_ClearAllPsets(h)
+    return {'status': 'ok', 'removed': bool(ok)}
+
+def ifc_define_pset(p):
+    """Define a custom pset schema (document-wide). params: {name,
+    members:[{name, type}]} — type is an IFC type string like 'IfcLabel',
+    'IfcReal', 'IfcBoolean', 'IfcLengthMeasure'."""
+    name = p.get('name')
+    members = p.get('members') or []
+    if not name or not members: return {'error': 'name + members required'}
+    if not vs.IFC_DefPsetBegin(name): return {'error': 'DefPsetBegin failed'}
+    added = 0
+    for m in members:
+        if vs.IFC_DefPsetAddMember(name, m.get('name', ''), m.get('type', 'IfcLabel')):
+            added += 1
+    ok = vs.IFC_DefPsetEnd(name)
+    return {'status': 'ok', 'defined': bool(ok), 'members_added': added}
+
+def ifc_get_entity_prop(p):
+    """Read a direct IFC entity attribute (Name, Description, Tag, ...).
+    params: {object_id, prop}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    r = _safe(lambda: vs.IFC_GetEntityProp(h, p.get('prop', '')))
+    # VW2026: (ok, value, ifcTypeCode) — value is index 1
+    if isinstance(r, (list, tuple)) and len(r) >= 2:
+        return {'status': 'ok', 'found': bool(r[0]), 'value': r[1]}
+    return {'status': 'ok', 'value': r}
+
+def ifc_set_entity_prop(p):
+    """Set a direct IFC entity attribute. params: {object_id, prop, value}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    ok = vs.IFC_SetEntityProp(h, p.get('prop', ''), str(p.get('value', '')))
+    return {'status': 'ok', 'set': bool(ok)}
+
+def ifc_bulk_set_pset(p):
+    """Set a pset property on EVERY object matching a criteria — the bulk tool
+    for DIN276/classification pipelines. params: {criteria, pset, prop, value,
+    entity? (also assign this IFC entity first, e.g. 'IfcSlab')}.
+    Collect-then-mutate (safe against ForEachObject iteration corruption)."""
+    crit = p.get('criteria')
+    pset, prop = p.get('pset'), p.get('prop')
+    if not crit or not pset or not prop:
+        return {'error': 'criteria, pset, prop required'}
+    val = str(p.get('value', ''))
+    handles = []
+    vs.ForEachObject(lambda hh: handles.append(hh), crit)
+    done = 0; failed = 0
+    for hh in handles:
+        try:
+            if p.get('entity'):
+                vs.IFC_SetIFCEntity(hh, p['entity'])
+            # SetPsetProp fails when the pset is not yet ATTACHED to this
+            # object (verified live) — attach + retry on first failure.
+            if not vs.IFC_SetPsetProp(hh, pset, prop, val):
+                vs.IFC_AttachPset(hh, pset)
+                if vs.IFC_SetPsetProp(hh, pset, prop, val): done += 1
+                else: failed += 1
+            else:
+                done += 1
+        except Exception:
+            failed += 1
+    return {'status': 'ok', 'matched': len(handles), 'set': done, 'failed': failed}
+
+# ---- textures -----------------------------------------------------------------
+
+def create_texture(p):
+    """Create a texture resource (plain color shader attached; edit color in
+    the Resource Manager or via shader records). params: {name, size?}."""
+    t = vs.CreateTexture()
+    if not t: return {'error': 'CreateTexture failed'}
+    if p.get('name'): vs.SetName(t, p['name'])
+    _safe(lambda: vs.CreateShaderRecord(t, 1, 30))  # family 1 = color, prototype 30 = plain color
+    if p.get('size') is not None:
+        _safe(lambda: vs.SetTextureSize(t, float(p['size'])))
+    return {'status': 'ok', 'object_id': _oid(t), 'name': (p.get('name') or vs.GetName(t))}
+
+def get_texture_info(p):
+    """Texture resource info: size + shader. params: {texture(name)}."""
+    t = vs.GetObject(p.get('texture', ''))
+    if not t: return {'error': 'texture not found (by name)'}
+    return {'status': 'ok', 'size': _safe(lambda: vs.GetTextureSize(t)),
+            'shader': _safe(lambda: vs.GetTextureShader(t))}
+
+def set_texture_size(p):
+    """Real-world size of a texture. params: {texture(name), size}."""
+    t = vs.GetObject(p.get('texture', ''))
+    if not t: return {'error': 'texture not found (by name)'}
+    vs.SetTextureSize(t, float(p.get('size', 1000)))
+    return {'status': 'ok'}
+
+def set_object_texture(p):
+    """Apply a texture (by resource name) to an object part.
+    params: {object_id, texture(name), part(0=overall 1=top 2=bottom 3=sides...),
+    layer(0)}. texture:'' removes (ref 0)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    name = p.get('texture', '')
+    ref = 0
+    if name:
+        ref = vs.Name2Index(name)
+        if not ref: return {'error': "texture '%s' not found (Name2Index=0)" % name}
+    vs.SetTextureRefN(h, ref, int(p.get('part', 0)), int(p.get('layer', 0)))
+    return {'status': 'ok', 'ref': ref}
+
+def get_object_texture(p):
+    """Texture applied to an object part. params: {object_id, part(0), layer(0),
+    resolve_by_class(bool)}. Returns ref index + resource name."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    ref = vs.GetTextureRefN(h, int(p.get('part', 0)), int(p.get('layer', 0)),
+                            bool(p.get('resolve_by_class', True)))
+    name = vs.Index2Name(ref) if ref else ''
+    return {'status': 'ok', 'ref': ref, 'texture': name}
+
+def set_texture_mapping(p):
+    """Texture mapping value on an object part (scale/rotation/offset).
+    params: {object_id, part(0), layer(0), selector (SetTexMapRealN codes:
+    1=offsetX 2=offsetY 3=rotation 4=scale2D ...), value}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    vs.SetTexMapRealN(h, int(p.get('part', 0)), int(p.get('layer', 0)),
+                      int(p.get('selector', 4)), float(p.get('value', 1)))
+    return {'status': 'ok'}
+
+def get_texture_mapping(p):
+    """Read a texture mapping value. params: {object_id, part(0), layer(0), selector}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    v = vs.GetTexMapRealN(h, int(p.get('part', 0)), int(p.get('layer', 0)),
+                          int(p.get('selector', 4)))
+    return {'status': 'ok', 'value': v}
+
+# ---- document default attributes ------------------------------------------------
+
+def set_default_attributes(p):
+    """Document DEFAULT attributes for newly created objects (the attribute
+    palette state). params (all optional): {fill_color:[r,g,b], fill_back:[r,g,b],
+    pen_color:[r,g,b], pen_back:[r,g,b], line_weight (mils), fill_pattern (int,
+    1=solid), pen_pattern (int, 2=solid line)}."""
+    def idx(rgb):
+        r = vs.RGBToColorIndex(int(rgb[0]) * 257, int(rgb[1]) * 257, int(rgb[2]) * 257)
+        return r if isinstance(r, int) else (r[-1] if r else 0)
+    applied = []
+    if p.get('fill_color'):  vs.FillFore(idx(p['fill_color']));  applied.append('fill_color')
+    if p.get('fill_back'):   vs.FillBack(idx(p['fill_back']));   applied.append('fill_back')
+    if p.get('pen_color'):   vs.PenFore(idx(p['pen_color']));    applied.append('pen_color')
+    if p.get('pen_back'):    vs.PenBack(idx(p['pen_back']));     applied.append('pen_back')
+    if p.get('line_weight') is not None: vs.PenSize(int(p['line_weight'])); applied.append('line_weight')
+    if p.get('fill_pattern') is not None: vs.FillPat(int(p['fill_pattern'])); applied.append('fill_pattern')
+    if p.get('pen_pattern') is not None: vs.PenPatN(int(p['pen_pattern'])); applied.append('pen_pattern')
+    return {'status': 'ok', 'applied': applied}
+
+def set_default_text_style(p):
+    """Document DEFAULT text attributes for new text objects. params (optional):
+    {font(name), size(pt), justification (1=left 2=center 3=right),
+    spacing (0=custom 2=single 3=1.5 4=double), face (0=plain 1=bold 2=italic)}."""
+    applied = []
+    if p.get('font'):
+        fid = vs.GetFontID(p['font'])
+        if fid < 0: return {'error': "font '%s' not found" % p['font']}
+        vs.TextFont(fid); applied.append('font')
+    if p.get('size') is not None: vs.TextSize(float(p['size'])); applied.append('size')
+    if p.get('justification') is not None: vs.TextJust(int(p['justification'])); applied.append('justification')
+    if p.get('spacing') is not None: vs.TextSpace(int(p['spacing'])); applied.append('spacing')
+    if p.get('face') is not None: vs.TextFace(int(p['face'])); applied.append('face')
+    return {'status': 'ok', 'applied': applied}
+
+def set_default_marker(p):
+    """Document DEFAULT arrowhead/marker for new dimensions/leaders.
+    params: {style (0..15), size, angle(deg)}."""
+    vs.Marker(int(p.get('style', 0)), float(p.get('size', 3)), int(p.get('angle', 15)))
+    return {'status': 'ok'}
+
+
 def boolean_operation(p):
     h1 = _h(p.get('object_id_a'))
     h2 = _h(p.get('object_id_b'))
@@ -1604,8 +1982,14 @@ def set_ifc_property(p):
     if not h: return {'error': 'Object not found'}
     try:
         # VW2026: IFC_SetPsetProp(h, pset, prop, value:STRING)
-        ok = vs.IFC_SetPsetProp(h, p.get('pset', ''),
-                                p.get('name', ''), str(p.get('value', '')))
+        pset = p.get('pset', '')
+        prop = p.get('prop') or p.get('name', '')
+        val = str(p.get('value', ''))
+        ok = vs.IFC_SetPsetProp(h, pset, prop, val)
+        if not ok:
+            # fails when the pset is not yet attached to this object — attach + retry
+            vs.IFC_AttachPset(h, pset)
+            ok = vs.IFC_SetPsetProp(h, pset, prop, val)
         return {'status': 'ok' if ok else 'error'}
     except Exception as e:
         return {'error': str(e)}
