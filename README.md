@@ -49,8 +49,28 @@ bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`, [legacy/](legacy/README.md
    `C:\Program Files\Vectorworks 2026\Plug-ins\` (VW closed, admin).
 5. **Executor command (one-time, in VW)**: Plug-in Manager → Eigene Plug-ins →
    Neu… → Menübefehl (Python) named **"VWX Bridge Start"**, code =
-   `watchdog/BridgeStart_MenuCommand.py`. Workspace editor: add it to a menu +
+   `vwx-plugin/BridgeStart_MenuCommand.py`. Workspace editor: add it to a menu +
    assign **Ctrl+Shift+B**; also add "VWX Bridge Palette anzeigen". Restart VW.
+
+Rebuild the knowledge index after an SDK bump:
+`python tools/build_vs_index.py <path-to-SDK>/vs.py` → redeploy `vs_index.json`.
+
+## Parts — a pipeline of three roles
+
+The Windows bridge is **not redundant copies** — the VW2026 execution-context
+constraint forces a three-role split (trigger → executor → work; see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). Every file below is required:
+
+| Part (repo → deploy) | Role |
+|---|---|
+| `native/` → `VwxBridge.vlb`+`.vwr` in `C:\Program Files\Vectorworks 2026\Plug-ins\` | **trigger** — native palette: heartbeat, background keystroke, error-dialog auto-dismiss |
+| `vwx-plugin/BridgeStart_MenuCommand.py` → "VWX Bridge Start" menu command (Ctrl+Shift+B) | **executor** — the only VW context where document mutation is safe |
+| `vwx-plugin/{vwx_pump,commands}.py` + `vs_index.json` → `…\Plug-ins\VW-MCP\` | **work** — pump drains the queue, commands do the `vs.*`, index gives signatures |
+| `mcp-server/` → `~\.local\share\vwx-mcp\`, `bridge/vwx-mcp.bat` → `~\bridge\` | MCP server (writes jobs, reads results) |
+
+**macOS / remote fallback** (`VWX_TRANSPORT=tcp`): `vwx-plugin/vwx_mcp_bridge.py`
+(the TCP dialog bridge) + `legacy/vwx_mcp_bridge_dialog.py` (dependency-free
+reference). Not used by the Windows file-IPC path.
 
 ## Run
 
@@ -115,19 +135,20 @@ __result__ = vs.GetObjectUuid(vs.LNewObj())
 
 ## Known constraint
 
-Every `vs.*` call runs on the Vectorworks main thread — the UI is busy while
-a command executes, in any architecture. On Windows the default transport is
-the **file-IPC pump (bridge v4)**: no resident bridge, no modal dialog — VW
-stays fully usable except during actual command execution. See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [watchdog/README.md](watchdog/README.md).
-The classic TCP dialog bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`,
+Every `vs.*` call runs on the Vectorworks main thread — the UI is busy only
+while a command actually executes. On Windows the transport is the **file-IPC
+pump driven by the native palette (bridge v13)**: reads drain in the
+background, writes reach VW through its own message queue, error dialogs
+self-dismiss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The classic TCP
+dialog bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`,
 [legacy/](legacy/README.md)).
 
 ## Docs
 
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — bridge lifecycle, watchdog, state files, env knobs.
-- **[AGENTS.md](AGENTS.md)** — agent integration guide + VW2026 API gotchas.
-- **[docs/ROADMAP.md](docs/ROADMAP.md)** — API expansion plan (→ ~225 tools).
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — bridge v13 lifecycle, context map, state files, env knobs.
+- **[AGENTS.md](AGENTS.md)** — agent integration guide, VW2026 API gotchas + renames, knowledge index.
+- **[docs/TOOL_COVERAGE.md](docs/TOOL_COVERAGE.md)** — full command-sweep coverage report.
+- **[docs/ROADMAP.md](docs/ROADMAP.md)** — API expansion plan.
 - **[docs/MIGRATION_fastmcp3.md](docs/MIGRATION_fastmcp3.md)** — bundled→standalone fastmcp migration.
 
 ## License

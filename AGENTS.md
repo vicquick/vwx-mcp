@@ -12,7 +12,7 @@ must be running first (see README). `ping` confirms the full chain is live.
 
 ## Three access layers — pick the narrowest that works
 
-1. **Explicit tools** (150). Typed, documented, safe. Prefer these.
+1. **Explicit tools** (171). Typed, documented, safe. Prefer these.
 2. **`vwx(command, params)`** — generic dispatcher to any verb in `commands.py`.
    Call `list_commands` to discover. Use when no explicit wrapper exists but a
    `commands.py` verb does.
@@ -95,6 +95,27 @@ Two verbs expose it (via the `vwx` dispatcher or as MCP tools):
 error dict instead of surfacing a modal Script-Fehler. Rebuild after an SDK
 update: `python tools/build_vs_index.py <path-to-vs.py>`.
 
+## SDK enrichment verbs (added from the index gap analysis)
+
+New capability wrapped from untapped `vs.*` domains (all live-tested):
+
+- **3D modeling**: `create_extrude_along_path` (sweep profile along path),
+  `create_tapered_extrude` (draft-angle extrude), `create_loft` (skin NURBS
+  through a group of section curves), `rotate_object_3d`, `draw_locus_3d`.
+- **2D surfaces (paint-bucket booleans)**: `add_surface` (union),
+  `clip_surface` (subtract), `intersect_surface`, `combine_into_surface`
+  (polyline from a bounded region around a point), `add_hole`, `polygonize`,
+  `draw_locus`.
+- **Graphic calculation (pure math, no document change)**:
+  `line_line_intersection`, `circle_circle_intersection`,
+  `line_circle_intersection`, `three_point_center`, `polygon_area_at_point`.
+  These return named point fields **plus** a `raw` field (the exact VS tuple);
+  points are extracted generically, so they are robust to VS return-order quirks.
+- **Introspection**: `get_3d_info` (bbox h/w/d), `get_centroid_3d`.
+
+Surface booleans **consume** their inputs (VW replaces them with the result) —
+re-fetch handles afterwards, don't reuse `object_id_a/b`.
+
 ## Server internals (for tool authors)
 
 - **`@mcp.tool(output_schema=None)`**, never `structured_output=False`. The server
@@ -105,7 +126,7 @@ update: `python tools/build_vs_index.py <path-to-vs.py>`.
 - New tools are registered via the **`vtool`** wrapper (in `vwx_mcp_server.py`),
   which forwards to `mcp.tool(output_schema=None)` and injects the tool's tag from
   `tool_tags.py` by function name. Add the new tool name to `tool_tags.py` too
-  (a probe asserts 150/150 coverage).
+  (a probe asserts every tool is tagged — currently 171/171).
 - Tags must be set at **registration** (decorator) for the Visibility API; mutating
   `tool.tags` afterward does not affect `enable/disable`.
 - Tool bodies return a JSON **string** via `cmd(command_type, params)`; the actual

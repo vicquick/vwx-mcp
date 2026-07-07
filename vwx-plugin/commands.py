@@ -723,6 +723,179 @@ def draw_cylinder(p):
     finally:
         _restore(prev)
 
+# ── SDK enrichment: 3D modeling ─────────────────────────────────────────────
+
+def create_extrude_along_path(p):
+    """Sweep a 2D profile along a 2D/3D path. params: {path_id, profile_id}."""
+    path = _h(p.get('path_id'))
+    prof = _h(p.get('profile_id'))
+    if not path or not prof:
+        return {'error': 'path_id and profile_id (both existing objects) required'}
+    eh = vs.ExtrudeAlongPath(path, prof)
+    return {'status': 'ok', 'object_id': _oid(eh)}
+
+def create_tapered_extrude(p):
+    """Extrude a 2D profile with a draft angle. params: {object_id, angle, height}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': '2D profile not found'}
+    eh = vs.CreateTaperedExtrude(h, float(p.get('angle', 10)), float(p.get('height', 100)))
+    return {'status': 'ok', 'object_id': _oid(eh)}
+
+def create_loft(p):
+    """Loft/skin NURBS surfaces through a GROUP of cross-section curves.
+    params: {group_id, ruled(bool), closed(bool), solid(bool)}."""
+    g = _h(p.get('group_id'))
+    if not g: return {'error': 'group_id (a group of section curves) required'}
+    h = vs.CreateLoftSurfaces(g, bool(p.get('ruled', False)),
+                              bool(p.get('closed', False)), bool(p.get('solid', False)))
+    return {'status': 'ok', 'object_id': _oid(h)}
+
+def draw_locus(p):
+    """2D reference point (locus). params: {x, y}."""
+    prev = _with_layer_class(p)
+    try:
+        vs.Locus((float(p.get('x', 0)), float(p.get('y', 0))))
+        return _newobj_result(p)
+    finally:
+        _restore(prev)
+
+def draw_locus_3d(p):
+    """3D reference point. params: {x, y, z}."""
+    prev = _with_layer_class(p)
+    try:
+        vs.Locus3D((float(p.get('x', 0)), float(p.get('y', 0)), float(p.get('z', 0))))
+        return _newobj_result(p)
+    finally:
+        _restore(prev)
+
+def rotate_object_3d(p):
+    """Rotate a 3D object about a point. params: {object_id, x_angle, y_angle,
+    z_angle, cx, cy, cz}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    vs.Set3DRot(h, float(p.get('x_angle', 0)), float(p.get('y_angle', 0)),
+                float(p.get('z_angle', 0)), float(p.get('cx', 0)),
+                float(p.get('cy', 0)), float(p.get('cz', 0)))
+    return {'status': 'ok', 'object_id': p.get('object_id')}
+
+def get_3d_info(p):
+    """Height/width/depth of a 3D object bounding box. params: {object_id}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    r = _safe(lambda: vs.Get3DInfo(h))
+    if not r: return {'error': 'not a 3D object / no info'}
+    try:
+        return {'status': 'ok', 'height': r[0], 'width': r[1], 'depth': r[2]}
+    except Exception:
+        return {'status': 'ok', 'info': r}
+
+def get_centroid_3d(p):
+    """Center of gravity of a 3D object. params: {object_id}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    r = _safe(lambda: vs.Centroid3D(h))
+    if r is None: return {'error': 'no centroid (not a solid?)'}
+    # Python: (ok, centerPt) — normalise to {x,y,z}
+    pt = r[1] if isinstance(r, (list, tuple)) and len(r) >= 2 and isinstance(r[1], (list, tuple)) else r
+    try:
+        return {'status': 'ok', 'x': pt[0], 'y': pt[1], 'z': pt[2]}
+    except Exception:
+        return {'status': 'ok', 'centroid': r}
+
+# ── SDK enrichment: 2D surface booleans (paint-bucket style) ────────────────
+
+def add_surface(p):
+    """Union two 2D surfaces into one. params: {object_id_a, object_id_b}."""
+    a = _h(p.get('object_id_a')); b = _h(p.get('object_id_b'))
+    if not a or not b: return {'error': 'object_id_a and object_id_b required'}
+    h = vs.AddSurface(a, b)
+    return {'status': 'ok', 'object_id': _oid(h)}
+
+def clip_surface(p):
+    """Subtract surface B from surface A. params: {object_id_a, object_id_b}."""
+    a = _h(p.get('object_id_a')); b = _h(p.get('object_id_b'))
+    if not a or not b: return {'error': 'object_id_a and object_id_b required'}
+    vs.ClipSurface(a, b)
+    return {'status': 'ok', 'object_id': _oid(vs.LNewObj())}
+
+def intersect_surface(p):
+    """Keep only the overlap of two 2D surfaces. params: {object_id_a, object_id_b}."""
+    a = _h(p.get('object_id_a')); b = _h(p.get('object_id_b'))
+    if not a or not b: return {'error': 'object_id_a and object_id_b required'}
+    h = vs.IntersectSurface(a, b)
+    return {'status': 'ok', 'object_id': _oid(h)}
+
+def combine_into_surface(p):
+    """Paint-bucket: build a polyline from the bounded region around a point.
+    params: {x, y}."""
+    h = vs.CombineIntoSurface((float(p.get('x', 0)), float(p.get('y', 0))))
+    return {'status': 'ok', 'object_id': _oid(h)}
+
+def add_hole(p):
+    """Cut a hole in object A using object B as the hole template (B consumed).
+    params: {object_id, hole_id}."""
+    a = _h(p.get('object_id')); b = _h(p.get('hole_id'))
+    if not a or not b: return {'error': 'object_id and hole_id required'}
+    vs.AddHole(a, b)
+    return {'status': 'ok', 'object_id': p.get('object_id')}
+
+# ── SDK enrichment: graphic calculation (pure math, no side effects) ─────────
+
+def _pts_from(raw):
+    """Pull coordinate points out of a VS calc return (mix of bools + point
+    lists). Returns list of [x,y(,z)] found, in order."""
+    out = []
+    if isinstance(raw, (list, tuple)):
+        for e in raw:
+            if isinstance(e, (list, tuple)) and e and all(isinstance(x,(int,float)) for x in e):
+                out.append([float(x) for x in e])
+    return out
+
+def line_line_intersection(p):
+    """Intersection point of two lines (each by 2 points).
+    params: {a1:[x,y], a2:[x,y], b1:[x,y], b2:[x,y]}."""
+    r = vs.LineLineIntersection(tuple(p['a1']), tuple(p['a2']),
+                                tuple(p['b1']), tuple(p['b2']))
+    pts = _pts_from(r)
+    return {'status': 'ok', 'point': pts[0] if pts else None,
+            'parallel': not pts, 'raw': r}
+
+def circle_circle_intersection(p):
+    """Intersection of two circles. params: {c1:[x,y], r1, c2:[x,y], r2}."""
+    r = vs.CircleCircleInters(tuple(p['c1']), tuple(p['c2']),
+                              float(p['r1']), float(p['r2']))
+    pts = _pts_from(r)
+    return {'status': 'ok', 'points': pts, 'count': len(pts), 'raw': r}
+
+def line_circle_intersection(p):
+    """Intersection of a line (2 pts) and a circle. params: {p1, p2, center, radius}."""
+    r = vs.LineCircleIntersect(tuple(p['p1']), tuple(p['p2']),
+                               tuple(p['center']), float(p['radius']))
+    pts = _pts_from(r)
+    return {'status': 'ok', 'points': pts, 'count': len(pts), 'raw': r}
+
+def three_point_center(p):
+    """Center of the circle through 3 points. params: {p1, p2, p3}."""
+    r = vs.ThreePtCenter(tuple(p['p1']), tuple(p['p2']), tuple(p['p3']))
+    try:
+        return {'status': 'ok', 'x': r[0], 'y': r[1]}
+    except Exception:
+        return {'status': 'ok', 'center': r}
+
+def polygon_area_at_point(p):
+    """Area of the smallest bounded polygon surrounding a point (paint-bucket
+    measure). params: {x, y}."""
+    a = vs.SrndArea((float(p.get('x', 0)), float(p.get('y', 0))))
+    return {'status': 'ok', 'area': a}
+
+def polygonize(p):
+    """Convert a polyline/polygon's arcs into straight segments.
+    params: {object_id, segment_length, straight(bool)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Object not found'}
+    r = vs.Polygonize(h, float(p.get('segment_length', 10)), bool(p.get('straight', False)))
+    return {'status': 'ok', 'object_id': _oid(r)}
+
 def boolean_operation(p):
     h1 = _h(p.get('object_id_a'))
     h2 = _h(p.get('object_id_b'))
