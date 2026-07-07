@@ -1,55 +1,63 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 150 tools, pure Python, no C++ compilation.**
+**Vectorworks 2026 MCP server — 150 tools, true background control (bridge v12).**
 
 Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
-Desktop, …). FastMCP HTTP server → TCP socket → Python plugin running inside
-Vectorworks → the `vs.*` API.
+Desktop, …) **while you work in another app**: reads drain invisibly via VW's
+OnIdle notification queue, writes reach VW through its own message queue — no
+watchdog process, no focus juggling, structurally crash-proof.
 
 > Building an agent against this server? Read **[AGENTS.md](AGENTS.md)** — it covers
 > the three access layers, object addressing, toolset presets, and the VW2026
 > API gotchas that will otherwise bite you.
 
-## Architecture
+## Architecture (Windows, bridge v12)
 
 ```
 MCP client (Claude Code / Desktop)
     │ streamable-http :8082
     ▼
 mcp-server/vwx_mcp_server.py     (standalone fastmcp 3.x)
-    │ TCP :9878, JSON newline-delimited (persistent, multi-message)
+    │ file IPC: ipc/jobs/*.json → ipc/results/<cid>.json
     ▼
-vwx-plugin/vwx_mcp_bridge.py     (runs inside Vectorworks)
-    ├── bg thread: socket I/O only (loops reading framed JSON)
-    ├── queue:    cmd_queue / result_map / result_events
-    └── main thread: vs.* dispatch via RegisterDialogForTimerEvents (100ms)
-        │  (dispatches to vwx-plugin/commands.py — hot-reloads per call)
-        ▼
-Vectorworks 2026  (vs.* Python API — 3071 functions, 73 categories)
+VwxBridge.vlb   (native C++ web palette inside Vectorworks)
+    │ palette open = bridge on; 100ms timer:
+    │   reads  → OnIdle notification → vwx_pump.pump_readonly()
+    │   writes → Ctrl+Shift+B accelerator (posted key when VW backgrounded)
+    ▼
+"VWX Bridge Start" Python menu command  (VW's script runner —
+    │  the ONLY context where document mutation is safe, verified)
+    ▼
+vwx_pump.pump_all() → commands.py (mtime-gated hot-reload) → vs.*
 ```
 
-The VW-side bridge is **mandatory** — it is the only path that can run `vs.*`
-against the live document. The MCP server is a thin socket proxy in front of it.
+Full context map, crash-test history and lifecycle:
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**. The classic TCP dialog
+bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`, [legacy/](legacy/README.md)).
 
-## Install
+## Install (Windows)
 
 1. Copy `vwx-plugin/` contents to `%APPDATA%\Nemetschek\Vectorworks\2026\Plug-ins\VWX-MCP\`
-   (the bridge also accepts the legacy folder name `VW-MCP`).
+   (the legacy folder name `VW-MCP` also works).
 2. Copy `mcp-server/vwx_mcp_server.py`, `mcp-server/tool_tags.py`, and
    `mcp-server/requirements.txt` to `%USERPROFILE%\.local\share\vwx-mcp\`
-3. Copy `bridge/vwx-mcp.bat` to `%USERPROFILE%\bridge\`
-4. Ensure `python` is on PATH. **No manual pip install needed** — the launcher
-   creates a venv and installs `requirements.txt` (`fastmcp==3.4.2`) on first run.
+3. Copy `bridge/vwx-mcp.bat` to `%USERPROFILE%\bridge\`. `python` on PATH —
+   the launcher creates a venv + installs `fastmcp` on first run.
+4. **Native palette**: build `native/VwxBridge2026.vcxproj` (VS2022 BuildTools,
+   `VWSDK2026` env → SDK root containing `SDKLib`), then copy
+   `native/Output/Release/VwxBridge.vlb` + `VwxBridge.vwr` to
+   `C:\Program Files\Vectorworks 2026\Plug-ins\` (VW closed, admin).
+5. **Executor command (one-time, in VW)**: Plug-in Manager → Eigene Plug-ins →
+   Neu… → Menübefehl (Python) named **"VWX Bridge Start"**, code =
+   `watchdog/BridgeStart_MenuCommand.py`. Workspace editor: add it to a menu +
+   assign **Ctrl+Shift+B**; also add "VWX Bridge Palette anzeigen". Restart VW.
 
 ## Run
 
-1. Launch Vectorworks 2026.
-2. In VW: `File → Scripts → Run Script` → pick `vwx_mcp_bridge.py` from the plugin dir.
-3. Dialog shows **"Active — TCP :9878"** (keeps VW in a modal event loop so the
-   main-thread pump works).
-4. Outside VW: double-click `bridge\vwx-mcp.bat`. First run bootstraps the venv,
-   then FastMCP listens on `http://127.0.0.1:8082/mcp`.
-5. Add the MCP client config:
+1. Launch Vectorworks, open the **VWX Bridge palette** (Extras menu). Palette
+   open = bridge on; Pause button or closing the palette stops it.
+2. Double-click `bridge\vwx-mcp.bat` → FastMCP on `http://127.0.0.1:8082/mcp`.
+3. MCP client config:
    ```json
    {
      "vwx-mcp": {
@@ -60,6 +68,8 @@ against the live document. The MCP server is a thin socket proxy in front of it.
    ```
 
 Test with the `ping` tool → `{"status":"ok","message":"VW MCP Bridge running"}`.
+`ping` answers even with VW backgrounded; a `draw_rectangle` proves the write
+path.
 
 ## Toolset presets (tame tool-overload)
 

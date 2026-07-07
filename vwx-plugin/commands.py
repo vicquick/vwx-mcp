@@ -483,7 +483,10 @@ def group_objects(p):
         h = _h(oid)
         if h: vs.SetSelect(h)
     vs.DoMenuTextByName('Group', 0)
-    return {'status': 'ok', 'object_id': _oid(vs.LNewObj())}
+    # LNewObj does not see menu-created groups; the new group stays selected,
+    # so the first selected object on the active layer IS the group.
+    gh = vs.FSActLayer()
+    return {'status': 'ok', 'object_id': _oid(gh)}
 
 def ungroup_object(p):
     h = _h(p.get('object_id'))
@@ -1867,8 +1870,10 @@ def create_angular_dimension(p):
         offset = float(p.get('offset', 50))
         arrow = int(p.get('arrow', 770))
         text_flag = int(p.get('text_flag', 0))
+        # VW2026 AngularDim(startPt, endPt, vert1/arcCenter, textOffset,
+        # arrow, textFlag, posAngle) — 7 args; center is the 3rd param.
         try:
-            vs.AngularDim((cx, cy), p1, p2, offset, arrow, text_flag)
+            vs.AngularDim(p1, p2, (cx, cy), offset, arrow, text_flag, 0.0)
         except Exception as e:
             return {'error': str(e)}
         return _newobj_result(p)

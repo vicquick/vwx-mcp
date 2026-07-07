@@ -401,6 +401,78 @@ static bool ModalDialogOpen()
 	return ctx.found;
 }
 
+// Auto-dismiss VW's own Script-Fehler / Python error dialogs so an errored
+// command can never block unattended background operation. Ported from the
+// (now retired) watchdog janitor. STRICTLY content-matched: only dialogs whose
+// text contains an error signature are touched — a dialog the user is actually
+// working in is never clicked. Runs on the VW main thread from the timer; a
+// modal error dialog pumps WM_TIMER in its own loop, so this fires even while
+// the dialog is up.
+static bool WindowTextContainsError(HWND dlg)
+{
+	struct C { bool hit; } c = { false };
+	EnumChildWindows( dlg, [](HWND ch, LPARAM lp) -> BOOL {
+		wchar_t buf[1024];
+		int n = GetWindowTextW( ch, buf, 1024 );
+		if ( n > 0 ) {
+			// German + English error signatures VW uses.
+			if ( wcsstr( buf, L"Script-Fehler" ) || wcsstr( buf, L"Traceback" ) ||
+			     wcsstr( buf, L"Script Error" )  || wcsstr( buf, L"Marionette" ) ||
+			     wcsstr( buf, L"Handle variable is NIL" ) ||
+			     wcsstr( buf, L"Invalid number of parameters" ) ) {
+				((C*) lp)->hit = true;
+				return FALSE;
+			}
+		}
+		return TRUE;
+	}, (LPARAM) &c );
+	return c.hit;
+}
+
+static void ClickDialogButton(HWND dlg)
+{
+	struct C { HWND btn; } c = { nullptr };
+	EnumChildWindows( dlg, [](HWND ch, LPARAM lp) -> BOOL {
+		wchar_t cls[64];  GetClassNameW( ch, cls, 64 );
+		if ( _wcsicmp( cls, L"Button" ) != 0 )
+			return TRUE;
+		wchar_t txt[64];  GetWindowTextW( ch, txt, 64 );
+		if ( wcsstr( txt, L"OK" ) || wcsstr( txt, L"Schlie" ) || wcsstr( txt, L"Close" ) ) {
+			((C*) lp)->btn = ch;
+			return FALSE;
+		}
+		return TRUE;
+	}, (LPARAM) &c );
+	if ( c.btn ) {
+		SendMessageW( c.btn, BM_CLICK, 0, 0 );
+	} else {
+		// no matching button — dismiss via the dialog's default/close path
+		SendMessageW( dlg, WM_COMMAND, IDOK, 0 );
+	}
+}
+
+static void DismissErrorDialogs()
+{
+	struct Ctx { DWORD pid; } ctx = { GetCurrentProcessId() };
+	EnumWindows( [](HWND h, LPARAM lp) -> BOOL {
+		Ctx* c = (Ctx*) lp;
+		DWORD p = 0;
+		GetWindowThreadProcessId( h, &p );
+		if ( p != c->pid || !IsWindowVisible( h ) )
+			return TRUE;
+		wchar_t cls[64];  GetClassNameW( h, cls, 64 );
+		if ( wcscmp( cls, L"#32770" ) != 0 )
+			return TRUE;
+		wchar_t title[128];  GetWindowTextW( h, title, 128 );
+		if ( wcsstr( title, L"Fehler" ) || wcsstr( title, L"Error" ) ||
+		     WindowTextContainsError( h ) ) {
+			ClickDialogButton( h );
+			LogLine( "auto-dismissed a VW error dialog" );
+		}
+		return TRUE;
+	}, (LPARAM) &ctx );
+}
+
 // Timer = heartbeat + TRIGGER only. It never executes a script itself
 // (WM_TIMER is NOT command context — mutations park it, verified live).
 // TriggerPump() posts a deferred notification / WM_COMMAND; the actual drain
@@ -410,6 +482,7 @@ static void CALLBACK PumpTimerProc(HWND, UINT, UINT_PTR, DWORD)
 {
 	RestoreKeyState();            // undo last tick's background-hotkey key state
 	                              // (posted keys have since been translated)
+	DismissErrorDialogs();        // keep unattended background ops unblocked
 	TXString pluginDir = VwxPluginDir();
 	WriteAlive( pluginDir );
 	gLastQueue = CountJobs( pluginDir );
