@@ -1,6 +1,6 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 150 tools, true background control (bridge v12).**
+**Vectorworks 2026 MCP server — 206 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
 
 Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
 Desktop, …) **while you work in another app**: reads drain invisibly via VW's
@@ -11,7 +11,7 @@ watchdog process, no focus juggling, structurally crash-proof.
 > the three access layers, object addressing, toolset presets, and the VW2026
 > API gotchas that will otherwise bite you.
 
-## Architecture (Windows, bridge v12)
+## Architecture (Windows, bridge v13)
 
 ```
 MCP client (Claude Code / Desktop)
@@ -24,6 +24,7 @@ VwxBridge.vlb   (native C++ web palette inside Vectorworks)
     │ palette open = bridge on; 100ms timer:
     │   reads  → OnIdle notification → vwx_pump.pump_readonly()
     │   writes → Ctrl+Shift+B accelerator (posted key when VW backgrounded)
+    │   + auto-dismisses VW error dialogs (content-matched) → never blocks
     ▼
 "VWX Bridge Start" Python menu command  (VW's script runner —
     │  the ONLY context where document mutation is safe, verified)
@@ -93,30 +94,32 @@ path.
 
 ## Toolset presets (tame tool-overload)
 
-150 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
+206 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
 `bridge/vwx-mcp.bat` to expose only one workflow's tools via the fastmcp
 Visibility API (tags live in `mcp-server/tool_tags.py`):
 
 | `VWX_TOOLSET` | tools | for |
 |---|---|---|
-| `full` (default) | 150 | everything |
-| `gis` | 68 | georef / layers / classes / appearance / export |
-| `modeling` | 89 | 2D+3D draw / manipulate / BIM / symbols |
-| `baumkataster` | 52 | tree register: plants / records / query / IO |
-| `minimal` | 24 | document / query / escape hatch |
+| `full` (default) | 206 | everything |
+| `gis` | 86 | georef / layers / classes / appearance / export |
+| `modeling` | 135 | 2D+3D draw / manipulate / BIM / symbols |
+| `baumkataster` | 67 | tree register: plants / records / query / IO |
+| `minimal` | 37 | document / query / escape hatch |
 
-## Tools (150)
+## Tools (206)
 
 19 tag groups — counts in parentheses:
 
-`document` (6) · `layers` (9) · `classes` (7) · `query` (11) · `manipulate` (13) ·
-`draw2d` (12) · `draw3d` (8) · `symbols` (6) · `appearance` (13) · `records` (7) ·
-`bim` (16, incl. IFC / walls / spaces / materials / PIOs / components) ·
-`landscape` (6, Baumkataster) · `site` (5) · `viewports` (7) · `worksheets` (5) ·
-`io` (6, export/import) · `view` (4) · `geo` (2) · `escape` (7)
+`bim` (22, incl. IFC / walls / roofs / slabs / spaces / materials / PIOs) ·
+`query` (21, incl. the criteria engine + eval_expression) · `manipulate` (20) ·
+`draw3d` (19, incl. loft / shell / path-extrude / NURBS) · `draw2d` (18, incl.
+surface booleans) · `appearance` (16, incl. lights) · `layers` (11) ·
+`worksheets` (11) · `escape` (9, incl. `vs_signature` knowledge-index lookup) ·
+`document` (7) · `classes` (7) · `records` (7) · `viewports` (7) · `symbols` (6) ·
+`landscape` (6, Baumkataster) · `io` (6) · `view` (6) · `site` (5) · `geo` (2)
 
 Three access layers (see [AGENTS.md](AGENTS.md)):
-1. **Explicit tools** — the 150 wrappers above.
+1. **Explicit tools** — the 206 wrappers above.
 2. **`vwx(command, params)`** — generic dispatcher reaching every verb in
    `commands.py` (use `list_commands` to discover).
 3. **`execute_script`** — arbitrary `vs.*` Python.
@@ -133,15 +136,30 @@ vs.Oval(-1, 1, 1, -1)        # bbox circle (see AGENTS.md — don't use ArcByCen
 __result__ = vs.GetObjectUuid(vs.LNewObj())
 ```
 
-## Known constraint
+## Knowledge index — scripts that run right the first time
 
-Every `vs.*` call runs on the Vectorworks main thread — the UI is busy only
-while a command actually executes. On Windows the transport is the **file-IPC
-pump driven by the native palette (bridge v13)**: reads drain in the
-background, writes reach VW through its own message queue, error dialogs
-self-dismiss. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The classic TCP
-dialog bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`,
-[legacy/](legacy/README.md)).
+`vwx-plugin/vs_index.json` holds the exact signature of all **3071** `vs.*`
+functions (args, arity, return type, category, doc), built from the SDK stub by
+`tools/build_vs_index.py`. The `vs_signature` tool looks them up; `commands.py`
+validates arity before calling, turning would-be modal VW engine errors into
+clean JSON errors. Rebuild after an SDK update and redeploy next to
+`commands.py`.
+
+## Known constraints
+
+The VW UI stays responsive while the bridge idles and during the (typically
+millisecond) command execution — reads are invisible, writes hop through VW's
+own message queue, and VW error dialogs are auto-dismissed by the palette. What
+remains, honestly:
+
+- Every `vs.*` call runs on VW's main thread — a genuinely long operation
+  blocks the UI for its duration (a 36-verb batch measures ~300 ms; the one
+  known pathological call, `vs.CombineIntoSurface`, measured 215 s and is
+  therefore quarantined behind `force:true`).
+- Export/import verbs (`export_pdf`, `import_dwg`, …) open VW's own modal
+  settings dialogs — the `vs` API has no headless path for them.
+- The classic TCP dialog bridge remains for macOS/remote
+  (`VWX_TRANSPORT=tcp`, [legacy/](legacy/README.md)).
 
 ## Docs
 
