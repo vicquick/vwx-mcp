@@ -17,7 +17,33 @@ Key API facts:
   FInLayer: vs.FInLayer(layerH)
   ForEachObject: build list in callback — never create/delete/re-layer inside
 """
-import vs, traceback
+import vs, traceback, os, json
+
+# ── vs.* signature index (knowledge index) ───────────────────────────────────
+# vs_index.json (built by tools/build_vs_index.py from the SDK vs.py stub) maps
+# every vs function -> {args, arity, required, ret, cat, doc}. Loaded once.
+# `vsig(name)` gives an agent/self an instant accurate signature; `vcheck` lets
+# call sites validate arity and fail with a clean dict instead of triggering a
+# VW engine error dialog.
+_VS_INDEX = {}
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vs_index.json'),
+              encoding='utf-8') as _f:
+        _VS_INDEX = json.load(_f)
+except Exception:
+    _VS_INDEX = {}
+
+def vsig(name):
+    """Return the signature record for a vs.* function, or None."""
+    return _VS_INDEX.get(name)
+
+def vcheck(name, argc):
+    """True if argc is a valid argument count for vs.<name> per the index.
+    Unknown functions pass (index may lag the SDK)."""
+    s = _VS_INDEX.get(name)
+    if not s:
+        return True
+    return s['required'] <= argc <= s['arity']
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -239,7 +265,7 @@ def rename_layer(p):
     new = p.get('new_name', '')
     h = vs.GetLayerByName(old)
     if not h: return {'error': f'Layer not found: {old}'}
-    vs.SetLName(h, new)
+    vs.SetName(h, new)   # VW2026: no SetLName; SetName renames any named object
     return {'status': 'ok'}
 
 def set_layer_scale(p):
@@ -2643,6 +2669,47 @@ def list_commands(p):
         out.append({'name': name, 'doc': doc_line})
     out.sort(key=lambda x: x['name'])
     return {'count': len(out), 'commands': out}
+
+def vs_signature(p):
+    """Look up the exact VW2026 signature of a vs.* function from the knowledge
+    index (built from the SDK stub). params: {name} or {search, category}.
+    Returns args/arity/required/return-type/category/doc — so scripts call
+    vs.* correctly the first time instead of triggering engine errors."""
+    name = p.get('name')
+    if name:
+        s = _VS_INDEX.get(name)
+        if not s:
+            # case-insensitive + prefix fallback
+            low = name.lower()
+            hits = {k: v for k, v in _VS_INDEX.items() if k.lower() == low}
+            if not hits:
+                hits = {k: v for k, v in _VS_INDEX.items() if k.lower().startswith(low)}
+            if len(hits) == 1:
+                name, s = next(iter(hits.items()))
+            elif hits:
+                return {'ambiguous': sorted(hits)[:40], 'count': len(hits)}
+            else:
+                return {'error': 'no vs function named %r' % name}
+        return {'name': name, **s}
+    q = (p.get('search') or '').lower()
+    cat = (p.get('category') or '').lower()
+    res = []
+    for k, v in _VS_INDEX.items():
+        if q and q not in k.lower() and q not in v.get('doc', '').lower():
+            continue
+        if cat and cat not in v.get('cat', '').lower():
+            continue
+        res.append({'name': k, 'args': v['args'], 'cat': v['cat'], 'doc': v['doc'][:80]})
+    res.sort(key=lambda x: x['name'])
+    return {'count': len(res), 'functions': res[:200]}
+
+def vs_index_stats(p):
+    """Summary of the loaded vs.* knowledge index: total functions + per-category
+    counts. Confirms the index is deployed and current."""
+    from collections import Counter
+    cats = Counter(v.get('cat', '') or '(none)' for v in _VS_INDEX.values())
+    return {'functions': len(_VS_INDEX),
+            'categories': dict(sorted(cats.items(), key=lambda kv: -kv[1]))}
 
 def _batch(p):
     """Run several commands in one round-trip (all on VW main thread, serial).

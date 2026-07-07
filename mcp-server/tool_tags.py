@@ -186,6 +186,8 @@ TOOL_TAGS = {
     "vwx": "escape",
     "vwx_batch": "escape",
     "list_commands": "escape",
+    "vs_signature": "escape",
+    "vs_index_stats": "escape",
     "set_object_variable": "escape",
     "get_object_variable": "escape",
 }

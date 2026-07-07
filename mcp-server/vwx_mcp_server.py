@@ -1262,6 +1262,26 @@ def list_commands(ctx: Context, filter: Optional[str] = None) -> str:
     if filter: p["filter"] = filter
     return cmd("list_commands", p)
 
+@vtool
+def vs_signature(ctx: Context, name: Optional[str] = None,
+                 search: Optional[str] = None, category: Optional[str] = None) -> str:
+    """Exact VW2026 signature of a `vs.*` function from the knowledge index
+    (3071 functions). Pass `name` for one function (args, arity, return type,
+    category, doc), or `search`/`category` to browse. Use this BEFORE writing an
+    `execute_script` body so you never guess an arg count and trip a VW engine
+    error. Example: vs_signature(name='HExtrude') -> objectH, bottom, top."""
+    p = {}
+    if name: p["name"] = name
+    if search: p["search"] = search
+    if category: p["category"] = category
+    return cmd("vs_signature", p)
+
+@vtool
+def vs_index_stats(ctx: Context) -> str:
+    """Size + per-category counts of the loaded `vs.*` knowledge index.
+    Confirms vs_index.json is deployed and current."""
+    return cmd("vs_index_stats")
+
 
 # ═══════════════════════════════════════════════════════════════════
 # High-frequency new verbs (explicit wrappers — the 80/20 set)
