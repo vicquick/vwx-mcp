@@ -49,6 +49,52 @@ If the client is loading too many tools, set `VWX_TOOLSET` (env, in the launcher
 | Old marker/pen/dash/wall-height calls misbehave | pre-2019 forms are obsolete | use the `…N` variants (`SetLSN`, `InsertNewComponentN`, …) |
 | Criteria string matches nothing | quoting | single-quote record names, mind the parens: `"((R in ['Part Info']))"` |
 
+## VW2026 API renames (function does not exist under the old name)
+
+These raise `module 'vs' has no attribute …` (or wrong-arg engine errors). All
+found + fixed via the full command sweep; the correct forms are in `commands.py`.
+
+| Old / wrong | VW2026 correct | Notes |
+|---|---|---|
+| `vs.CreateExtrude(h, ht)` | `vs.HExtrude(h, zBottom, zTop)` | z baked into the extrude, no separate move |
+| `vs.LinDimN(...)` | `vs.LinearDim(start, end, offset, dimType, arrow, textFlag, textOffset)` | 7 args |
+| `vs.AngularDim(center, p1, p2, off, arr, txt)` | `vs.AngularDim(startPt, endPt, arcCenter, textOffset, arrow, textFlag, posAngle)` | 7 args; **center is 3rd** |
+| `vs.SetClassVisibility(name, n)` | `vs.ShowClass(name)` / `vs.HideClass(name)` | by name |
+| `vs.IFC_SetPSetAttribute(...)` | `vs.IFC_SetPsetProp(h, pset, prop, value)` | value is a STRING |
+| `vs.ZoomToSel()` | `vs.DoMenuTextByName('Fit To Objects', 0)` | selection-aware fit |
+| `vs.SetWSCellValue(ws, r, c, v)` | `vs.SetWSCellFormula(ws, r, c, r, c, v)` | 5 cell coords + value |
+| `vs.SaveDocument()` | `vs.DoMenuTextByName('Save', 0)` | keeps path/format |
+| `vs.SymbolCreate(...)` | `vs.BeginSym(name)` … create geometry … `vs.EndSym()` | captures objects made between the calls |
+| `vs.HMirror(h, p1, p2)` | `vs.MirrorN(h, dup, p1, p2, preserveMatrix)` | dup=False transforms in place |
+| `vs.SetLName(h, name)` | `vs.SetName(h, name)` | generic — renames any named object incl. layers |
+| `vs.GetNumberOfComponents(h)` | returns **`(ok, count)`** tuple | unpack `[1]`, not an int |
+| `create_wall` via `vs.SetPrefReal(85)`+`vs.SetPref(68)` | `vs.SetWallWidth` → `vs.Wall` → `vs.SetWallThickness` + `vs.SetWallHeights` | the pref-poking form **hard-crashes VW** |
+
+**Verbs that always open a modal VW dialog** (the `vs` API has no headless path):
+`export_pdf`, `export_image`, `export_dxf`, `export_shp`, `export_ifc`,
+`save_document_as`, `import_dwg`, `import_image`. `export_pdf` in particular
+calls `AcquireExportPDFSettingsAndLocation`, which *asks the user*. Expect a
+dialog; automated runs skip these.
+
+## Knowledge index — `vs_index.json` (author scripts right the first time)
+
+`vwx-plugin/vs_index.json` (625 KB, built by `tools/build_vs_index.py` from the
+SDK `vs.py` stub) maps all **3071** `vs.*` functions →
+`{args, arity, required, ret, cat, doc}`. Deploy it next to `commands.py`.
+
+Two verbs expose it (via the `vwx` dispatcher or as MCP tools):
+
+- **`vs_signature`** — `{name}` returns the exact signature
+  (`vs_signature('AngularDim')` → 7 args, names, category, doc); `{search}` /
+  `{category}` searches. Use this **before** writing an `execute_script` body so
+  you never guess an arg count and trip a VW engine-error dialog.
+- **`vs_index_stats`** — index size + per-category counts (confirms deployment).
+
+`commands.py` also loads the index at import and offers `vcheck(name, argc)` /
+`vsig(name)` internally, so call sites can validate arity and return a clean
+error dict instead of surfacing a modal Script-Fehler. Rebuild after an SDK
+update: `python tools/build_vs_index.py <path-to-vs.py>`.
+
 ## Server internals (for tool authors)
 
 - **`@mcp.tool(output_schema=None)`**, never `structured_output=False`. The server
