@@ -1590,6 +1590,15 @@ def get_document_units(ctx: Context) -> str:
     return cmd("get_document_units")
 
 @vtool
+def get_materials(ctx: Context, layers: Optional[List[str]] = None, guard: int = 60000) -> str:
+    """Distinct materials USED in the document with usage counts — deep-walks
+    geometry (descends into groups/symbols/PIOs) reading object- and
+    component-level materials. layers: restrict to named design layers."""
+    p = {"guard": guard}
+    if layers: p["layers"] = layers
+    return cmd("get_materials", p)
+
+@vtool
 def set_projection(ctx: Context, projection: int = 0, render_mode: int = 0,
                    view_distance: float = 0, clip1: float = 0, clip2: float = 0) -> str:
     """Set view projection (0=orthogonal, 1=perspective; VW codes) + render mode code."""

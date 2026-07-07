@@ -224,6 +224,7 @@ TOOL_TAGS = {
     "set_view_angles": "view",
     "set_projection": "view",
     "get_document_units": "document",
+    "get_materials": "bim",
     "create_extrude_along_path": "draw3d",
     "create_tapered_extrude": "draw3d",
     "create_loft": "draw3d",
