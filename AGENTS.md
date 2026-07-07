@@ -12,7 +12,7 @@ must be running first (see README). `ping` confirms the full chain is live.
 
 ## Three access layers — pick the narrowest that works
 
-1. **Explicit tools** (206). Typed, documented, safe. Prefer these.
+1. **Explicit tools** (207). Typed, documented, safe. Prefer these.
 2. **`vwx(command, params)`** — generic dispatcher to any verb in `commands.py`.
    Call `list_commands` to discover. Use when no explicit wrapper exists but a
    `commands.py` verb does.
@@ -175,7 +175,7 @@ list (rebuild + redeploy `VwxBridge.vlb` to activate).
 - New tools are registered via the **`vtool`** wrapper (in `vwx_mcp_server.py`),
   which forwards to `mcp.tool(output_schema=None)` and injects the tool's tag from
   `tool_tags.py` by function name. Add the new tool name to `tool_tags.py` too
-  (a probe asserts every tool is tagged — currently 206/206).
+  (a probe asserts every tool is tagged — currently 207/207).
 - Tags must be set at **registration** (decorator) for the Visibility API; mutating
   `tool.tags` afterward does not affect `enable/disable`.
 - Tool bodies return a JSON **string** via `cmd(command_type, params)`; the actual

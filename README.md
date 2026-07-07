@@ -1,6 +1,6 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 206 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
+**Vectorworks 2026 MCP server — 207 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
 
 Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
 Desktop, …) **while you work in another app**: reads drain invisibly via VW's
@@ -94,19 +94,19 @@ path.
 
 ## Toolset presets (tame tool-overload)
 
-206 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
+207 tools is a lot of context for a client to load. Set `VWX_TOOLSET` in
 `bridge/vwx-mcp.bat` to expose only one workflow's tools via the fastmcp
 Visibility API (tags live in `mcp-server/tool_tags.py`):
 
 | `VWX_TOOLSET` | tools | for |
 |---|---|---|
-| `full` (default) | 206 | everything |
+| `full` (default) | 207 | everything |
 | `gis` | 86 | georef / layers / classes / appearance / export |
 | `modeling` | 135 | 2D+3D draw / manipulate / BIM / symbols |
 | `baumkataster` | 67 | tree register: plants / records / query / IO |
 | `minimal` | 37 | document / query / escape hatch |
 
-## Tools (206)
+## Tools (207)
 
 19 tag groups — counts in parentheses:
 
@@ -119,7 +119,7 @@ surface booleans) · `appearance` (16, incl. lights) · `layers` (11) ·
 `landscape` (6, Baumkataster) · `io` (6) · `view` (6) · `site` (5) · `geo` (2)
 
 Three access layers (see [AGENTS.md](AGENTS.md)):
-1. **Explicit tools** — the 206 wrappers above.
+1. **Explicit tools** — the 207 wrappers above.
 2. **`vwx(command, params)`** — generic dispatcher reaching every verb in
    `commands.py` (use `list_commands` to discover).
 3. **`execute_script`** — arbitrary `vs.*` Python.
