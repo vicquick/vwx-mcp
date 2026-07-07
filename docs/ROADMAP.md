@@ -1,10 +1,11 @@
 # VW2026 Python API expansion roadmap for vwx-mcp
 
 > **STATUS 2026-07-07 — GOAL EXCEEDED.** This roadmap targeted ~215–225 tools;
-> the server is now at **237 tools** after three SDK-enrichment batches
+> the server is now at **248 tools** after four SDK-enrichment batches
 > (3D/NURBS/booleans/calc → architecture/lights/criteria/worksheets →
 > criteria-driven report worksheets / IFC-deep bulk classification / textures /
-> document defaults) plus the `vs_index.json` knowledge index (3071 signatures).
+> document defaults → GIS coordinate engine / polygon vertex editing) plus the
+> `vs_index.json` knowledge index (3071 signatures).
 > Every cluster below is either shipped or intentionally skipped
 > (dialogs/events = headless-meaningless; Spotlight/Truss/ConnectCAD = out of
 > domain). Kept as historical reference + gotcha catalogue.
