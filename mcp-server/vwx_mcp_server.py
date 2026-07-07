@@ -1340,10 +1340,6 @@ def intersect_surface(ctx: Context, object_id_a: str, object_id_b: str) -> str:
     """Keep only the overlap of two 2D surfaces."""
     return cmd("intersect_surface", {"object_id_a": object_id_a, "object_id_b": object_id_b})
 
-@vtool
-def combine_into_surface(ctx: Context, x: float = 0, y: float = 0) -> str:
-    """Paint-bucket: build a polyline from the bounded region around a point."""
-    return cmd("combine_into_surface", {"x": x, "y": y})
 
 @vtool
 def add_hole(ctx: Context, object_id: str, hole_id: str) -> str:

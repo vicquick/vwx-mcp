@@ -85,7 +85,7 @@ Python-context teardown after a Marionette run loses nothing.
 
 | Piece | Path | Role |
 |---|---|---|
-| MCP server | `mcp-server/vwx_mcp_server.py` | 171 tools, fastmcp, file transport; `VWX_TRANSPORT=tcp` for the legacy dialog bridge |
+| MCP server | `mcp-server/vwx_mcp_server.py` | 170 tools, fastmcp, file transport; `VWX_TRANSPORT=tcp` for the legacy dialog bridge |
 | Native palette | `native/` → build `VwxBridge.vlb`+`.vwr`, deploy to `C:\Program Files\Vectorworks 2026\Plug-ins\` via `~\bridge\deploy_native_bridge.bat` (VW closed, UAC) | trigger + heartbeat + status UI |
 | Pump | `vwx-plugin/vwx_pump.py` → `%APPDATA%\…\Plug-ins\VW-MCP\` | `pump_readonly()` / `pump_all()`; **no module-level auto-run** |
 | Executor | `vwx-plugin/BridgeStart_MenuCommand.py` | paste into a Python menu-command plugin "VWX Bridge Start", accelerator Ctrl+Shift+B |

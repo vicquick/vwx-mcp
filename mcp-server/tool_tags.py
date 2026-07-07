@@ -199,7 +199,6 @@ TOOL_TAGS = {
     "add_surface": "draw2d",
     "clip_surface": "draw2d",
     "intersect_surface": "draw2d",
-    "combine_into_surface": "draw2d",
     "add_hole": "draw2d",
     "polygonize": "draw2d",
     "line_line_intersection": "query",
