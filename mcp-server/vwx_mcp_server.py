@@ -1590,6 +1590,74 @@ def get_document_units(ctx: Context) -> str:
     return cmd("get_document_units")
 
 
+
+# ── SDK enrichment 4: GIS coordinate engine + polygon vertex editing ────────
+
+@vtool
+def geo_to_drawing(ctx: Context, lat: float, lon: float) -> str:
+    """Convert WGS84 lat/lon to drawing x/y via the document georeferencing.
+    Feed OSM/GPS data straight into the drawing."""
+    return cmd("geo_to_drawing", {"lat": lat, "lon": lon})
+
+@vtool
+def drawing_to_geo(ctx: Context, x: float, y: float) -> str:
+    """Convert drawing x/y to WGS84 lat/lon via the document georeferencing."""
+    return cmd("drawing_to_geo", {"x": x, "y": y})
+
+@vtool
+def get_georeference_info(ctx: Context, layer: Optional[str] = None) -> str:
+    """Georeferencing summary: origin lat/lon, angle to north, layer projection,
+    project elevation."""
+    p = {}
+    if layer: p["layer"] = layer
+    return cmd("get_georeference_info", p)
+
+@vtool
+def get_projection(ctx: Context, layer: Optional[str] = None, esri_style: bool = False) -> str:
+    """Layer projection as WKT + Proj4 (for GIS round-trips)."""
+    p = {"esri_style": esri_style}
+    if layer: p["layer"] = layer
+    return cmd("get_projection", p)
+
+@vtool
+def set_document_georef(ctx: Context, epsg: int) -> str:
+    """Georeference the document by EPSG code using the current user origin
+    (e.g. 25832 = ETRS89/UTM32N)."""
+    return cmd("set_document_georef", {"epsg": epsg})
+
+@vtool
+def get_poly_vertices(ctx: Context, object_id: str) -> str:
+    """All vertices of a polygon/polyline as [[x,y],...] + closed flag."""
+    return cmd("get_poly_vertices", {"object_id": object_id})
+
+@vtool
+def set_poly_vertex(ctx: Context, object_id: str, index: int, x: float, y: float) -> str:
+    """Move one polygon/polyline vertex (1-based index)."""
+    return cmd("set_poly_vertex", {"object_id": object_id, "index": index, "x": x, "y": y})
+
+@vtool
+def insert_poly_vertex(ctx: Context, object_id: str, x: float, y: float, before: int = 1,
+                       vertex_type: int = 0, radius: float = 0) -> str:
+    """Insert a vertex before position `before`. vertex_type: 0=corner 1=bezier
+    2=cubic 3=arc (with radius)."""
+    return cmd("insert_poly_vertex", {"object_id": object_id, "x": x, "y": y,
+                                      "before": before, "vertex_type": vertex_type, "radius": radius})
+
+@vtool
+def delete_poly_vertex(ctx: Context, object_id: str, index: int) -> str:
+    """Delete one vertex (1-based index)."""
+    return cmd("delete_poly_vertex", {"object_id": object_id, "index": index})
+
+@vtool
+def set_poly_closed(ctx: Context, object_id: str, closed: bool = True) -> str:
+    """Open or close a polygon/polyline."""
+    return cmd("set_poly_closed", {"object_id": object_id, "closed": closed})
+
+@vtool
+def get_poly_holes(ctx: Context, object_id: str) -> str:
+    """Openings (holes) of a polyline — count + hole object ids."""
+    return cmd("get_poly_holes", {"object_id": object_id})
+
 # ── SDK enrichment 3: report worksheets, IFC deep, textures, doc defaults ───
 
 @vtool

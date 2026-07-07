@@ -12,7 +12,7 @@ must be running first (see README). `ping` confirms the full chain is live.
 
 ## Three access layers — pick the narrowest that works
 
-1. **Explicit tools** (237). Typed, documented, safe. Prefer these.
+1. **Explicit tools** (248). Typed, documented, safe. Prefer these.
 2. **`vwx(command, params)`** — generic dispatcher to any verb in `commands.py`.
    Call `list_commands` to discover. Use when no explicit wrapper exists but a
    `commands.py` verb does.
@@ -195,6 +195,21 @@ IFC gotchas (verified live):
 - Worksheet DATABASE binding: cell formula `=DATABASE((criteria))` on column 0
   of the row; subrows appear after `RecalculateWS`.
 
+## SDK enrichment 4 — GIS coordinate engine + polygon vertex editing
+
+11 more verbs (all live-tested; lat/lon round-trip exact):
+
+- **GIS**: `geo_to_drawing` / `drawing_to_geo` (WGS84 ⇄ drawing via document
+  georef — feed OSM/GPS straight in), `get_georeference_info` (origin,
+  angle-to-north, projection), `get_projection` (WKT + Proj4),
+  `set_document_georef` (EPSG, e.g. 25832).
+- **Polygon vertex editing**: `get_poly_vertices`, `set_poly_vertex`,
+  `insert_poly_vertex` (corner/bezier/cubic/arc), `delete_poly_vertex`,
+  `set_poly_closed`, `get_poly_holes`.
+
+Gotcha: the `…N` GIS functions return **`(ok, value…)`** tuples with a leading
+boolean — `_nums()` in commands.py strips flags generically.
+
 ## Server internals (for tool authors)
 
 - **`@mcp.tool(output_schema=None)`**, never `structured_output=False`. The server
@@ -205,7 +220,7 @@ IFC gotchas (verified live):
 - New tools are registered via the **`vtool`** wrapper (in `vwx_mcp_server.py`),
   which forwards to `mcp.tool(output_schema=None)` and injects the tool's tag from
   `tool_tags.py` by function name. Add the new tool name to `tool_tags.py` too
-  (a probe asserts every tool is tagged — currently 237/237).
+  (a probe asserts every tool is tagged — currently 248/248).
 - Tags must be set at **registration** (decorator) for the Visibility API; mutating
   `tool.tags` afterward does not affect `enable/disable`.
 - Tool bodies return a JSON **string** via `cmd(command_type, params)`; the actual

@@ -1,5 +1,14 @@
 # VW2026 Python API expansion roadmap for vwx-mcp
 
+> **STATUS 2026-07-07 — GOAL EXCEEDED.** This roadmap targeted ~215–225 tools;
+> the server is now at **237 tools** after three SDK-enrichment batches
+> (3D/NURBS/booleans/calc → architecture/lights/criteria/worksheets →
+> criteria-driven report worksheets / IFC-deep bulk classification / textures /
+> document defaults) plus the `vs_index.json` knowledge index (3071 signatures).
+> Every cluster below is either shipped or intentionally skipped
+> (dialogs/events = headless-meaningless; Spotlight/Truss/ConnectCAD = out of
+> domain). Kept as historical reference + gotcha catalogue.
+
 ## TL;DR
 The current ~125 tools cover basic draw/attribute/query/IFC/plant/symbol workflows. The biggest unclaimed high-value surface for a landscape architect is: (1) the **Component API** for walls/slabs/roofs (~90 functions under `Objects - Architectural`), (2) the **Dimensions** category (15 functions incl. `LinearDim`, `AngularDim`, `CircularDim`, `CreateChainDimension`, `AssociateLinearDimension`), (3) the **SiteModel `DTM6_*` runtime layer** (send-to-surface, Z-at-XY, modifier classes), (4) **Hatches/Vector Fills** (`CreateStaticHatch`, `SetVectorFill` — critical for site plans), (5) **Solid booleans** (`AddSolid`, `SubtractSolid`, `IntersectSolid`, `CreateShell`), (6) **Data Tags**, (7) **Graphic Calculation** helpers (`OffsetPoly`, `ClipPolygon`, `CombinePolygons`, `PointAlongPoly`, `SubtractPolygon`, `Distance`, `PtInPoly`) which are massively useful for generating planting geometry, (8) **Materials API** (`CreateMaterial`, `SetObjMaterialHandle`, component material), (9) **NURBS surfaces** for landform/rails, and (10) **Viewport Class Overrides** (`CreateVPClOvrd` family — essential for sheet production). A tight wrap of just these ten clusters adds ~90–100 new MCP tools and takes the server to ~215–225 total.
 

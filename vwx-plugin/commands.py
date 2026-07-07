@@ -1323,6 +1323,130 @@ def set_projection(p):
                   float(p.get('clip2', 0)))
     return {'status': 'ok'}
 
+# ── SDK enrichment 4: GIS coordinate engine + polygon vertex editing ────────
+
+def _nums(r):
+    """Strip leading ok-flags from a VW return tuple; keep the numbers.
+    (True, 51.3, 9.4) -> [51.3, 9.4]; scalars pass through as [scalar]."""
+    if isinstance(r, (list, tuple)):
+        vals = [v for v in r if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        return vals
+    return [r] if isinstance(r, (int, float)) else []
+
+def geo_to_drawing(p):
+    """Convert WGS84 lat/lon to drawing coordinates using the document's
+    georeferencing. params: {lat, lon}. Requires a georeferenced document."""
+    r = vs.GeogCoordToVWN(float(p.get('lat', 0)), float(p.get('lon', 0)))
+    pts = _pts_from(r if isinstance(r, (list, tuple)) else (r,))
+    if pts: return {'status': 'ok', 'x': pts[0][0], 'y': pts[0][1]}
+    v = _nums(r)
+    if len(v) >= 2: return {'status': 'ok', 'x': v[0], 'y': v[1]}
+    return {'status': 'ok', 'raw': r}
+
+def drawing_to_geo(p):
+    """Convert drawing coordinates to WGS84 lat/lon using the document's
+    georeferencing. params: {x, y}."""
+    r = vs.VWCoordToGeogN(float(p.get('x', 0)), float(p.get('y', 0)))
+    v = _nums(r)
+    if len(v) >= 2: return {'status': 'ok', 'lat': v[0], 'lon': v[1]}
+    pts = _pts_from(r if isinstance(r, (list, tuple)) else (r,))
+    if pts: return {'status': 'ok', 'lat': pts[0][0], 'lon': pts[0][1]}
+    return {'status': 'ok', 'raw': r}
+
+def get_georeference_info(p):
+    """Georeferencing summary: origin (lat/lon), angle to north, projection of
+    the active (or named) layer. params: {layer?}."""
+    lh = vs.GetLayerByName(p['layer']) if p.get('layer') else vs.ActLayer()
+    origin = _nums(_safe(lambda: vs.GetGISOriginN()))
+    proj = _safe(lambda: vs.GetProjectionLocName(lh))
+    if isinstance(proj, (list, tuple)): proj = proj[-1]
+    return {'status': 'ok',
+            'origin_lat': (origin[0] if len(origin) >= 2 else None),
+            'origin_lon': (origin[1] if len(origin) >= 2 else None),
+            'angle_to_north': _safe(lambda: vs.GetAngleToNorth()),
+            'is_georeferenced': bool(_safe(lambda: vs.IsGeoreferenced(lh))),
+            'projection': proj,
+            'project_elevation': _safe(lambda: vs.GetProjectElevation())}
+
+def get_projection(p):
+    """Projection of a layer as WKT + Proj4. params: {layer?, esri_style(bool)}."""
+    lh = vs.GetLayerByName(p['layer']) if p.get('layer') else vs.ActLayer()
+    esri = bool(p.get('esri_style', False))
+    def _sv(r):
+        if isinstance(r, (list, tuple)): return r[-1]
+        return r
+    return {'status': 'ok',
+            'name': _sv(_safe(lambda: vs.GetProjectionLocName(lh))),
+            'wkt': _sv(_safe(lambda: vs.GetProjectionWKT(lh, esri))),
+            'proj4': _sv(_safe(lambda: vs.GetProjectionProj4(lh, esri)))}
+
+def set_document_georef(p):
+    """Georeference the document by EPSG code using the current user origin.
+    params: {epsg} (e.g. 25832 for ETRS89/UTM32N)."""
+    epsg = int(p.get('epsg', 0))
+    if not epsg: return {'error': 'epsg required (e.g. 25832)'}
+    vs.SetDocGeoRefByUsrOrg(epsg)
+    return {'status': 'ok', 'epsg': epsg}
+
+def get_poly_vertices(p):
+    """All vertices of a polygon/polyline as [[x,y],...]. params: {object_id}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    n = vs.GetVertNum(h)
+    verts = []
+    for i in range(1, int(n) + 1):
+        pt = vs.GetPolyPt(h, i)
+        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+            verts.append([pt[0], pt[1]])
+    return {'status': 'ok', 'count': int(n), 'vertices': verts,
+            'closed': bool(_safe(lambda: vs.IsPolyClosed(h)))}
+
+def set_poly_vertex(p):
+    """Move one vertex. params: {object_id, index (1-based), x, y}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    vs.SetPolyPt(h, int(p.get('index', 1)), float(p.get('x', 0)), float(p.get('y', 0)))
+    return {'status': 'ok'}
+
+def insert_poly_vertex(p):
+    """Insert a vertex. params: {object_id, x, y, before (1-based),
+    vertex_type (0=corner 1=bezier 2=cubic 3=arc), radius}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    vs.InsertVertex(h, float(p.get('x', 0)), float(p.get('y', 0)),
+                    int(p.get('before', 1)), int(p.get('vertex_type', 0)),
+                    float(p.get('radius', 0)))
+    return {'status': 'ok', 'count': int(vs.GetVertNum(h))}
+
+def delete_poly_vertex(p):
+    """Delete one vertex. params: {object_id, index (1-based)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    vs.DelVertex(h, int(p.get('index', 1)))
+    return {'status': 'ok', 'count': int(vs.GetVertNum(h))}
+
+def set_poly_closed(p):
+    """Open/close a polygon/polyline. params: {object_id, closed(bool)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    vs.SetPolyClosed(h, bool(p.get('closed', True)))
+    return {'status': 'ok', 'closed': bool(vs.IsPolyClosed(h))}
+
+def get_poly_holes(p):
+    """Openings (holes) of a polyline. params: {object_id}. Returns hole ids."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    n = _safe(lambda: vs.GetNumHoles(h))
+    if isinstance(n, (list, tuple)): n = n[-1] if n else 0
+    n = int(n or 0)
+    holes = []
+    for i in range(1, n + 1):
+        hh = _safe(lambda i=i: vs.GetHole(h, i))
+        if isinstance(hh, (list, tuple)): hh = hh[-1]
+        if hh: holes.append(_oid(hh))
+    return {'status': 'ok', 'count': n, 'holes': holes}
+
+
 # ── SDK enrichment 3: report worksheets, IFC deep, textures, doc defaults ───
 
 def _col_letter(i):
