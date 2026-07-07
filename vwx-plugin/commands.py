@@ -909,6 +909,324 @@ def polygonize(p):
     r = vs.Polygonize(h, float(p.get('segment_length', 10)), bool(p.get('straight', False)))
     return {'status': 'ok', 'object_id': _oid(r)}
 
+# ── SDK enrichment 2: architecture, lights, criteria, worksheets, text, edit ─
+
+def create_roof(p):
+    """Create a roof from a footprint. params: {edges:[{x,y,slope,projection,
+    eave_height},...], gable(bool), bearing_inset, thickness, miter_type(1..4),
+    vert_miter}. Edges in order around the footprint; slope in deg."""
+    edges = p.get('edges') or []
+    if len(edges) < 3: return {'error': 'need >=3 edges [{x,y,slope,projection,eave_height}]'}
+    roof = vs.CreateRoof(bool(p.get('gable', False)), float(p.get('bearing_inset', 0)),
+                         float(p.get('thickness', 200)), int(p.get('miter_type', 1)),
+                         float(p.get('vert_miter', 0)))
+    if not roof: return {'error': 'CreateRoof failed'}
+    for e in edges:
+        vs.AppendRoofEdge(roof, (float(e.get('x', 0)), float(e.get('y', 0))),
+                          float(e.get('slope', 30)), float(e.get('projection', 300)),
+                          float(e.get('eave_height', 2500)))
+    return {'status': 'ok', 'object_id': _oid(roof), 'edges': len(edges)}
+
+def create_slab(p):
+    """Create a slab from a closed 2D profile. params: {object_id} (profile consumed)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'profile not found'}
+    s = vs.CreateSlab(h)
+    if not s: return {'error': 'CreateSlab failed (profile must be closed 2D)'}
+    return {'status': 'ok', 'object_id': _oid(s)}
+
+def join_walls(p):
+    """Join two walls (T or L join). params: {wall_id_a, wall_id_b, mode(1=T,2=L),
+    capped(bool)}."""
+    a = _h(p.get('wall_id_a')); b = _h(p.get('wall_id_b'))
+    if not a or not b: return {'error': 'wall_id_a and wall_id_b required'}
+    ok = vs.JoinWalls(a, b, a, b, int(p.get('mode', 2)), bool(p.get('capped', True)), False)
+    return {'status': 'ok', 'joined': bool(ok)}
+
+def add_symbol_to_wall(p):
+    """Insert a symbol (door/window) into a wall. params: {wall_id, symbol_name,
+    offset (along wall), height, flip(bool), right(bool)}."""
+    w = _h(p.get('wall_id'))
+    if not w: return {'error': 'wall not found'}
+    if not p.get('symbol_name'): return {'error': 'symbol_name required'}
+    vs.AddSymToWall(w, float(p.get('offset', 0)), float(p.get('height', 0)),
+                    bool(p.get('flip', False)), bool(p.get('right', False)),
+                    p['symbol_name'])
+    return {'status': 'ok', 'object_id': _oid(vs.LNewObj())}
+
+def set_wall_style(p):
+    """Apply a wall style by name. params: {object_id, style}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'wall not found'}
+    ok = vs.SetWallStyle(h, p.get('style', ''), 0, 0)
+    return {'status': 'ok', 'applied': bool(ok)}
+
+def get_wall_style(p):
+    """Wall style name of a wall. params: {object_id}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'wall not found'}
+    return {'status': 'ok', 'style': vs.GetWallStyle(h)}
+
+def create_light(p):
+    """Create a light. params: {x,y,z, light_type(1=directional,2=point,3=spot),
+    on(bool), shadows(bool), brightness(0-100)}."""
+    lt = int(p.get('light_type', 2))
+    h = vs.CreateLight(float(p.get('x', 0)), float(p.get('y', 0)), float(p.get('z', 1000)),
+                       lt, bool(p.get('on', True)), bool(p.get('shadows', True)))
+    if not h: return {'error': 'CreateLight failed'}
+    if p.get('brightness') is not None:
+        vs.SetLightInfo(h, lt, int(p['brightness']), bool(p.get('on', True)),
+                        bool(p.get('shadows', True)))
+    return {'status': 'ok', 'object_id': _oid(h)}
+
+def set_light_info(p):
+    """Set light attributes. params: {object_id, light_type, brightness(0-100),
+    on(bool), shadows(bool)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'light not found'}
+    vs.SetLightInfo(h, int(p.get('light_type', 2)), int(p.get('brightness', 75)),
+                    bool(p.get('on', True)), bool(p.get('shadows', True)))
+    return {'status': 'ok'}
+
+def get_light_info(p):
+    """Light attributes. params: {object_id}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'light not found'}
+    r = vs.GetLightInfo(h)
+    try:
+        return {'status': 'ok', 'light_type': r[0], 'brightness': r[1],
+                'on': bool(r[2]), 'shadows': bool(r[3])}
+    except Exception:
+        return {'status': 'ok', 'info': r}
+
+def criteria_count(p):
+    """Count objects matching a VW criteria string, e.g. "(T=RECT)" or
+    "(L='Layer-1')" or "((R IN ['Baumkataster']))". params: {criteria}."""
+    c = p.get('criteria')
+    if not c: return {'error': 'criteria required'}
+    return {'status': 'ok', 'count': vs.Count(c)}
+
+def select_by_criteria(p):
+    """Select all objects matching a criteria string. params: {criteria}.
+    Returns how many are selected afterwards."""
+    c = p.get('criteria')
+    if not c: return {'error': 'criteria required'}
+    vs.SelectObj(c)
+    return {'status': 'ok', 'selected': vs.NumSelectedObjects()}
+
+def deselect_by_criteria(p):
+    """Deselect all objects matching a criteria string. params: {criteria}."""
+    c = p.get('criteria')
+    if not c: return {'error': 'criteria required'}
+    vs.DSelectObj(c)
+    return {'status': 'ok', 'selected': vs.NumSelectedObjects()}
+
+def eval_expression(p):
+    """Evaluate a worksheet-style expression on ONE object, e.g. 'AREA',
+    'PERIM', a record field "('Rec'.'Field')". params: {object_id, expression,
+    as_string(bool)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    expr = p.get('expression')
+    if not expr: return {'error': 'expression required'}
+    if p.get('as_string'):
+        return {'status': 'ok', 'value': vs.EvalStr(h, expr)}
+    return {'status': 'ok', 'value': vs.Eval(h, expr)}
+
+def _ws(p):
+    name = p.get('worksheet') or p.get('name')
+    h = vs.GetObject(name) if name else None
+    return h
+
+def get_worksheet_cell(p):
+    """Displayed string + numeric value of one worksheet cell.
+    params: {worksheet(name), row, column} (1-based)."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r, c = int(p.get('row', 1)), int(p.get('column', 1))
+    return {'status': 'ok', 'text': vs.GetWSCellString(ws, r, c),
+            'value': _safe(lambda: vs.GetWSCellValue(ws, r, c))}
+
+def get_worksheet_size(p):
+    """(rows, columns) of a worksheet. params: {worksheet(name)}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    r = vs.GetWSRowColumnCount(ws)
+    try:
+        return {'status': 'ok', 'rows': r[0], 'columns': r[1]}
+    except Exception:
+        return {'status': 'ok', 'size': r}
+
+def insert_worksheet_rows(p):
+    """Insert rows. params: {worksheet(name), before_row, count}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    vs.InsertWSRows(ws, int(p.get('before_row', 1)), int(p.get('count', 1)))
+    return {'status': 'ok'}
+
+def delete_worksheet_rows(p):
+    """Delete rows. params: {worksheet(name), start_row, count}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    vs.DeleteWSRows(ws, int(p.get('start_row', 1)), int(p.get('count', 1)))
+    return {'status': 'ok'}
+
+def insert_worksheet_columns(p):
+    """Insert columns. params: {worksheet(name), before_column, count}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    vs.InsertWSColumns(ws, int(p.get('before_column', 1)), int(p.get('count', 1)))
+    return {'status': 'ok'}
+
+def set_worksheet_column_width(p):
+    """Set column width(s). params: {worksheet(name), from_column, to_column, width}."""
+    ws = _ws(p)
+    if not ws: return {'error': 'worksheet not found (by name)'}
+    fc = int(p.get('from_column', 1))
+    vs.SetWSColumnWidth(ws, fc, int(p.get('to_column', fc)), int(p.get('width', 80)))
+    return {'status': 'ok'}
+
+def get_text(p):
+    """Content of a text object. params: {object_id}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'text object not found'}
+    return {'status': 'ok', 'text': vs.GetText(h)}
+
+def set_text(p):
+    """Replace content of a text object. params: {object_id, text}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'text object not found'}
+    vs.SetText(h, p.get('text', ''))
+    return {'status': 'ok'}
+
+def set_text_size_all(p):
+    """Set font size of the WHOLE text object. params: {object_id, size(pt)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'text object not found'}
+    n = vs.GetTextLength(h)
+    vs.SetTextSize(h, 0, n, float(p.get('size', 12)))
+    return {'status': 'ok', 'chars': n}
+
+def convert_to_polygon(p):
+    """Convert any 2D object to a polygon (arcs tessellated). params:
+    {object_id, resolution (segments per arc, default 32)}. Original untouched."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    r = vs.ConvertToPolygon(h, int(p.get('resolution', 32)))
+    return {'status': 'ok', 'object_id': _oid(r)}
+
+def convert_to_polyline(p):
+    """Convert a 2D object to a polyline (arcs preserved as arc vertices).
+    params: {object_id}. Original untouched."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    r = vs.MakePolyline(h)
+    return {'status': 'ok', 'object_id': _oid(r)}
+
+def set_stacking_order(p):
+    """Move object in the drawing stacking order. params: {object_id,
+    action: 'front'|'forward'|'backward'|'back'}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    a = p.get('action', 'front')
+    if a in ('front', 'forward'): vs.HMoveForward(h, a == 'front')
+    elif a in ('back', 'backward'): vs.HMoveBackward(h, a == 'back')
+    else: return {'error': "action must be front|forward|backward|back"}
+    return {'status': 'ok'}
+
+def move_object_3d(p):
+    """Move an object in 3D by a delta. params: {object_id, dx, dy, dz}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    vs.Move3DObj(h, float(p.get('dx', 0)), float(p.get('dy', 0)), float(p.get('dz', 0)))
+    return {'status': 'ok', 'object_id': p.get('object_id')}
+
+def create_shell(p):
+    """Thicken a NURBS surface into a shelled solid. params: {object_id, thickness}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'NURBS surface not found'}
+    s = vs.CreateShell(h, float(p.get('thickness', 10)))
+    if not s: return {'error': 'CreateShell failed (input must be a NURBS surface)'}
+    return {'status': 'ok', 'object_id': _oid(s)}
+
+def revolve_with_rail(p):
+    """Revolve a profile around an axis, optionally following a rail curve.
+    params: {profile_id, rail_id, axis_id} (axis = a line defining the axis)."""
+    prof = _h(p.get('profile_id')); rail = _h(p.get('rail_id')); axis = _h(p.get('axis_id'))
+    if not prof or not axis: return {'error': 'profile_id and axis_id required'}
+    s = vs.RevolveWithRail(prof, rail if rail else prof, axis)
+    if not s: return {'error': 'RevolveWithRail produced nothing (check geometry planes)'}
+    return {'status': 'ok', 'object_id': _oid(s)}
+
+def offset_nurbs(p):
+    """Offset a NURBS curve/surface by a distance. params: {object_id, distance}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'NURBS object not found'}
+    r = vs.CreateOffsetNurbsObjectHandle(h, float(p.get('distance', 10)))
+    if not r: return {'error': 'offset failed (not a NURBS object?)'}
+    return {'status': 'ok', 'object_id': _oid(r)}
+
+def extend_nurbs_curve(p):
+    """Extend a NURBS curve at start or end. params: {object_id, distance,
+    at_start(bool), linear(bool)}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'NURBS curve not found'}
+    r = vs.ExtendNurbsCurve(h, float(p.get('distance', 50)),
+                            bool(p.get('at_start', False)), bool(p.get('linear', True)))
+    return {'status': 'ok', 'object_id': _oid(r if r else h)}
+
+def set_layer_elevation(p):
+    """Set base elevation (Z) + thickness (deltaZ) of a design layer.
+    params: {layer(name), elevation, thickness}."""
+    h = vs.GetLayerByName(p.get('layer', ''))
+    if not h: return {'error': 'layer not found'}
+    vs.SetLayerElevation(h, float(p.get('elevation', 0)), float(p.get('thickness', 0)))
+    return {'status': 'ok'}
+
+def get_layer_elevation(p):
+    """Base elevation + thickness of a design layer. params: {layer(name)}."""
+    h = vs.GetLayerByName(p.get('layer', ''))
+    if not h: return {'error': 'layer not found'}
+    r = vs.GetLayerElevation(h)
+    try:
+        return {'status': 'ok', 'elevation': r[0], 'thickness': r[1]}
+    except Exception:
+        return {'status': 'ok', 'raw': r}
+
+def set_view_angles(p):
+    """Set the 3D view by rotation angles + offset (like the flyover tool).
+    params: {x_angle, y_angle, z_angle, dx, dy, dz} (deg / doc units)."""
+    vs.SetView(float(p.get('x_angle', -60)), float(p.get('y_angle', 0)),
+               float(p.get('z_angle', -15)), float(p.get('dx', 0)),
+               float(p.get('dy', 0)), float(p.get('dz', 0)))
+    return {'status': 'ok'}
+
+def get_object_metrics(p):
+    """Area + perimeter of a 2D object (doc units). params: {object_id}."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'object not found'}
+    return {'status': 'ok', 'area': _safe(lambda: vs.HArea(h)),
+            'perimeter': _safe(lambda: vs.HPerim(h))}
+
+def get_document_units(p):
+    """Current document unit settings (raw GetUnits tuple: fraction, display,
+    format, upi, unit name, square unit name)."""
+    r = vs.GetUnits()
+    try:
+        return {'status': 'ok', 'fraction': r[0], 'display': r[1], 'format': r[2],
+                'units_per_inch': r[3], 'name': r[4], 'square_name': r[5]}
+    except Exception:
+        return {'status': 'ok', 'raw': r}
+
+def set_projection(p):
+    """Set projection/render of the active view. params: {projection
+    (0=orthogonal 1=perspective 2=... VW codes), render_mode (0=wireframe,
+    4=? — VW codes), view_distance, clip1, clip2}. Uses vs.Projection."""
+    vs.Projection(int(p.get('projection', 0)), int(p.get('render_mode', 0)),
+                  float(p.get('view_distance', 0)), float(p.get('clip1', 0)),
+                  float(p.get('clip2', 0)))
+    return {'status': 'ok'}
+
 def boolean_operation(p):
     h1 = _h(p.get('object_id_a'))
     h2 = _h(p.get('object_id_b'))

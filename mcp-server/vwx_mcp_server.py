@@ -352,7 +352,16 @@ mcp = FastMCP(
         "(2) `vwx(command, params)` generic dispatcher — reaches every function "
         "in the bridge's commands.py (use `list_commands` to discover); "
         "(3) `execute_script` for arbitrary vs.* Python. "
-        "Object IDs are UUIDs (strings) returned by vs.GetObjectUuid."
+        "Conventions: object IDs are UUID strings (vs.GetObjectUuid); "
+        "coordinates/distances are in DOCUMENT units (check get_document_units), "
+        "y grows up, angles in degrees; results are JSON with either "
+        "{status:'ok', ...} or {error:'...'}. "
+        "Speed: use `vwx_batch` for many calls in one round-trip. "
+        "Accuracy: call `vs_signature(name)` BEFORE writing execute_script "
+        "bodies — the knowledge index has the exact signature of all 3071 vs.* "
+        "functions, so scripts run right the first time. "
+        "Criteria strings power bulk ops: criteria_count / select_by_criteria / "
+        "for_each_criteria with e.g. \"(T=RECT)\" or \"(L='Layer-1')\"."
     ),
     lifespan=server_lifespan,
 )
@@ -1378,6 +1387,215 @@ def three_point_center(ctx: Context, p1: List[float], p2: List[float], p3: List[
 def polygon_area_at_point(ctx: Context, x: float = 0, y: float = 0) -> str:
     """Area of the smallest bounded polygon surrounding a point (paint-bucket measure)."""
     return cmd("polygon_area_at_point", {"x": x, "y": y})
+
+# ── SDK enrichment 2: architecture, lights, criteria, worksheets, text, edit ─
+
+@vtool
+def create_roof(ctx: Context, edges: List[Dict[str, Any]], gable: bool = False,
+                bearing_inset: float = 0, thickness: float = 200,
+                miter_type: int = 1, vert_miter: float = 0) -> str:
+    """Create a roof from a footprint. edges=[{x,y,slope,projection,eave_height},...]
+    in order around the footprint; slope deg, distances in doc units."""
+    return cmd("create_roof", {"edges": edges, "gable": gable, "bearing_inset": bearing_inset,
+                               "thickness": thickness, "miter_type": miter_type, "vert_miter": vert_miter})
+
+@vtool
+def create_slab(ctx: Context, object_id: str) -> str:
+    """Create a slab from a closed 2D profile object (profile is consumed)."""
+    return cmd("create_slab", {"object_id": object_id})
+
+@vtool
+def join_walls(ctx: Context, wall_id_a: str, wall_id_b: str, mode: int = 2, capped: bool = True) -> str:
+    """Join two walls. mode: 1=T-join, 2=L-join."""
+    return cmd("join_walls", {"wall_id_a": wall_id_a, "wall_id_b": wall_id_b, "mode": mode, "capped": capped})
+
+@vtool
+def add_symbol_to_wall(ctx: Context, wall_id: str, symbol_name: str, offset: float = 0,
+                       height: float = 0, flip: bool = False, right: bool = False) -> str:
+    """Insert a symbol (door/window) into a wall at offset along the wall."""
+    return cmd("add_symbol_to_wall", {"wall_id": wall_id, "symbol_name": symbol_name,
+                                      "offset": offset, "height": height, "flip": flip, "right": right})
+
+@vtool
+def set_wall_style(ctx: Context, object_id: str, style: str) -> str:
+    """Apply a wall style (by resource name) to a wall."""
+    return cmd("set_wall_style", {"object_id": object_id, "style": style})
+
+@vtool
+def get_wall_style(ctx: Context, object_id: str) -> str:
+    """Wall style name of a wall."""
+    return cmd("get_wall_style", {"object_id": object_id})
+
+@vtool
+def create_light(ctx: Context, x: float = 0, y: float = 0, z: float = 1000,
+                 light_type: int = 2, on: bool = True, shadows: bool = True,
+                 brightness: Optional[int] = None) -> str:
+    """Create a light source. light_type: 1=directional, 2=point, 3=spot. brightness 0-100."""
+    p = {"x": x, "y": y, "z": z, "light_type": light_type, "on": on, "shadows": shadows}
+    if brightness is not None: p["brightness"] = brightness
+    return cmd("create_light", p)
+
+@vtool
+def set_light_info(ctx: Context, object_id: str, light_type: int = 2, brightness: int = 75,
+                   on: bool = True, shadows: bool = True) -> str:
+    """Set light attributes (type, brightness 0-100, on, shadows)."""
+    return cmd("set_light_info", {"object_id": object_id, "light_type": light_type,
+                                  "brightness": brightness, "on": on, "shadows": shadows})
+
+@vtool
+def get_light_info(ctx: Context, object_id: str) -> str:
+    """Light attributes: type, brightness, on, shadows."""
+    return cmd("get_light_info", {"object_id": object_id})
+
+@vtool
+def criteria_count(ctx: Context, criteria: str) -> str:
+    """Count objects matching a VW criteria string, e.g. "(T=RECT)",
+    "(L=\'Layer-1\')", "((R IN [\'Baumkataster\']))". Fast server-side count."""
+    return cmd("criteria_count", {"criteria": criteria})
+
+@vtool
+def select_by_criteria(ctx: Context, criteria: str) -> str:
+    """Select all objects matching a criteria string; returns resulting selection count."""
+    return cmd("select_by_criteria", {"criteria": criteria})
+
+@vtool
+def deselect_by_criteria(ctx: Context, criteria: str) -> str:
+    """Deselect all objects matching a criteria string."""
+    return cmd("deselect_by_criteria", {"criteria": criteria})
+
+@vtool
+def eval_expression(ctx: Context, object_id: str, expression: str, as_string: bool = False) -> str:
+    """Evaluate a worksheet expression on ONE object: AREA, PERIM, VOLUME,
+    a record field ('Rec'.'Field') etc. as_string=True for text values."""
+    return cmd("eval_expression", {"object_id": object_id, "expression": expression, "as_string": as_string})
+
+@vtool
+def get_worksheet_cell(ctx: Context, worksheet: str, row: int, column: int) -> str:
+    """Displayed string + numeric value of one worksheet cell (1-based row/column)."""
+    return cmd("get_worksheet_cell", {"worksheet": worksheet, "row": row, "column": column})
+
+@vtool
+def get_worksheet_size(ctx: Context, worksheet: str) -> str:
+    """Row + column count of a worksheet (by name)."""
+    return cmd("get_worksheet_size", {"worksheet": worksheet})
+
+@vtool
+def insert_worksheet_rows(ctx: Context, worksheet: str, before_row: int = 1, count: int = 1) -> str:
+    """Insert rows into a worksheet."""
+    return cmd("insert_worksheet_rows", {"worksheet": worksheet, "before_row": before_row, "count": count})
+
+@vtool
+def delete_worksheet_rows(ctx: Context, worksheet: str, start_row: int = 1, count: int = 1) -> str:
+    """Delete rows from a worksheet."""
+    return cmd("delete_worksheet_rows", {"worksheet": worksheet, "start_row": start_row, "count": count})
+
+@vtool
+def insert_worksheet_columns(ctx: Context, worksheet: str, before_column: int = 1, count: int = 1) -> str:
+    """Insert columns into a worksheet."""
+    return cmd("insert_worksheet_columns", {"worksheet": worksheet, "before_column": before_column, "count": count})
+
+@vtool
+def set_worksheet_column_width(ctx: Context, worksheet: str, from_column: int, width: int,
+                               to_column: Optional[int] = None) -> str:
+    """Set worksheet column width(s) in pixels."""
+    p = {"worksheet": worksheet, "from_column": from_column, "width": width}
+    if to_column is not None: p["to_column"] = to_column
+    return cmd("set_worksheet_column_width", p)
+
+@vtool
+def get_text(ctx: Context, object_id: str) -> str:
+    """Text content of a text object."""
+    return cmd("get_text", {"object_id": object_id})
+
+@vtool
+def set_text(ctx: Context, object_id: str, text: str) -> str:
+    """Replace the content of a text object."""
+    return cmd("set_text", {"object_id": object_id, "text": text})
+
+@vtool
+def set_text_size_all(ctx: Context, object_id: str, size: float = 12) -> str:
+    """Set the font size (pt) of the whole text object."""
+    return cmd("set_text_size_all", {"object_id": object_id, "size": size})
+
+@vtool
+def convert_to_polygon(ctx: Context, object_id: str, resolution: int = 32) -> str:
+    """Convert a 2D object to a polygon (arcs tessellated at resolution). Original kept."""
+    return cmd("convert_to_polygon", {"object_id": object_id, "resolution": resolution})
+
+@vtool
+def convert_to_polyline(ctx: Context, object_id: str) -> str:
+    """Convert a 2D object to a polyline (arcs preserved). Original kept."""
+    return cmd("convert_to_polyline", {"object_id": object_id})
+
+@vtool
+def set_stacking_order(ctx: Context, object_id: str, action: str = "front") -> str:
+    """Move object in stacking order: front | forward | backward | back."""
+    return cmd("set_stacking_order", {"object_id": object_id, "action": action})
+
+@vtool
+def move_object_3d(ctx: Context, object_id: str, dx: float = 0, dy: float = 0, dz: float = 0) -> str:
+    """Move an object by a 3D delta (dz lifts it in Z)."""
+    return cmd("move_object_3d", {"object_id": object_id, "dx": dx, "dy": dy, "dz": dz})
+
+@vtool
+def create_shell(ctx: Context, object_id: str, thickness: float = 10) -> str:
+    """Thicken a NURBS surface into a shelled solid."""
+    return cmd("create_shell", {"object_id": object_id, "thickness": thickness})
+
+@vtool
+def revolve_with_rail(ctx: Context, profile_id: str, axis_id: str, rail_id: Optional[str] = None) -> str:
+    """Revolve a profile around an axis line (optionally following a rail curve).
+    Geometry-sensitive: degenerate setups return a clear error instead of a solid."""
+    p = {"profile_id": profile_id, "axis_id": axis_id}
+    if rail_id: p["rail_id"] = rail_id
+    return cmd("revolve_with_rail", p)
+
+@vtool
+def offset_nurbs(ctx: Context, object_id: str, distance: float = 10) -> str:
+    """Offset a NURBS curve/surface by a distance."""
+    return cmd("offset_nurbs", {"object_id": object_id, "distance": distance})
+
+@vtool
+def extend_nurbs_curve(ctx: Context, object_id: str, distance: float = 50,
+                       at_start: bool = False, linear: bool = True) -> str:
+    """Extend a NURBS curve at start or end by a distance."""
+    return cmd("extend_nurbs_curve", {"object_id": object_id, "distance": distance,
+                                      "at_start": at_start, "linear": linear})
+
+@vtool
+def set_layer_elevation(ctx: Context, layer: str, elevation: float = 0, thickness: float = 0) -> str:
+    """Set base elevation (Z) + thickness (deltaZ) of a design layer."""
+    return cmd("set_layer_elevation", {"layer": layer, "elevation": elevation, "thickness": thickness})
+
+@vtool
+def get_layer_elevation(ctx: Context, layer: str) -> str:
+    """Base elevation + thickness of a design layer."""
+    return cmd("get_layer_elevation", {"layer": layer})
+
+@vtool
+def set_view_angles(ctx: Context, x_angle: float = -60, y_angle: float = 0, z_angle: float = -15,
+                    dx: float = 0, dy: float = 0, dz: float = 0) -> str:
+    """Set the 3D view by rotation angles (deg) + offset — like the flyover tool."""
+    return cmd("set_view_angles", {"x_angle": x_angle, "y_angle": y_angle, "z_angle": z_angle,
+                                   "dx": dx, "dy": dy, "dz": dz})
+
+@vtool
+def get_object_metrics(ctx: Context, object_id: str) -> str:
+    """Area + perimeter of a 2D object in document units."""
+    return cmd("get_object_metrics", {"object_id": object_id})
+
+@vtool
+def get_document_units(ctx: Context) -> str:
+    """Current document unit settings (name, units-per-inch, precision flags)."""
+    return cmd("get_document_units")
+
+@vtool
+def set_projection(ctx: Context, projection: int = 0, render_mode: int = 0,
+                   view_distance: float = 0, clip1: float = 0, clip2: float = 0) -> str:
+    """Set view projection (0=orthogonal, 1=perspective; VW codes) + render mode code."""
+    return cmd("set_projection", {"projection": projection, "render_mode": render_mode,
+                                  "view_distance": view_distance, "clip1": clip1, "clip2": clip2})
+
 
 
 

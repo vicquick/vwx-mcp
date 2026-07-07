@@ -419,7 +419,14 @@ static bool WindowTextContainsError(HWND dlg)
 			if ( wcsstr( buf, L"Script-Fehler" ) || wcsstr( buf, L"Traceback" ) ||
 			     wcsstr( buf, L"Script Error" )  || wcsstr( buf, L"Marionette" ) ||
 			     wcsstr( buf, L"Handle variable is NIL" ) ||
-			     wcsstr( buf, L"Invalid number of parameters" ) ) {
+			     wcsstr( buf, L"Invalid number of parameters" ) ||
+			     // VW compile/runtime error dialog ("Beim Kompilieren bzw.
+			     // Ausführen des Scripts ist ein Fehler aufgetreten …
+			     // Error Output anzeigen"). Seen when a vs.* call errors at
+			     // the ENGINE level (bad geometry args) rather than in Python.
+			     wcsstr( buf, L"Beim Kompilieren" ) ||
+			     wcsstr( buf, L"Error Output" ) ||
+			     wcsstr( buf, L"error occurred while compiling" ) ) {
 				((C*) lp)->hit = true;
 				return FALSE;
 			}
