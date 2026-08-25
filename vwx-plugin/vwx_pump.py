@@ -31,18 +31,41 @@ IPC layout (plugin dir):
 """
 import os, sys, json, time, traceback
 
+def _vw_roots():
+    """Vectorworks plug-in roots for every installed major version, newest first.
+
+    The version used to be the literal '2026'. Nothing in this file is
+    version-specific, and the failure mode on a new Vectorworks was silent —
+    the path simply did not exist and every job timed out with no explanation.
+    """
+    root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
+                        'Vectorworks')
+    forced = os.environ.get('VWX_VW_VERSION')
+    versions = [forced] if forced else []
+    if not versions:
+        try:
+            versions = sorted((d for d in os.listdir(root)
+                               if len(d) == 4 and d.isdigit()), reverse=True)
+        except Exception:
+            versions = []
+    return [os.path.join(root, v, 'Plug-ins') for v in versions]
+
+
 try:
     _DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:                      # VW runs scripts as <string>
-    _base = os.path.join(os.environ.get('APPDATA', ''),
-                         'Nemetschek', 'Vectorworks', '2026', 'Plug-ins')
-    for _name in ('VW-MCP', 'VWX-MCP'):
-        _cand = os.path.join(_base, _name)
-        if os.path.isdir(_cand):
-            _DIR = _cand
+    _DIR = None
+    for _base in _vw_roots():
+        for _name in ('VW-MCP', 'VWX-MCP'):
+            _cand = os.path.join(_base, _name)
+            if os.path.isdir(_cand):
+                _DIR = _cand
+                break
+        if _DIR:
             break
-    else:
-        _DIR = os.path.join(_base, 'VW-MCP')
+    if _DIR is None:
+        _roots = _vw_roots()
+        _DIR = os.path.join(_roots[0] if _roots else '', 'VW-MCP')
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
@@ -77,7 +100,43 @@ def _log(msg):
         pass
 
 
+_MANIFEST = os.path.join(_IPC, 'readonly.json')
+_manifest_names = None
+_manifest_mtime = None
+
+
+def _readonly_manifest():
+    """Read-only command names as classified by the MCP server, if it said.
+
+    The prefix rule below is a convention with nothing enforcing it: a command
+    named get_or_create_layer would mutate the document from the OnIdle
+    notification context, which is verified to crash Vectorworks. The server
+    knows the real classification (it annotates every tool with readOnlyHint)
+    and writes it here at startup, so the two sides stop guessing separately.
+    Absent or unreadable manifest falls back to the prefixes — the pump must
+    keep working when only the plugin has been redeployed.
+    """
+    global _manifest_names, _manifest_mtime
+    try:
+        mt = os.path.getmtime(_MANIFEST)
+    except Exception:
+        return None
+    if mt != _manifest_mtime:
+        try:
+            with open(_MANIFEST, 'r', encoding='utf-8') as f:
+                _manifest_names = frozenset(json.load(f))
+            _manifest_mtime = mt
+            _log("readonly manifest: %d names" % len(_manifest_names))
+        except Exception as e:
+            _log("readonly manifest unreadable (%s) — using prefixes" % e)
+            return None
+    return _manifest_names
+
+
 def _is_readonly(cmd):
+    names = _readonly_manifest()
+    if names is not None:
+        return cmd in names
     return cmd in _RO_NAMES or cmd.startswith(_RO_PREFIXES)
 
 
@@ -123,18 +182,36 @@ def _list_jobs():
         return []
 
 
+_peek_cache = {}
+
+
 def _peek_cmd(fn):
-    """Read a job's command name WITHOUT claiming it."""
+    """Read a job's command name WITHOUT claiming it.
+
+    Cached by filename. Job files are written once under a unique
+    <timestamp>-<cid> name and never rewritten, so the answer cannot go stale.
+    Without the cache the read-only drain re-read every queued mutation job
+    from disk on every OnIdle notification — many times a second while a write
+    waits for the accelerator hop.
+    """
+    hit = _peek_cache.get(fn)
+    if hit is not None:
+        return hit
     try:
         with open(os.path.join(_JOBS, fn), 'r', encoding='utf-8') as f:
-            return json.load(f).get('type', '')
+            cmd = json.load(f).get('type', '')
     except Exception:
         return None
+    if len(_peek_cache) > 512:          # bounded: a stuck queue must not grow it forever
+        _peek_cache.clear()
+    _peek_cache[fn] = cmd
+    return cmd
 
 
 def _claim_and_run(fn):
     src  = os.path.join(_JOBS, fn)
     work = src + '.working'
+    _peek_cache.pop(fn, None)
     try:
         os.replace(src, work)           # atomic claim
     except Exception:
@@ -171,18 +248,37 @@ def _claim_and_run(fn):
     return True
 
 
+SWEEP_EVERY = 60.0           # how often the TTL sweep is allowed to run
+_last_sweep = 0.0
+_dirs_ready = False
+
+
 def _housekeep():
-    for d in (_JOBS, _RESULTS):
-        try:
-            os.makedirs(d, exist_ok=True)
-        except Exception:
-            pass
+    """Cheap per-drain work only. The expensive sweep runs on a timer.
+
+    This used to stat every file in the results directory on EVERY pump call —
+    an O(n) scan paying full price on each trigger cycle even though the TTL
+    cleanup only needs to happen rarely. On a long session with orphaned
+    results that scan grew without bound and was charged to the latency of
+    every single tool call.
+    """
+    global _last_sweep, _dirs_ready
+    if not _dirs_ready:
+        for d in (_JOBS, _RESULTS):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception:
+                pass
+        _dirs_ready = True
     try:
         with open(_STAMP, 'w') as f:
             f.write(str(time.time()))
     except Exception:
         pass
     now = time.time()
+    if now - _last_sweep < SWEEP_EVERY:
+        return
+    _last_sweep = now
     try:
         for fn in os.listdir(_RESULTS):
             p = os.path.join(_RESULTS, fn)
@@ -209,12 +305,22 @@ def pump_all():
     _housekeep()
     _log("pump_all: genuine dispatch — draining everything")
     done = 0
-    while True:
+    # Re-list only after a pass that actually ran something: a job arriving
+    # mid-drain still gets picked up, but a pass that claimed nothing ends the
+    # loop instead of spinning on directory enumerations. The pass cap is a
+    # backstop against a job that can neither be claimed nor removed, which
+    # would otherwise wedge this loop inside VW's command dispatch — the one
+    # context where a hang is most visible to the user.
+    for _pass in range(64):
         jobs = _list_jobs()
         if not jobs:
             break
+        ran = 0
         for fn in jobs:
             if _claim_and_run(fn):
-                done += 1
+                ran += 1
+        done += ran
+        if ran == 0:
+            break
     if done:
         _log("pump_all done: %d job(s)" % done)

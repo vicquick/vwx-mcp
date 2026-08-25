@@ -11,19 +11,43 @@ if %errorlevel% neq 0 (
   exit /b
 )
 
-set "SRC=%USERPROFILE%\Documents\vwx-mcp-work\vwx-mcp\native\Output\Release"
-set "DST=C:\Program Files\Vectorworks 2026\Plug-ins"
+REM Build output sits next to this script in the repo — deriving it keeps the
+REM script working from any clone (and keeps a developer's home directory out
+REM of a public repository).
+set "SRC=%~dp0..\native\Output\Release"
+
+REM Vectorworks major version was hardcoded as 2026 here, in the deploy target
+REM AND in the process name below. The process-name copy is the dangerous one:
+REM on any other version the "wait for VW to close" guard silently never
+REM matches, reports success, and the copy then fails on a DLL still locked by
+REM a running Vectorworks. Discover the newest installed version instead;
+REM override with VWX_VW_VERSION.
+set "VWVER=%VWX_VW_VERSION%"
+if not defined VWVER (
+  for /f "delims=" %%D in ('dir /b /ad /o-n "C:\Program Files\Vectorworks *" 2^>nul') do (
+    if not defined VWVER for /f "tokens=2" %%V in ("%%D") do set "VWVER=%%V"
+  )
+)
+if not defined VWVER (
+  echo   No "C:\Program Files\Vectorworks ^<year^>" install found.
+  echo   Set VWX_VW_VERSION=2026 ^(or your version^) and rerun.
+  pause
+  exit /b 1
+)
+set "DST=C:\Program Files\Vectorworks %VWVER%\Plug-ins"
+set "VWEXE=Vectorworks%VWVER%.exe"
+echo Target: Vectorworks %VWVER%
 
 echo Waiting for Vectorworks to exit completely (up to 60 s)...
 set /a tries=0
 :waitloop
-tasklist /FI "IMAGENAME eq Vectorworks2026.exe" | find /I "Vectorworks2026.exe" >nul
+tasklist /FI "IMAGENAME eq %VWEXE%" | find /I "%VWEXE%" >nul
 if %errorlevel% neq 0 goto :vwclosed
 set /a tries+=1
 if %tries% geq 30 (
   echo.
   echo   Vectorworks is STILL RUNNING after 60 s. Close it completely
-  echo   ^(check Task Manager for lingering Vectorworks2026.exe^) and rerun.
+  echo   ^(check Task Manager for lingering %VWEXE%^) and rerun.
   echo.
   pause
   exit /b 1
@@ -39,6 +63,16 @@ for %%F in ("%SRC%\VwxBridge.vlb") do echo   %%~tF  %%~zF bytes  %%F
 
 copy /Y "%SRC%\VwxBridge.vlb" "%DST%\" || goto :fail
 copy /Y "%SRC%\VwxBridge.vwr" "%DST%\" || goto :fail
+
+REM Vectorworks credentials file, if one has been issued. It must sit beside the
+REM plug-in it covers, and without it VW shows the "Unknown Developer Plug-ins"
+REM dialog at every launch. Optional: absent until Vectorworks returns the .vst
+REM for the request in native\CredentialsVwxMcp.json — see docs\PLUGIN_CREDENTIALS.md.
+if exist "%~dp0..\native\Credentials*.vst" (
+  copy /Y "%~dp0..\native\Credentials*.vst" "%DST%\" >nul && echo   credentials file deployed
+) else (
+  echo   no credentials file ^(expect the "Unbekannte Entwickler-Plug-ins" dialog^)
+)
 
 REM verify: deployed size must equal source size
 for %%F in ("%SRC%\VwxBridge.vlb") do set "SRCSIZE=%%~zF"
@@ -63,7 +97,7 @@ exit /b 0
 :fail
 echo.
 echo   COPY FAILED (error %errorlevel%). Is Vectorworks really closed?
-echo   (The .vlb stays DLL-locked until every Vectorworks2026.exe is gone.)
+echo   (The .vlb stays DLL-locked until every %VWEXE% is gone.)
 echo.
 pause
 exit /b 1

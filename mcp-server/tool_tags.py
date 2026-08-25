@@ -187,6 +187,10 @@ TOOL_TAGS = {
     "vwx_batch": "escape",
     "list_commands": "escape",
     "vs_signature": "escape",
+    "set_toolset": "escape",
+    # Visual verification belongs to every workflow — a planting plan, a GIS
+    # sheet and a solid model all need someone to look at the result.
+    "screenshot": "escape",
     "vs_index_stats": "escape",
     "create_roof": "bim",
     "create_slab": "bim",
@@ -293,8 +297,13 @@ PRESETS = {
     "full": None,  # sentinel: enable everything
     "gis": {"query", "layers", "classes", "appearance", "io", "geo",
             "records", "document", "escape"},
+    # 'escape' carries the three access layers themselves — vwx, vwx_batch,
+    # list_commands, vs_signature, execute_script, set_toolset. A preset that
+    # drops it strands the agent with only the explicit verbs and no way back,
+    # including no way to call set_toolset to undo the filter. It must be in
+    # every preset.
     "modeling": {"draw2d", "draw3d", "manipulate", "bim", "symbols",
-                 "appearance", "query", "document", "view"},
+                 "appearance", "query", "document", "view", "escape"},
     "baumkataster": {"landscape", "records", "query", "layers", "document",
                      "io", "escape"},
     "minimal": {"document", "query", "escape"},

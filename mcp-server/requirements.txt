@@ -1,2 +1,19 @@
 # vwx-mcp server deps. Migrated to standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md).
-fastmcp==3.4.2
+#
+# 3.4.3-3.4.7 are security and hardening only — a NAT64 SSRF bypass, DNS-
+# rebinding protection on streamable HTTP, unsafe OAuth redirect schemes, JWKS
+# Ed25519 handling. Exposure is low on a loopback listener, but the pin costs
+# nothing to move.
+#
+# Deliberately NOT on 4.x. FastMCP 4.0 is still beta (4.0.0b3, no GA date): it
+# moves to MCP SDK v2 and the 2026-07-28 stateless spec, replaces the Docket
+# tasks extra with a `fastmcp-tasks` package, and changes output-schema
+# handling — which is exactly where the `output_schema=None` workaround in
+# vtool() lives. Revisit when 4.0.0 final ships, and re-verify tools/list emits
+# no outputSchema before shipping it.
+fastmcp==3.4.7
+
+# Window capture for the `screenshot` tool: PNG encoding and a quality
+# downscale. Vectorworks has no headless render-to-file API, so visual
+# verification is a Win32 window capture done server-side.
+pillow>=11.0
