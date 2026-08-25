@@ -25,15 +25,32 @@ import os, sys, socket, threading, queue, json, traceback, time
 try:
     _DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
-    _base = os.path.join(os.environ.get('APPDATA', ''),
-                         'Nemetschek', 'Vectorworks', '2026', 'Plug-ins')
-    for _name in ('VWX-MCP', 'VW-MCP'):
-        _cand = os.path.join(_base, _name)
-        if os.path.isdir(_cand):
-            _DIR = _cand
-            break
+    # Version discovered, not hardcoded — this fallback bridge is still the
+    # only option on macOS and for remote setups, so it must not be the one
+    # file left pinned to a single Vectorworks release.
+    _root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
+                         'Vectorworks')
+    _forced = os.environ.get('VWX_VW_VERSION')
+    if _forced:
+        _versions = [_forced]
     else:
-        _DIR = os.path.join(_base, 'VWX-MCP')
+        try:
+            _versions = sorted((d for d in os.listdir(_root)
+                                if len(d) == 4 and d.isdigit()), reverse=True)
+        except Exception:
+            _versions = []
+    _DIR = None
+    for _version in _versions:
+        for _name in ('VWX-MCP', 'VW-MCP'):
+            _cand = os.path.join(_root, _version, 'Plug-ins', _name)
+            if os.path.isdir(_cand):
+                _DIR = _cand
+                break
+        if _DIR:
+            break
+    if _DIR is None:
+        _newest = _versions[0] if _versions else ''
+        _DIR = os.path.join(_root, _newest, 'Plug-ins', 'VWX-MCP')
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 

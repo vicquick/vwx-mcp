@@ -14,17 +14,44 @@ import os
 import sys
 import importlib
 
-_base = os.path.join(os.environ.get('APPDATA', ''),
-                     'Nemetschek', 'Vectorworks', '2026', 'Plug-ins')
-for _name in ('VW-MCP', 'VWX-MCP'):
-    _dir = os.path.join(_base, _name)
-    if os.path.isdir(_dir):
-        if _dir not in sys.path:
-            sys.path.insert(0, _dir)
+_root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek', 'Vectorworks')
+_forced = os.environ.get('VWX_VW_VERSION')
+if _forced:
+    _versions = [_forced]
+else:
+    try:
+        _versions = sorted((d for d in os.listdir(_root)
+                            if len(d) == 4 and d.isdigit()), reverse=True)
+    except Exception:
+        _versions = []
+
+_dir = None
+for _v in _versions:
+    for _name in ('VW-MCP', 'VWX-MCP'):
+        _cand = os.path.join(_root, _v, 'Plug-ins', _name)
+        if os.path.isdir(_cand):
+            _dir = _cand
+            break
+    if _dir:
         break
+if _dir and _dir not in sys.path:
+    sys.path.insert(0, _dir)
 
 import vwx_pump
-importlib.reload(vwx_pump)
+# Reload ONLY when the file changed on disk. This used to reload
+# unconditionally on every trigger — a disk read, compile and exec of the whole
+# module on each drain cycle, repeating for as long as the queue was non-empty,
+# and it threw away the pump's warm state (peek cache, sweep timer, read-only
+# manifest) every single time. The mtime marker rides on the module object,
+# which survives in sys.modules between menu-command invocations, so an edited
+# or redeployed vwx_pump.py still hot-reloads at once.
+try:
+    _mt = os.path.getmtime(os.path.join(_dir, 'vwx_pump.py')) if _dir else 0.0
+except Exception:
+    _mt = 0.0
+if getattr(vwx_pump, '_vwx_loaded_mtime', None) != _mt:
+    importlib.reload(vwx_pump)
+    vwx_pump._vwx_loaded_mtime = _mt
 # v11 pump has NO module-level auto-run: the entry point must be called
 # explicitly. pump_all = full drain incl. document mutation — safe HERE
 # because this is VW's own script-plugin execution context (v4-proven,

@@ -6,6 +6,11 @@
 
 #include <cstdio>
 #include <ctime>
+#include <cctype>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <functional>
 
 using namespace VwxBridge;
 
@@ -34,7 +39,27 @@ using namespace VwxBridge;
 //   C. Foreground keystroke (Ctrl+Shift+B) when VW is already the foreground
 //      app — reaches the accelerator -> DoInterface. Not background, but
 //      Win11 permits it since no foreground-steal is needed.
+// Adaptive drain cadence. Job arrival is bursty — idle for minutes, then a
+// dozen calls back to back — so a single flat period is either wasteful when
+// nothing is queued or slow when something is. Run hot while the queue has
+// work, fall back to the idle period after a quiet spell. kTrigDebounceMs is
+// an exact multiple of kTickHotMs so the debounce never rejects a whole tick
+// (see TriggerPump).
+static const UINT    kTickHotMs      = 20;
+static const UINT    kTickIdleMs     = 150;
+static const DWORD   kTrigDebounceMs = 40;
+static const DWORD   kCooldownMs     = 1500;
+// The per-tick housekeeping does not need tick resolution and some of it is
+// expensive: DismissErrorDialogs walks every top-level window on the DESKTOP,
+// not just Vectorworks'. At a 20ms tick that would run fifty times a second.
+// Both are throttled to their own wall-clock intervals, independent of tick.
+static const DWORD   kDismissEveryMs = 200;
+static const DWORD   kAliveEveryMs   = 250;
 static UINT_PTR      gPumpTimer     = 0;
+static UINT          gTickPeriod    = kTickIdleMs;
+static DWORD         gLastBusyTick  = 0;
+static DWORD         gLastDismiss   = 0;
+static DWORD         gLastAlive     = 0;
 static bool          gPaused        = false;
 static int           gLastQueue     = 0;
 static bool          gPumping       = false;   // reentrancy guard for the drain
@@ -51,17 +76,63 @@ static const StatusData kVwxMagic   = 0x56575850;   // 'VWXP' — filters our ow
 // --------------------------------------------------------------------------------------------------------
 // Helpers: VW-MCP plugin folder (job queue home) + job counting via Win32.
 
+// The Vectorworks major version was hardcoded here as "2026". Nothing in this
+// palette is version-specific, and the failure mode on a new Vectorworks is
+// silent: the folder does not exist, the queue is never found, and every tool
+// call times out with no indication why. Enumerate the installed versions and
+// take the newest that actually contains the plug-in instead.
+//
+// Cached: this is called on every timer tick, and a directory enumeration per
+// tick would be exactly the kind of per-tick cost the adaptive cadence is
+// trying to remove. VWX_VW_VERSION forces one version, matching the Python side.
 static TXString VwxPluginDir()
 {
+	static bool     resolved = false;
+	static TXString cached;
+	if ( resolved )
+		return cached;
+
 	const char* appdata = getenv("APPDATA");
 	if ( appdata == nullptr )
 		return "";
-	for ( const char* name : { "VW-MCP", "VWX-MCP" } ) {
-		TXString dir;
-		dir << appdata << "\\Nemetschek\\Vectorworks\\2026\\Plug-ins\\" << name;
-		DWORD attrs = GetFileAttributesW( dir.GetWCharPtr() );
-		if ( attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) )
-			return dir;
+
+	std::vector<std::string> versions;
+	if ( const char* forced = getenv("VWX_VW_VERSION") ) {
+		versions.push_back( forced );
+	} else {
+		TXString glob;
+		glob << appdata << "\\Nemetschek\\Vectorworks\\*";
+		WIN32_FIND_DATAW fd;
+		HANDLE h = FindFirstFileW( glob.GetWCharPtr(), &fd );
+		if ( h != INVALID_HANDLE_VALUE ) {
+			do {
+				if ( !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) )
+					continue;
+				char name[8] = {0};
+				int i = 0;
+				for ( ; i < 7 && fd.cFileName[i]; ++i )
+					name[i] = (char) fd.cFileName[i];
+				if ( i == 4 && isdigit((unsigned char)name[0]) && isdigit((unsigned char)name[1])
+				            && isdigit((unsigned char)name[2]) && isdigit((unsigned char)name[3]) )
+					versions.push_back( name );
+			} while ( FindNextFileW( h, &fd ) );
+			FindClose( h );
+		}
+		std::sort( versions.begin(), versions.end(), std::greater<std::string>() );
+	}
+
+	for ( const std::string& version : versions ) {
+		for ( const char* name : { "VW-MCP", "VWX-MCP" } ) {
+			TXString dir;
+			dir << appdata << "\\Nemetschek\\Vectorworks\\" << version.c_str()
+			    << "\\Plug-ins\\" << name;
+			DWORD attrs = GetFileAttributesW( dir.GetWCharPtr() );
+			if ( attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) ) {
+				cached   = dir;
+				resolved = true;
+				return cached;
+			}
+		}
 	}
 	return "";
 }
@@ -135,16 +206,41 @@ static void LogLine(const char* msg)
 // Two pump scripts. Both import vwx_pump (hot-reloaded) and call one entry
 // point: pump_readonly() drains only read-only jobs (safe anywhere);
 // pump_all() drains everything (genuine dispatch only).
+// NOTE: this script carries its OWN copy of the plug-in path logic — it does
+// not go through VwxPluginDir() above, so fixing the C++ helper alone would
+// leave this copy pinned to one Vectorworks version. Keep the two in step.
 static const char* kPumpReadonlyScript =
 	"import os, sys, importlib\n"
-	"p = os.path.join(os.environ.get('APPDATA',''), 'Nemetschek', 'Vectorworks', '2026', 'Plug-ins', 'VW-MCP')\n"
-	"if not os.path.isdir(p):\n"
-	"    p = os.path.join(os.environ.get('APPDATA',''), 'Nemetschek', 'Vectorworks', '2026', 'Plug-ins', 'VWX-MCP')\n"
-	"if p not in sys.path:\n"
+	"r = os.path.join(os.environ.get('APPDATA',''), 'Nemetschek', 'Vectorworks')\n"
+	"f = os.environ.get('VWX_VW_VERSION')\n"
+	"if f:\n"
+	"    vs = [f]\n"
+	"else:\n"
+	"    try:\n"
+	"        vs = sorted((d for d in os.listdir(r) if len(d) == 4 and d.isdigit()), reverse=True)\n"
+	"    except Exception:\n"
+	"        vs = []\n"
+	"p = ''\n"
+	"for v in vs:\n"
+	"    for n in ('VW-MCP', 'VWX-MCP'):\n"
+	"        c = os.path.join(r, v, 'Plug-ins', n)\n"
+	"        if os.path.isdir(c):\n"
+	"            p = c\n"
+	"            break\n"
+	"    if p:\n"
+	"        break\n"
+	"if p and p not in sys.path:\n"
 	"    sys.path.insert(0, p)\n"
 	"try:\n"
 	"    import vwx_pump\n"
-	"    importlib.reload(vwx_pump)\n"
+	// Reload only on change. This fires from OnIdle — many times a second —
+	// and used to re-read, recompile and re-exec the whole pump module every
+	// time, discarding its warm state (peek cache, sweep timer, manifest) on
+	// each pass.
+	"    mt = os.path.getmtime(os.path.join(p, 'vwx_pump.py'))\n"
+	"    if getattr(vwx_pump, '_vwx_loaded_mtime', None) != mt:\n"
+	"        importlib.reload(vwx_pump)\n"
+	"        vwx_pump._vwx_loaded_mtime = mt\n"
 	"    vwx_pump.pump_readonly()\n"
 	"except Exception:\n"
 	"    import traceback, time\n"
@@ -326,7 +422,12 @@ static bool ModalDialogOpen();
 static void TriggerPump()
 {
 	DWORD now = GetTickCount();
-	if ( now - gLastTrigTick < 120 )        // snappier writes (was 400ms)
+	// Debounce must divide evenly into the timer period, or the two beat
+	// against each other: a 120ms guard on a 100ms tick meant every second
+	// tick was rejected and the real trigger cadence was 200ms, not the
+	// intended 100ms — the single largest term in the per-call latency floor.
+	// kTrigDebounceMs is an exact multiple of kTickHotMs.
+	if ( now - gLastTrigTick < kTrigDebounceMs )
 		return;
 	if ( ModalDialogOpen() )
 		return;                                  // a real modal is up — hold
@@ -364,7 +465,9 @@ static void CALLBACK PumpTimerProc(HWND, UINT, UINT_PTR, DWORD);
 void VwxBridge_StartPumpTimer()
 {
 	if ( gPumpTimer == 0 ) {
-		gPumpTimer = SetTimer( nullptr, 0, 100, PumpTimerProc );   // 100ms: snappier pickup
+		gTickPeriod   = kTickIdleMs;      // starts idle, goes hot on first job
+		gLastBusyTick = 0;
+		gPumpTimer = SetTimer( nullptr, 0, gTickPeriod, PumpTimerProc );
 		gSDK->RegisterNotificationProcedure( VwxNotifyProc, kNotifyLayerChange );
 		TryFindPumpMenuCommandId();
 		LogLine( "bridge on (palette open)" );
@@ -490,17 +593,37 @@ static void DismissErrorDialogs()
 static void RestoreKeyState();
 static void CALLBACK PumpTimerProc(HWND, UINT, UINT_PTR, DWORD)
 {
+	DWORD now = GetTickCount();
 	RestoreKeyState();            // undo last tick's background-hotkey key state
 	                              // (posted keys have since been translated)
-	if ( !gPaused )
+	if ( !gPaused && now - gLastDismiss >= kDismissEveryMs ) {
+		gLastDismiss = now;
 		DismissErrorDialogs();    // keep unattended background ops unblocked
 		                          // (paused = hands-off: user may be editing
 		                          //  node scripts / working in dialogs)
+	}
 	TXString pluginDir = VwxPluginDir();
-	WriteAlive( pluginDir );
-	gLastQueue = CountJobs( pluginDir );
+	if ( now - gLastAlive >= kAliveEveryMs ) {
+		gLastAlive = now;
+		WriteAlive( pluginDir );  // the server tolerates an 8s-old heartbeat,
+		                          // so this need not run at tick resolution
+	}
+	gLastQueue = CountJobs( pluginDir );   // pickup path — must run every tick
 	if ( gLastQueue > 0 && !gPaused && !gPumping )
 		TriggerPump();
+
+	// Adaptive period: hot while there is work or shortly after, idle
+	// otherwise. Changing the period of a timer created with a NULL window
+	// means killing and recreating it — SetTimer ignores the id for those and
+	// hands back a new one.
+	if ( gLastQueue > 0 )
+		gLastBusyTick = now;
+	UINT want = ( now - gLastBusyTick < kCooldownMs ) ? kTickHotMs : kTickIdleMs;
+	if ( want != gTickPeriod && gPumpTimer != 0 ) {
+		KillTimer( nullptr, gPumpTimer );
+		gPumpTimer  = SetTimer( nullptr, 0, want, PumpTimerProc );
+		gTickPeriod = want;
+	}
 }
 
 // --------------------------------------------------------------------------------------------------------

@@ -17,7 +17,7 @@ Key API facts:
   FInLayer: vs.FInLayer(layerH)
   ForEachObject: build list in callback — never create/delete/re-layer inside
 """
-import vs, traceback, os, json
+import vs, traceback, os, json, re
 
 # ── vs.* signature index (knowledge index) ───────────────────────────────────
 # vs_index.json (built by tools/build_vs_index.py from the SDK vs.py stub) maps
@@ -2439,17 +2439,41 @@ def export_dxf(p):
         return {'error': str(e)}
 
 def export_image(p):
-    try:
-        path = p.get('path', '')
-        w = int(p.get('width', 2000))
-        h = int(p.get('height', 1500))
-        dpi = int(p.get('dpi', 150))
-        fmt = p.get('format', 'png').lower()
-        fmap = {'png': 4, 'jpg': 2, 'jpeg': 2, 'tif': 3, 'tiff': 3}
-        vs.ExportImageFile(path, w, h, dpi, fmap.get(fmt, 4))
-        return {'status': 'ok', 'path': path}
-    except Exception as e:
-        return {'error': str(e)}
+    """Not implementable on VW2026 — fails loudly instead of pretending.
+
+    This used to call vs.ExportImageFile(path, w, h, dpi, fmt). The real VW2026
+    signature is ExportImageFile(hImage, filePath): two arguments, and the
+    handle is an Image OBJECT in the document, not the drawing. The call
+    therefore did nothing, raised nothing, and returned {'status':'ok','path':…}
+    — so callers believed a file had been written and only found out much later
+    that the path was empty. A silent no-op that reports success is worse than
+    no tool at all.
+
+    There is no headless drawing-to-raster API in vs.*; the menu-driven export
+    opens a modal dialog, which the unattended bridge cannot answer.
+    """
+    path = p.get('path', '')
+    hint = p.get('object_id')
+    if hint:
+        # Exporting an actual Image object IS supported — that is what the API
+        # is for. Honour it when the caller passes one.
+        try:
+            h = _h(hint)
+            if h is None:
+                return {'error': 'object not found: %s' % hint}
+            vs.ExportImageFile(h, path)
+            return {'status': 'ok', 'path': path, 'exported': 'image object'}
+        except Exception as e:
+            return {'error': str(e)}
+    return {'error':
+            "export_image cannot rasterize the drawing on VW2026: "
+            "vs.ExportImageFile(hImage, filePath) exports an Image OBJECT, not "
+            "the document, and no headless render-to-file API exists. "
+            "To SEE the drawing use the `screenshot` tool (captures the "
+            "Vectorworks window and returns the picture directly). "
+            "For a vector deliverable use `export_pdf`. To export an existing "
+            "Image object, pass its object_id to this command.",
+            'path': path}
 
 def import_dwg(p):
     try:
@@ -3799,17 +3823,56 @@ def vs_signature(p):
             else:
                 return {'error': 'no vs function named %r' % name}
         return {'name': name, **s}
-    q = (p.get('search') or '').lower()
+    q = (p.get('search') or '').lower().strip()
     cat = (p.get('category') or '').lower()
+    limit = int(p.get('limit', 25))
+
+    # Ranked, multi-term search. The old version did a single substring test
+    # and then sorted ALPHABETICALLY, so for a query like "area polygon" it
+    # found nothing at all (no function name contains that string), and for
+    # broad queries the best match could sit at position 150 of 200 — which
+    # made the index useless exactly when the caller did not already know the
+    # function name, i.e. the case it exists for.
+    terms = [t for t in re.split(r'[^a-z0-9]+', q) if t]
     res = []
     for k, v in _VS_INDEX.items():
-        if q and q not in k.lower() and q not in v.get('doc', '').lower():
-            continue
         if cat and cat not in v.get('cat', '').lower():
             continue
-        res.append({'name': k, 'args': v['args'], 'cat': v['cat'], 'doc': v['doc'][:80]})
-    res.sort(key=lambda x: x['name'])
-    return {'count': len(res), 'functions': res[:200]}
+        kl = k.lower()
+        doc = v.get('doc', '') or ''
+        docl = doc.lower()
+        if not terms:
+            res.append((0, k, v))
+            continue
+        score = 0
+        matched = 0
+        for t in terms:
+            hit = False
+            if kl == t:
+                score += 100; hit = True
+            elif kl.startswith(t):
+                score += 40; hit = True
+            elif t in kl:
+                score += 25; hit = True
+            if t in docl:
+                score += 6; hit = True
+            if t in (v.get('cat', '') or '').lower():
+                score += 3; hit = True
+            if hit:
+                matched += 1
+        if not matched:
+            continue
+        # Every term matching somewhere beats one term matching strongly.
+        score += 30 * (matched == len(terms))
+        # Prefer the plain name over its N/2/D variants and other long cousins.
+        score -= min(len(k), 40) * 0.2
+        res.append((score, k, v))
+
+    res.sort(key=lambda e: (-e[0], e[1]))
+    out = [{'name': k, 'args': v['args'], 'cat': v['cat'],
+            'doc': (v.get('doc') or '')[:110]}
+           for _s, k, v in res[:limit]]
+    return {'count': len(res), 'returned': len(out), 'functions': out}
 
 def vs_index_stats(p):
     """Summary of the loaded vs.* knowledge index: total functions + per-category
