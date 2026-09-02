@@ -24,6 +24,8 @@ TOOL_TAGS = {
     "get_document_info": "document",
     "save_document": "document",
     "save_document_as": "document",
+    "list_documents": "document",
+    "switch_document": "document",
     "get_document_preferences": "document",
     "set_document_preferences": "document",
     # layers

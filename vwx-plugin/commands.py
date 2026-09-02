@@ -183,6 +183,190 @@ def set_document_preferences(p):
     return {'status': 'ok'}
 
 
+# ── Open documents ──────────────────────────────────────────────────────────
+# VectorScript cannot see past the active document. There is no
+# GetDocumentCount, no NextDocument, no SetActiveDocument — GetFName tells you
+# which file you are in and nothing about the others. Confirmed against the
+# 3071-function index, not assumed.
+#
+# What does know is Windows: every open document is a window in this very
+# process, and this code runs inside it. So the list comes from the window
+# manager and the switch is a posted MDI message.
+#
+# Posted, not sent. We are on VW's main thread; a SendMessage would re-enter
+# VW's UI while a script is still running. PostMessage queues the switch and
+# it happens after we return — which is why switch_document reports what it
+# asked for, never what happened. The next command runs in the new document
+# and can confirm it. A tool that claimed success here would be guessing.
+
+def _win32():
+    """user32 + this process id, or None where there is no Windows API."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        return ctypes.windll.user32, ctypes.windll.kernel32.GetCurrentProcessId(), ctypes, wintypes
+    except Exception:
+        return None
+
+
+def _fenster_titel(u, ctypes, h):
+    n = u.GetWindowTextLengthW(h)
+    b = ctypes.create_unicode_buffer(n + 2)
+    u.GetWindowTextW(h, b, n + 2)
+    return b.value or ''
+
+
+def _fenster_klasse(u, ctypes, h):
+    b = ctypes.create_unicode_buffer(256)
+    u.GetClassNameW(h, b, 256)
+    return b.value or ''
+
+
+def _dokumentfenster():
+    """Every VW document window in this process.
+
+    Returns (liste, mdi_client, diagnose). Each entry carries hwnd, title and
+    the file name teased out of it; mdi_client is the MDI container when VW
+    uses one, so the caller knows which message to post.
+    """
+    teile = _win32()
+    if not teile:
+        return [], None, {'grund': 'kein Windows-API (ctypes fehlt)'}
+    u, pid, ctypes, wintypes = teile
+
+    EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    oberste, mdi_clients, kinder = [], [], []
+
+    def _oben(h, _l):
+        p = wintypes.DWORD()
+        u.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value == pid:
+            oberste.append(h)
+        return True
+    u.EnumWindows(EnumProc(_oben), 0)
+
+    def _kind(h, _l):
+        kl = _fenster_klasse(u, ctypes, h)
+        if kl == 'MDIClient':
+            mdi_clients.append(h)
+        kinder.append((h, kl))
+        return True
+    for h in oberste:
+        u.EnumChildWindows(h, EnumProc(_kind), 0)
+
+    # Ein Dokumentfenster erkennt man am Dateinamen im Titel. Die Klasse des
+    # Fensters heisst je nach VW-Version anders — der Titel nicht.
+    def _eintrag(h, quelle):
+        t = _fenster_titel(u, ctypes, h)
+        tl = t.lower()
+        if '.vwx' not in tl and '.vwxp' not in tl and '.sta' not in tl:
+            return None
+        datei = t
+        for trenner in (' - ', ' — ', ' – '):
+            if trenner in datei:
+                datei = datei.split(trenner)[0]
+        datei = datei.strip().lstrip('*').strip()
+        return {'hwnd': int(h), 'titel': t, 'datei': datei,
+                'klasse': _fenster_klasse(u, ctypes, h), 'quelle': quelle}
+
+    gefunden, gesehen = [], set()
+    for client in mdi_clients:
+        def _mdikind(h, _l):
+            if u.GetParent(h) == client:
+                e = _eintrag(h, 'mdi')
+                if e and e['hwnd'] not in gesehen:
+                    gesehen.add(e['hwnd']); gefunden.append(e)
+            return True
+        u.EnumChildWindows(client, EnumProc(_mdikind), 0)
+
+    if not gefunden:
+        # Kein MDI (oder VW hat umgebaut): jedes Fenster mit Dateinamen nehmen.
+        for h in oberste + [k[0] for k in kinder]:
+            e = _eintrag(h, 'fenster')
+            if e and e['hwnd'] not in gesehen:
+                gesehen.add(e['hwnd']); gefunden.append(e)
+
+    diagnose = {'oberste': len(oberste), 'kinder': len(kinder),
+                'mdi_clients': len(mdi_clients)}
+    return gefunden, (mdi_clients[0] if mdi_clients else None), diagnose
+
+
+def _grundname(s):
+    s = (s or '').replace('\\', '/').rsplit('/', 1)[-1].strip().lstrip('*').strip()
+    return s.lower()
+
+
+def list_documents(p):
+    """Every open Vectorworks document, and which one commands land in."""
+    aktiv = _safe(vs.GetFName, '') or ''
+    fenster, _client, diagnose = _dokumentfenster()
+    for f in fenster:
+        f['aktiv'] = _grundname(f['datei']) == _grundname(aktiv)
+
+    if not fenster:
+        # Lieber das eine bekannte Dokument melden als eine leere Liste, die
+        # aussieht, als waere nichts offen.
+        return {'status': 'ok', 'aktiv': aktiv, 'anzahl': 1 if aktiv else 0,
+                'dokumente': ([{'datei': aktiv, 'aktiv': True, 'hwnd': None}] if aktiv else []),
+                'hinweis': 'Fenster nicht auffindbar — nur das aktive Dokument ist bekannt.',
+                'diagnose': diagnose}
+
+    return {'status': 'ok', 'aktiv': aktiv, 'anzahl': len(fenster),
+            'dokumente': fenster, 'diagnose': diagnose}
+
+
+def switch_document(p):
+    """Bring another open document to the front. params: name | hwnd.
+
+    The switch is queued, not done: it takes effect after this script returns.
+    Confirm with the next command (get_document_info), do not trust this one.
+    """
+    teile = _win32()
+    if not teile:
+        return {'error': 'Dokumentwechsel gibt es nur unter Windows.'}
+    u, _pid, ctypes, _wt = teile
+
+    fenster, client, diagnose = _dokumentfenster()
+    if not fenster:
+        return {'error': 'Kein Dokumentfenster gefunden.', 'diagnose': diagnose}
+
+    ziel = None
+    if p.get('hwnd'):
+        ziel = next((f for f in fenster if f['hwnd'] == int(p['hwnd'])), None)
+    else:
+        name = _grundname(p.get('name', ''))
+        if not name:
+            return {'error': 'Bitte name oder hwnd angeben.',
+                    'offen': [f['datei'] for f in fenster]}
+        ziel = next((f for f in fenster if _grundname(f['datei']) == name), None)
+        if not ziel:   # Teiltreffer, damit "Musterdatei" fuer 260717_Musterdatei.vwx reicht
+            treffer = [f for f in fenster if name in _grundname(f['datei'])]
+            if len(treffer) > 1:
+                return {'error': 'Mehrdeutig.', 'passt_auf': [f['datei'] for f in treffer]}
+            ziel = treffer[0] if treffer else None
+    if not ziel:
+        return {'error': 'Dieses Dokument ist nicht offen.',
+                'offen': [f['datei'] for f in fenster]}
+
+    vorher = _safe(vs.GetFName, '') or ''
+    if _grundname(ziel['datei']) == _grundname(vorher):
+        return {'status': 'ok', 'aktiv': vorher, 'gewechselt': False,
+                'hinweis': 'Dieses Dokument ist bereits vorn.'}
+
+    WM_MDIACTIVATE = 0x0222
+    SW_RESTORE = 9
+    if client and ziel.get('quelle') == 'mdi':
+        u.PostMessageW(client, WM_MDIACTIVATE, ziel['hwnd'], 0)
+    else:
+        if u.IsIconic(ziel['hwnd']):
+            u.ShowWindow(ziel['hwnd'], SW_RESTORE)
+        u.SetForegroundWindow(ziel['hwnd'])
+
+    return {'status': 'angestossen', 'ziel': ziel['datei'], 'vorher': vorher,
+            'hinweis': 'Der Wechsel greift, sobald dieses Skript zurueck ist. '
+                       'Mit get_document_info bestaetigen — diese Antwort belegt ihn nicht.'}
+
+
 # ── Layers ──────────────────────────────────────────────────────────────────
 
 def get_layers(p):

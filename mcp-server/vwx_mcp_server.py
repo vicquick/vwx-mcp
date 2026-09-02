@@ -680,6 +680,30 @@ def save_document_as(ctx: Context, path: str) -> str:
     return cmd("save_document_as", {"path": path})
 
 @vtool
+def list_documents(ctx: Context) -> str:
+    """List every open Vectorworks document and which one commands land in.
+
+    VectorScript cannot see past the active document — there is no
+    GetDocumentCount and no NextDocument. This reads the window list of the
+    Vectorworks process instead, so it works with several files open at once.
+    """
+    return cmd("list_documents")
+
+@vtool
+def switch_document(ctx: Context, name: str = None, hwnd: int = None) -> str:
+    """Bring another open document to the front, by file name or window handle.
+
+    QUEUED, NOT DONE: the switch takes effect after the call returns, so this
+    answer reports what was asked for, not what happened. Confirm with
+    get_document_info before writing anything — a write in the wrong document
+    is the expensive mistake here. Partial names are accepted while unique.
+    """
+    p = {}
+    if name: p["name"] = name
+    if hwnd: p["hwnd"] = hwnd
+    return cmd("switch_document", p)
+
+@vtool
 def get_document_preferences(ctx: Context) -> str:
     """Get document preferences: units, scale, snap settings"""
     return cmd("get_document_preferences")
