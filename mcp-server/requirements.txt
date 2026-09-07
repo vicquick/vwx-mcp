@@ -1,17 +1,26 @@
-# vwx-mcp server deps. Migrated to standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md).
+# vwx-mcp server deps. Migrated to standalone fastmcp 3.x (see docs/MIGRATION_fastmcp3.md),
+# then to 4.x once 4.0 went GA.
 #
-# 3.4.3-3.4.7 are security and hardening only — a NAT64 SSRF bypass, DNS-
-# rebinding protection on streamable HTTP, unsafe OAuth redirect schemes, JWKS
-# Ed25519 handling. Exposure is low on a loopback listener, but the pin costs
-# nothing to move.
-#
-# Deliberately NOT on 4.x. FastMCP 4.0 is still beta (4.0.0b3, no GA date): it
-# moves to MCP SDK v2 and the 2026-07-28 stateless spec, replaces the Docket
-# tasks extra with a `fastmcp-tasks` package, and changes output-schema
-# handling — which is exactly where the `output_schema=None` workaround in
-# vtool() lives. Revisit when 4.0.0 final ships, and re-verify tools/list emits
-# no outputSchema before shipping it.
-fastmcp==3.4.7
+# 4.0.3 (2026-09): the 4.x line is final, so the "stay on 3.4.7 until GA" note
+# that used to live here is spent. What 4.0 changes and how it checked out on
+# this install:
+#   * MCP SDK v2 (mcp 2.1.1, mcp-types split out) — `from mcp.types import
+#     ToolAnnotations, TextContent` still resolves, now via mcp_types.
+#   * output-schema handling was the one real risk, since `output_schema=None`
+#     in vtool() is load-bearing: without it every tool emits an outputSchema
+#     derived from `-> str` and clients have historically dropped the whole
+#     tool set. Verified after the upgrade: tools/list = 252 tools, 0 with
+#     outputSchema, over both in-process and streamable HTTP on :8082.
+#   * the Docket tasks extra is now the separate `fastmcp-tasks` package, still
+#     reachable as `fastmcp[tasks]` and still pulling pydocket — so the
+#     `import docket` availability gate above VWX_TASKS stays correct.
+#   * unchanged and re-verified: mcp.tool(timeout=/tags=/annotations=/meta=),
+#     mcp.enable(tags=, only=True), the Middleware base and its
+#     context.fastmcp_context, TimingMiddleware, ResponseCachingMiddleware's
+#     *_settings kwargs, ToolResult + utilities.types.Image, and run()'s
+#     host/port/uvicorn_config transport kwargs.
+# Re-verify tools/list emits no outputSchema before moving this pin again.
+fastmcp==4.0.3
 
 # Window capture for the `screenshot` tool: PNG encoding and a quality
 # downscale. Vectorworks has no headless render-to-file API, so visual

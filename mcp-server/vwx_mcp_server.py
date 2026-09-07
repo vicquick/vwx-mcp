@@ -695,8 +695,10 @@ def switch_document(ctx: Context, name: str = None, hwnd: int = None) -> str:
 
     QUEUED, NOT DONE: the switch takes effect after the call returns, so this
     answer reports what was asked for, not what happened. Confirm with
-    get_document_info before writing anything — a write in the wrong document
-    is the expensive mistake here. Partial names are accepted while unique.
+    confirm_active_document as the next call before writing anything — a
+    write in the wrong document is the expensive mistake here. Partial names
+    are accepted while unique; an ambiguous match (same base name, different
+    folder) is reported with candidate window handles instead of guessing.
     """
     p = {}
     if name: p["name"] = name
@@ -806,12 +808,17 @@ def rename_class(ctx: Context, old_name: str, new_name: str) -> str:
 @vtool
 def set_class_appearance(ctx: Context, name: str, fill_r: int = None, fill_g: int = None, fill_b: int = None,
                          pen_r: int = None, pen_g: int = None, pen_b: int = None,
-                         line_weight: float = None) -> str:
-    """Set class fill/pen color (0-255 RGB) and line weight in mm"""
+                         line_weight: float = None, fill_pattern: int = None,
+                         line_style: int = None, opacity: float = None,
+                         hatch: str = None) -> str:
+    """Set class fill/pen color (0-255 RGB), line weight (mm), fill pattern index,
+    line style index, opacity (0-100 percent, 100=fully opaque) and/or hatch name.
+    Every argument is optional; only fields you pass are touched."""
     p = {"name": name}
     for k, v in {"fill_r": fill_r, "fill_g": fill_g, "fill_b": fill_b,
                  "pen_r": pen_r, "pen_g": pen_g, "pen_b": pen_b,
-                 "line_weight": line_weight}.items():
+                 "line_weight": line_weight, "fill_pattern": fill_pattern,
+                 "line_style": line_style, "opacity": opacity, "hatch": hatch}.items():
         if v is not None: p[k] = v
     return cmd("set_class_appearance", p)
 
@@ -2078,10 +2085,13 @@ def ifc_remove_pset(ctx: Context, object_id: str, pset: Optional[str] = None) ->
     return cmd("ifc_remove_pset", p)
 
 @vtool
-def ifc_define_pset(ctx: Context, name: str, members: List[Dict[str, str]]) -> str:
+def ifc_define_pset(ctx: Context, name: str, members: List[Dict[str, str]],
+                     ersetzen: bool = True) -> str:
     """Define a custom pset schema (document-wide). members=[{name, type}],
-    type: 'IfcLabel' | 'IfcReal' | 'IfcBoolean' | 'IfcLengthMeasure' ..."""
-    return cmd("ifc_define_pset", {"name": name, "members": members})
+    type: 'IfcLabel' | 'IfcReal' | 'IfcBoolean' | 'IfcLengthMeasure' ...
+    ersetzen=False aborts with an error instead of overwriting an existing
+    pset of the same name (default True keeps the old overwrite behavior)."""
+    return cmd("ifc_define_pset", {"name": name, "members": members, "ersetzen": ersetzen})
 
 @vtool
 def ifc_get_entity_prop(ctx: Context, object_id: str, prop: str) -> str:
@@ -3034,3 +3044,268 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein pset-import
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def ifc_pset_defined(ctx: Context, name: Optional[str] = None,
+                      names: Optional[List[str]] = None) -> str:
+    """Check whether one or more custom IFC Psets are defined in the document
+    (and whether each is 'custom'). Pass `name` for one pset or `names` for
+    several. Returns {results: {name: {defined, custom}}}."""
+    p: Dict[str, Any] = {}
+    if name: p["name"] = name
+    if names: p["names"] = names
+    return cmd("ifc_pset_defined", p)
+
+@vtool
+def ifc_import_pset_defs(ctx: Context, path: str, variante: int = 1,
+                          names: Optional[List[str]] = None) -> str:
+    """Import Custom Object Pset SCHEMA DEFINITIONS from a file/folder into the
+    document -- the office-CSV-to-shared-schema path. variante 1 =
+    IFC_DefPsetImport (expects a FOLDER per VW's own doc text); variante 2 =
+    IFC_DefPsetImport2 (expects a single FILE). Both underlying functions
+    return only a bare boolean and there is no vs.* call that lists all pset
+    schemas defined in the document, so pass `names` -- the pset names you
+    expect this file to define -- to get a real before/after
+    IFC_IsPsetDefined diff instead of trusting the raw return value alone.
+    NOTE: a schema imported this way lands in the document as a Record
+    Format, not as a database table -- do not expect worksheet/database
+    behavior from it."""
+    p: Dict[str, Any] = {"path": path, "variante": variante}
+    if names: p["names"] = names
+    return cmd("ifc_import_pset_defs", p)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein datenmanager
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def ifc_dm_list_objects(ctx: Context) -> str:
+    """List the IFC Data Mapping's object-rule names (cheap, no deep walk) — call before ifc_dm_dump on a large (~900+ object) mapping."""
+    return cmd("ifc_dm_list_objects", {})
+
+@vtool
+def ifc_dm_dump(ctx: Context, object_name: Optional[str] = None) -> str:
+    """Full IFC Data Mapping dump: Objects->Entries->Fields and Entries->PSets->PSet-Fields, with flags + conditions. Pass object_name to restrict to one object (recommended — the mapping can hold 900+ objects); each list in the result carries its own index_base (0/1/-1=ambiguous) since 0- vs 1-based indexing is unverified for this VW API family."""
+    p = {}
+    if object_name: p["object_name"] = object_name
+    return cmd("ifc_dm_dump", p)
+
+@vtool
+def ifc_dm_add_entry(ctx: Context, object_name: str, entry: str, enable: bool = True) -> str:
+    """Add a new entry to an object's IFC Data Mapping rule."""
+    return cmd("ifc_dm_add_entry", {"object_name": object_name, "entry": entry, "enable": enable})
+
+@vtool
+def ifc_dm_add_field(ctx: Context, object_name: str, entry: str, field: str, type: str = "IfcLabel",
+                     optional: bool = False, enable: bool = True, empty: bool = False) -> str:
+    """Add a direct field (outside any Pset) to an (object, entry) mapping rule."""
+    return cmd("ifc_dm_add_field", {"object_name": object_name, "entry": entry, "field": field,
+                                    "type": type, "optional": optional, "enable": enable,
+                                    "empty": empty})
+
+@vtool
+def ifc_dm_add_pset(ctx: Context, object_name: str, entry: str, pset: str, enable: bool = True,
+                    condition: str = "") -> str:
+    """Attach a Pset to an (object, entry) mapping rule. Uses IFC_DMAddPSetInEntry
+    (never IFC_DMAddPSetForEnt, which silently creates a duplicate entry)."""
+    return cmd("ifc_dm_add_pset", {"object_name": object_name, "entry": entry, "pset": pset,
+                                   "enable": enable, "condition": condition})
+
+@vtool
+def ifc_dm_add_pset_field(ctx: Context, object_name: str, entry: str, pset: str, field: str,
+                          type: str = "IfcLabel", optional: bool = False, enable: bool = True,
+                          empty: bool = False) -> str:
+    """Add a field to a Pset already attached under an (object, entry) rule."""
+    return cmd("ifc_dm_add_pset_field", {"object_name": object_name, "entry": entry, "pset": pset,
+                                         "field": field, "type": type, "optional": optional,
+                                         "enable": enable, "empty": empty})
+
+@vtool
+def ifc_dm_enable_object(ctx: Context, object_name: str, enable: bool = True) -> str:
+    """Enable/disable an IFC Data Mapping object rule as a whole."""
+    return cmd("ifc_dm_enable_object", {"object_name": object_name, "enable": enable})
+
+@vtool
+def ifc_dm_enable_entry(ctx: Context, object_name: str, entry: str, enable: bool = True) -> str:
+    """Enable/disable one entry under an IFC Data Mapping object."""
+    return cmd("ifc_dm_enable_entry", {"object_name": object_name, "entry": entry, "enable": enable})
+
+@vtool
+def ifc_dm_enable_pset(ctx: Context, object_name: str, entry: str, pset: str, enable: bool = True) -> str:
+    """Enable/disable a Pset under an (object, entry) IFC Data Mapping rule."""
+    return cmd("ifc_dm_enable_pset", {"object_name": object_name, "entry": entry, "pset": pset,
+                                      "enable": enable})
+
+@vtool
+def ifc_dm_set_entry_type(ctx: Context, object_name: str, entry: str, type: str) -> str:
+    """Set an entry's IfcEntry type (documented only as Primary/Secondary; exact literal spelling unverified)."""
+    return cmd("ifc_dm_set_entry_type", {"object_name": object_name, "entry": entry, "type": type})
+
+@vtool
+def ifc_dm_set_object_condition(ctx: Context, object_name: str, condition: str) -> str:
+    """Set the ObjCond formula that decides whether an IFC Data Mapping object rule applies."""
+    return cmd("ifc_dm_set_object_condition", {"object_name": object_name, "condition": condition})
+
+@vtool
+def ifc_dm_set_field_map(ctx: Context, object_name: str, entry: str, field: str, mapping: str,
+                         pset: Optional[str] = None) -> str:
+    """Set a field's mapping-source formula, e.g. ='DTM6'.'Cut Volume'. Pass pset to target a Pset field, omit for a direct entry field."""
+    p = {"object_name": object_name, "entry": entry, "field": field, "mapping": mapping}
+    if pset: p["pset"] = pset
+    return cmd("ifc_dm_set_field_map", p)
+
+@vtool
+def ifc_dm_set_field_flags(ctx: Context, object_name: str, entry: str, field: str,
+                           enabled: Optional[bool] = None, optional: Optional[bool] = None,
+                           empty: Optional[bool] = None, type: Optional[str] = None) -> str:
+    """Set state flags (enabled/optional/empty/type) on a direct entry field — only flags you pass are changed."""
+    p = {"object_name": object_name, "entry": entry, "field": field}
+    if enabled is not None: p["enabled"] = enabled
+    if optional is not None: p["optional"] = optional
+    if empty is not None: p["empty"] = empty
+    if type is not None: p["type"] = type
+    return cmd("ifc_dm_set_field_flags", p)
+
+@vtool
+def ifc_dm_set_pset_field_flags(ctx: Context, object_name: str, entry: str, pset: str, field: str,
+                                enabled: Optional[bool] = None, optional: Optional[bool] = None,
+                                empty: Optional[bool] = None, type: Optional[str] = None) -> str:
+    """Set state flags (enabled/optional/empty/type) on a Pset field — only flags you pass are changed."""
+    p = {"object_name": object_name, "entry": entry, "pset": pset, "field": field}
+    if enabled is not None: p["enabled"] = enabled
+    if optional is not None: p["optional"] = optional
+    if empty is not None: p["empty"] = empty
+    if type is not None: p["type"] = type
+    return cmd("ifc_dm_set_pset_field_flags", p)
+
+@vtool
+def ifc_dm_delete_entry(ctx: Context, object_name: str, entry: str) -> str:
+    """Delete an entry (and its fields/Psets) from an IFC Data Mapping object."""
+    return cmd("ifc_dm_delete_entry", {"object_name": object_name, "entry": entry})
+
+@vtool
+def ifc_dm_delete_field(ctx: Context, object_name: str, entry: str, field: str) -> str:
+    """Delete a direct entry field from the IFC Data Mapping."""
+    return cmd("ifc_dm_delete_field", {"object_name": object_name, "entry": entry, "field": field})
+
+@vtool
+def ifc_dm_delete_pset(ctx: Context, object_name: str, entry: str, pset: str) -> str:
+    """Remove a Pset (and its fields) from an (object, entry) IFC Data Mapping rule."""
+    return cmd("ifc_dm_delete_pset", {"object_name": object_name, "entry": entry, "pset": pset})
+
+@vtool
+def ifc_dm_delete_pset_field(ctx: Context, object_name: str, entry: str, pset: str, field: str) -> str:
+    """Delete one field from a Pset in the IFC Data Mapping."""
+    return cmd("ifc_dm_delete_pset_field", {"object_name": object_name, "entry": entry, "pset": pset,
+                                            "field": field})
+
+@vtool
+def ifc_dm_save(ctx: Context, path: str, object_name: Optional[str] = None, to_file: bool = True) -> str:
+    """Save the IFC Data Mapping (IFC_DMSaveSettings — param meanings are a documented guess, see tool docstring in commands.py; test on a throwaway file first)."""
+    p = {"path": path, "to_file": to_file}
+    if object_name: p["object_name"] = object_name
+    return cmd("ifc_dm_save", p)
+
+@vtool
+def ifc_dm_load(ctx: Context, path: str) -> str:
+    """Load an IFC Data Mapping (IFC_DMLoadSettings — likely REPLACES the current mapping wholesale; snapshot with ifc_dm_dump first)."""
+    return cmd("ifc_dm_load", {"path": path})
+
+@vtool
+def ifc_dm_reset_to_default(ctx: Context, confirm: str) -> str:
+    """DESTRUCTIVE: wipes the ENTIRE IFC Data Mapping to VW factory defaults, no undo. Requires confirm == 'RESET DATA MAPPING TO DEFAULTS'."""
+    return cmd("ifc_dm_reset_to_default", {"confirm": confirm})
+
+@vtool
+def ifc_dm_reset_to_cobie_default(ctx: Context, confirm: str) -> str:
+    """DESTRUCTIVE: wipes the ENTIRE IFC Data Mapping to VW's COBie defaults, no undo. Requires confirm == 'RESET DATA MAPPING TO COBIE DEFAULTS'."""
+    return cmd("ifc_dm_reset_to_cobie_default", {"confirm": confirm})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein klassenattribute
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def get_class_appearance(ctx: Context, name: str) -> str:
+    """Read one class's full appearance (fill/pen color, lineweight, fill
+    pattern, line style, opacity, hatch) to verify a set_class_appearance write."""
+    return cmd("get_class_appearance", {"name": name})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein schraffuren
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def create_hatch_definition(ctx: Context, name: str, layers: list,
+                            page_space: bool = False, rotate_in_wall: bool = False,
+                            color_index: int = 0, replace: bool = False) -> str:
+    """Create a new vector-fill hatch definition. layers: [{x_start,y_start,x_repeat,y_repeat,x_offset,y_offset,dash_factor,line_weight,color_index}, ...]. Fails if name exists unless replace=True."""
+    p = {"name": name, "layers": layers, "page_space": page_space,
+         "rotate_in_wall": rotate_in_wall, "color_index": color_index, "replace": replace}
+    return cmd("create_hatch_definition", p)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein hybridsymbole
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def get_symbol_type(ctx: Context, object_id: str = None, name: str = None, layer: str = None) -> str:
+    """Check if a symbol is 2D, 3D, or hybrid. Pass object_id (a placed instance, cheap and exact) OR name + layer
+    (searches one layer for the first placed instance). name WITHOUT layer is refused: vs.ForEachObject has no
+    early-abort, so a name-only search would walk the whole document just to find one instance."""
+    p = {}
+    if object_id: p["object_id"] = object_id
+    if name: p["name"] = name
+    if layer: p["layer"] = layer
+    return cmd("get_symbol_type", p)
+
+@vtool
+def get_symbol_options(ctx: Context, name: str) -> str:
+    """Read a symbol definition's default class + insert/break mode. Tuple order from VW is unverified — see 'warning' in the result."""
+    return cmd("get_symbol_options", {"name": name})
+
+@vtool
+def set_symbol_options(ctx: Context, name: str, insert_mode: int = 0, break_mode: int = 0, class_name: str = "") -> str:
+    """Set a symbol definition's default class, insert mode, and break mode (raw VW integer codes)."""
+    return cmd("set_symbol_options", {"name": name, "insert_mode": insert_mode,
+                                       "break_mode": break_mode, "class_name": class_name})
+
+@vtool
+def create_hybrid_symbol(ctx: Context, name: str, object_ids_2d: list = None, object_ids_3d: list = None,
+                          folder: str = None, class_name: str = None,
+                          insert_mode: int = None, break_mode: int = None) -> str:
+    """Create a symbol def from both 2D and 3D source objects. Experimental: whether VW classifies the result as truly hybrid is unverified — see 'warnings' in the result."""
+    p = {"name": name, "object_ids_2d": object_ids_2d or [], "object_ids_3d": object_ids_3d or []}
+    if folder: p["folder"] = folder
+    if class_name: p["class_name"] = class_name
+    if insert_mode is not None: p["insert_mode"] = insert_mode
+    if break_mode is not None: p["break_mode"] = break_mode
+    return cmd("create_hybrid_symbol", p)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Baustein dokumentwechsel
+# ──────────────────────────────────────────────────────────────────────────
+
+@vtool
+def confirm_active_document(ctx: Context, expected: str) -> str:
+    """Confirm the active document matches 'expected' after switch_document.
+
+    Call this as the command right after switch_document — the switch is
+    posted, not done, so switch_document's own answer never proves anything.
+    'expected' can be a bare file name (base-name match) or a full/partial
+    path including the folder, which is the only way to tell apart two open
+    files that share a name but live in different folders — when 'expected'
+    looks like a path, the path comparison alone decides (a bare-name match
+    cannot rule out the wrong folder, so it is not allowed to override it).
+    """
+    return cmd("confirm_active_document", {"expected": expected})
