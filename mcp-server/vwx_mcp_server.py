@@ -1533,12 +1533,12 @@ def apply_texture(ctx: Context, object_id: str, texture_name: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @vtool
-def execute_script(ctx: Context, code: str) -> str:
+def execute_script(ctx: Context, code: str, allow_handle_walk: bool = False) -> str:
     """Execute arbitrary vs.* Python code inside Vectorworks.
     Code runs on VW main thread. Use __result__ to return a value.
     Example: '__result__ = vs.GetDocumentName()'
     All vs.* functions available. Stdout captured in 'output' key."""
-    return cmd("execute_script", {"code": code})
+    return cmd("execute_script", {"code": code, "allow_handle_walk": allow_handle_walk})
 
 @vtool
 def run_menu_command(ctx: Context, menu_name: str) -> str:
@@ -2557,6 +2557,15 @@ def _vw_windows():
                 return True
         finally:
             k32.CloseHandle(h)
+        # Floating palettes (the VWX Bridge palette, tool palettes) are owned
+        # windows too, but they are not dialogs: their MFC class is
+        # BCGPMiniFrame/BCGP*. Treating them as modal returned a 20 px title
+        # bar as "the dialog" and told the model to close the bridge itself
+        # (2026-09-11). Real VW dialogs are #32770 or Afx dialog classes.
+        cls = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(hwnd, cls, 64)
+        if cls.value.startswith("BCGP"):
+            return True
         rect = wintypes.RECT()
         u32.GetWindowRect(hwnd, ctypes.byref(rect))
         area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)

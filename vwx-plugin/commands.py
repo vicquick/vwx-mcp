@@ -22,9 +22,18 @@ import vs, traceback, os, json, re
 # ── vs.* signature index (knowledge index) ───────────────────────────────────
 # vs_index.json (built by tools/build_vs_index.py from the SDK vs.py stub) maps
 # every vs function -> {args, arity, required, ret, cat, doc}. Loaded once.
-# `vsig(name)` gives an agent/self an instant accurate signature; `vcheck` lets
-# call sites validate arity and fail with a clean dict instead of triggering a
-# VW engine error dialog.
+# NOTE: this used to also define vsig(name)/vcheck(name, argc) as an arity
+# pre-check for vs.* call sites. Repo-wide grep found zero call sites using
+# either — AGENTS.md advertised them as a safety net ("call sites can validate
+# arity ... instead of triggering a VW engine error dialog") that no code ever
+# actually used. Per this round's rule (a tool that fails silently is worse
+# than one that fails honestly), a documented safety net nobody calls is worse
+# than none — it tells a reader arity is checked when it is not. Removed
+# rather than retrofitted: wiring vcheck into the ~300 existing vs.* call
+# sites in this file is a large, high-risk rewrite out of scope for this pass
+# and not something to do without the bridge available to test against; see
+# AGENTS.md for the doc update that goes with this removal. _VS_INDEX itself
+# stays loaded — other code in this file may still want the raw index later.
 _VS_INDEX = {}
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vs_index.json'),
@@ -32,18 +41,6 @@ try:
         _VS_INDEX = json.load(_f)
 except Exception:
     _VS_INDEX = {}
-
-def vsig(name):
-    """Return the signature record for a vs.* function, or None."""
-    return _VS_INDEX.get(name)
-
-def vcheck(name, argc):
-    """True if argc is a valid argument count for vs.<name> per the index.
-    Unknown functions pass (index may lag the SDK)."""
-    s = _VS_INDEX.get(name)
-    if not s:
-        return True
-    return s['required'] <= argc <= s['arity']
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -68,16 +65,49 @@ def _h(oid):
     except Exception: pass
     return None
 
+
+# Opt-in diagnostic for _safe()'s swallowed exceptions. Off by default so the
+# ~241 existing call sites keep their current silent-fallback behavior with
+# zero output-format or timing change; set VWX_SAFE_DEBUG=1 in the process
+# environment before starting the bridge to print what _safe() is catching
+# (to stderr, via the traceback module already imported at module load) while
+# diagnosing a specific report of "empty/None field that should have a
+# value". Not wired to a file/log sink on purpose — this file runs inside
+# VW's process and must not assume a writable log path exists.
+_SAFE_DEBUG = bool(os.environ.get('VWX_SAFE_DEBUG'))
+
 def _safe(fn, default=None):
-    try: return fn()
-    except: return default
+    """Run fn(), returning default on failure instead of raising.
+    Catches Exception only — NOT BaseException. A bare `except:` (the
+    previous form here) also caught KeyboardInterrupt, SystemExit and
+    GeneratorExit, meaning Ctrl+C during a long _safe() call, or the
+    interpreter shutting down mid-call, was silently absorbed and turned
+    into a normal-looking `default` return instead of stopping anything.
+    `except Exception:` still catches every real failure mode _safe() exists
+    for (AttributeError from a vs.* name that does not exist on this VW
+    build, TypeError from a wrong arg count, NameError from a typo in the
+    caller's lambda, etc. — all Exception subclasses) so all ~241 existing
+    call sites keep behaving exactly as before for every case that used to
+    reach `return default`. Only the BaseException-but-not-Exception cases
+    change, and for those the old behavior was itself the bug."""
+    try:
+        return fn()
+    except Exception:
+        if _SAFE_DEBUG:
+            traceback.print_exc()
+        return default
 
 def _bbox(h):
+    """Return h's bounding box as a dict, or None if h has none / GetBBox
+    fails. Same except-Exception-not-bare-except fix as _safe() above, for
+    the same reason: this must not be able to swallow KeyboardInterrupt or
+    SystemExit."""
     try:
         p1, p2 = vs.GetBBox(h)
         return {'x1': p1[0], 'y1': p1[1], 'x2': p2[0], 'y2': p2[1],
                 'w': abs(p2[0]-p1[0]), 'h': abs(p2[1]-p1[1])}
-    except: return None
+    except Exception:
+        return None
 
 OBJ_TYPES = {
     2:'line',3:'rect',4:'oval',5:'polyline',6:'bezier',8:'arc',
@@ -176,11 +206,36 @@ def get_document_preferences(p):
     return out
 
 def set_document_preferences(p):
-    # Units & scale live on layers in VW; apply scale to active layer.
+    """Set document preferences. params: {units, scale}.
+
+    scale applies to the ACTIVE LAYER — in VW the scale lives on the layer,
+    not the document.
+
+    units is NOT settable from here. vs.SetUnits(fraction, display, format,
+    upi, name, squareName) takes six low-level values, not a name like "mm":
+    upi is units-per-inch (25.4 for mm, 2.54 for cm, 0.0254 for m) and the
+    remaining four control display and rounding. Guessing the other five from
+    a unit name would quietly change how every dimension in the document is
+    displayed. The server used to accept units= and pass it here, where
+    nothing read it and the command still answered ok — so a caller setting
+    units got a success for something that never happened. Now it says so.
+    """
+    out = {'status': 'ok'}
     if p.get('scale') is not None:
         h = vs.ActLayer()
-        if h: vs.SetLScale(h, float(p['scale']))
-    return {'status': 'ok'}
+        if h:
+            _safe(lambda: vs.SetLScale(h, float(p['scale'])))
+            out['scale_set_on_layer'] = _safe(lambda: vs.GetLName(h))
+        else:
+            out['warning'] = 'no active layer — scale not applied'
+    if p.get('units') is not None:
+        out['units_ignored'] = (
+            'units cannot be set through this command: vs.SetUnits needs six '
+            'low-level values (fraction, display, format, units-per-inch, name, '
+            'squareName) and inferring five of them from a unit name would '
+            'silently change display and rounding for the whole document. '
+            'Use get_document_units to read the current setting.')
+    return out
 
 
 # ── Open documents ──────────────────────────────────────────────────────────
@@ -1570,19 +1625,34 @@ def set_text_size_all(p):
 
 def convert_to_polygon(p):
     """Convert any 2D object to a polygon (arcs tessellated). params:
-    {object_id, resolution (segments per arc, default 32)}. Original untouched."""
+    {object_id, resolution (segments per arc, default 32)}. Original untouched.
+    vs.ConvertToPolygon takes TWO arguments (h, resolution) — a second, later
+    definition of this command used to shadow this one and called it with one,
+    which is an engine error, not a fallback."""
     h = _h(p.get('object_id'))
     if not h: return {'error': 'object not found'}
-    r = vs.ConvertToPolygon(h, int(p.get('resolution', 32)))
+    r = _safe(lambda: vs.ConvertToPolygon(h, int(p.get('resolution', 32))))
+    if not r: return {'error': 'ConvertToPolygon returned nothing'}
     return {'status': 'ok', 'object_id': _oid(r)}
 
 def convert_to_polyline(p):
     """Convert a 2D object to a polyline (arcs preserved as arc vertices).
-    params: {object_id}. Original untouched."""
+    params: {object_id, replace (default False)}.
+
+    Two different VW calls hide behind this name, and a duplicate definition
+    used to pick the second one silently while this docstring promised the
+    first:
+      MakePolyline(src)      -- builds a NEW polyline, source stays (default)
+      ConvertToPolyline(h)   -- converts the shape itself (replace=True)
+    """
     h = _h(p.get('object_id'))
     if not h: return {'error': 'object not found'}
-    r = vs.MakePolyline(h)
-    return {'status': 'ok', 'object_id': _oid(r)}
+    if p.get('replace'):
+        r = _safe(lambda: vs.ConvertToPolyline(h))
+    else:
+        r = _safe(lambda: vs.MakePolyline(h))
+    if not r: return {'error': 'conversion returned nothing'}
+    return {'status': 'ok', 'object_id': _oid(r), 'replaced': bool(p.get('replace'))}
 
 def set_stacking_order(p):
     """Move object in the drawing stacking order. params: {object_id,
@@ -1813,14 +1883,12 @@ def get_poly_holes(p):
 
 
 # ── SDK enrichment 3: report worksheets, IFC deep, textures, doc defaults ───
-
-def _col_letter(i):
-    """1 -> A, 2 -> B, ... 27 -> AA (worksheet column letters)."""
-    s = ''
-    while i > 0:
-        i, r = divmod(i - 1, 26)
-        s = chr(65 + r) + s
-    return s
+# (_col_letter, a 1->A/27->AA worksheet-column-letter helper, used to live
+# here. Removed: create_report_worksheet below never referenced it — its
+# worksheet API is purely row/col-index numeric, not column-letter based —
+# and grep found no other caller in the file either. Dead code with no
+# runtime risk, but pure clutter next to the function it looked like it was
+# written for.)
 
 def create_report_worksheet(p):
     """One-call criteria-driven report (database worksheet): creates the
@@ -2255,10 +2323,34 @@ def set_3d_view(p):
 
 # ── Symbols ─────────────────────────────────────────────────────────────────
 
+def _resource_names(res_type):
+    """Names of document resources of one type via BuildResourceList.
+
+    ForEachObject criteria like 'T=SYMDEF' walk drawing objects and never see
+    resources, so `_collect` returned nothing for symbol definitions and
+    record formats on VW2026 (verified 2026-09-11: 12 symbols, 16 formats
+    present, both reported 0). BuildResourceList is the resource browser's own
+    enumeration. Type 16 = symbol definition, 47 = record format, 11 = hatch."""
+    try:
+        list_id, n = vs.BuildResourceList(res_type, 0, '')
+    except Exception:
+        return []
+    names = []
+    for i in range(1, (n or 0) + 1):
+        nm = _safe(lambda: vs.GetNameFromResourceList(list_id, i))
+        if nm:
+            names.append(nm)
+    return names
+
+
 def get_symbols(p):
     syms = []
-    for h in _collect('T=SYMDEF'):
-        syms.append({'name': _safe(lambda: vs.GetName(h)), 'object_id': _oid(h)})
+    for nm in _resource_names(16):
+        h = _safe(lambda: vs.GetObject(nm))
+        syms.append({'name': nm, 'object_id': _oid(h) if h else None})
+    if not syms:                                   # old path as a fallback
+        for h in _collect('T=SYMDEF'):
+            syms.append({'name': _safe(lambda: vs.GetName(h)), 'object_id': _oid(h)})
     return {'symbols': syms, 'count': len(syms)}
 
 def place_symbol(p):
@@ -2429,11 +2521,16 @@ def set_marker(p):
 
 def get_record_formats(p):
     fmts = []
-    for h in _collect('T=RECDEF'):
-        n = _safe(lambda: vs.GetName(h))
-        if n:
-            fmts.append({'name': n, 'object_id': _oid(h),
-                         'field_count': _safe(lambda: vs.NumFields(h), 0)})
+    for n in _resource_names(47):
+        h = _safe(lambda: vs.GetObject(n))
+        fmts.append({'name': n, 'object_id': _oid(h) if h else None,
+                     'field_count': _safe(lambda: vs.NumFields(h), 0) if h else None})
+    if not fmts:                                   # old path as a fallback
+        for h in _collect('T=RECDEF'):
+            n = _safe(lambda: vs.GetName(h))
+            if n:
+                fmts.append({'name': n, 'object_id': _oid(h),
+                             'field_count': _safe(lambda: vs.NumFields(h), 0)})
     return {'formats': fmts, 'count': len(fmts)}
 
 def get_object_records(p):
@@ -2930,11 +3027,23 @@ def export_image(p):
             'path': path}
 
 def import_dwg(p):
+    """Import a DXF/DWG file. params: {path, layer (optional target layer)}.
+
+    layer used to be accepted by the server and dropped here, so an import
+    aimed at a specific layer landed on whatever was active and still reported
+    ok. _with_layer_class/_restore is the same pattern the draw_* commands use.
+    """
+    path = p.get('path', '')
+    if not path: return {'error': 'path required'}
+    prev = _with_layer_class(p)
     try:
-        vs.ImportDXFDWG(p.get('path', ''), False)
-        return {'status': 'ok'}
+        vs.ImportDXFDWG(path, False)
+        return {'status': 'ok', 'path': path,
+                'layer': _safe(lambda: vs.GetLName(vs.ActLayer()))}
     except Exception as e:
         return {'error': str(e)}
+    finally:
+        _restore(prev)
 
 def export_shp(p):
     """Export to Shapefile (GIS export).
@@ -2949,13 +3058,21 @@ def export_shp(p):
                        '(vs.LegacyShapefileExp) opens a modal dialog.')}
 
 def import_image(p):
+    """Import an image file as an image object. params: {path, x, y, layer}.
+
+    layer used to be accepted by the server and dropped here — see import_dwg.
+    """
+    path = p.get('path', '')
+    if not path: return {'error': 'path required'}
+    prev = _with_layer_class(p)
     try:
-        path = p.get('path', '')
-        x, y = p.get('x', 0), p.get('y', 0)
-        vs.ImportImageFile(path, (x, y))
-        return {'status': 'ok', 'object_id': _oid(vs.LNewObj())}
+        vs.ImportImageFile(path, (p.get('x', 0), p.get('y', 0)))
+        return {'status': 'ok', 'object_id': _oid(vs.LNewObj()),
+                'layer': _safe(lambda: vs.GetLName(vs.ActLayer()))}
     except Exception as e:
         return {'error': str(e)}
+    finally:
+        _restore(prev)
 
 
 # ── View ────────────────────────────────────────────────────────────────────
@@ -3209,12 +3326,33 @@ def for_each_criteria(p):
 
 # ── Baumkataster Bulk Record Setter ──────────────────────────────────────────
 
+# Fields that vs.ResetObject wipes on the VW2026 Existing-Tree PIO (the regen
+# re-runs auto-numbering and clears them). They are written AFTER the reset,
+# and no further reset must follow — the LLA batch tools document the same.
+_PIO_LATE_FIELDS = ('Tree No', 'Instance Name')
+
+
+def _pio_record_name(h, requested=None):
+    """Record to write: the caller's choice, else the PIO's own parametric
+    record (German VW2026 names it 'Existing Tree', not 'Baumkataster')."""
+    if requested:
+        return requested
+    rec = _safe(lambda: vs.GetParametricRecord(h))
+    nm = _safe(lambda: vs.GetName(rec)) if rec else None
+    return nm or 'Baumkataster'
+
+
 def baumkataster_set_fields(p):
-    """Bulk-set record fields. fields: {FieldName: value}. Default record: Baumkataster."""
+    """Bulk-set record fields. fields: {FieldName: value}.
+
+    record: defaults to the object's parametric record. reset: ResetObject
+    after writing (default True). 'Tree No' / 'Instance Name' are always
+    written after the reset because VW2026 clears them on regen."""
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
-    rec = p.get('record', 'Baumkataster')
-    fields = p.get('fields', {}) or {}
+    rec = _pio_record_name(h, p.get('record'))
+    fields = dict(p.get('fields', {}) or {})
+    late = {k: fields.pop(k) for k in list(fields) if k in _PIO_LATE_FIELDS}
     # Attach if not already attached
     try:
         vs.SetRecord(h, rec)
@@ -3226,9 +3364,17 @@ def baumkataster_set_fields(p):
             done += 1
         except Exception as e:
             errs[k] = str(e)
-    try: vs.ResetObject(h)
-    except Exception: pass
-    return {'status': 'ok', 'set': done, 'errors': errs}
+    if p.get('reset', True):
+        try: vs.ResetObject(h)
+        except Exception: pass
+    for k, v in late.items():
+        try:
+            vs.SetRField(h, rec, k, str(v))
+            done += 1
+        except Exception as e:
+            errs[k] = str(e)
+    return {'status': 'ok', 'set': done, 'errors': errs, 'record': rec,
+            'late_fields': sorted(late)}
 
 
 # ── Extra 2D Primitives ──────────────────────────────────────────────────────
@@ -3291,11 +3437,16 @@ def _layer_uuids():
 
 def _apply_pio_params(h, name, parameters):
     if not parameters: return
-    for field, value in parameters.items():
+    params = dict(parameters)
+    late = {k: params.pop(k) for k in list(params) if k in _PIO_LATE_FIELDS}
+    for field, value in params.items():
         try: vs.SetRField(h, name, field, str(value))
         except Exception: pass
     try: vs.ResetObject(h)
     except Exception: pass
+    for field, value in late.items():          # see _PIO_LATE_FIELDS
+        try: vs.SetRField(h, name, field, str(value))
+        except Exception: pass
 
 def create_pio(p):
     """Create a Plug-in Object (Door, Window, Stair, Fence, Hardscape, Data Tag, …).
@@ -3934,21 +4085,7 @@ def point_along_polygon(p):
         return {'x': x, 'y': y, 'segment': seg}
     except Exception as e: return {'error': str(e)}
 
-def convert_to_polygon(p):
-    h = _h(p.get('object_id'))
-    if not h: return {'error': 'Object not found'}
-    try:
-        nh = vs.ConvertToPolygon(h)
-        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
-    except Exception as e: return {'error': str(e)}
 
-def convert_to_polyline(p):
-    h = _h(p.get('object_id'))
-    if not h: return {'error': 'Object not found'}
-    try:
-        nh = vs.ConvertToPolyline(h)
-        return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
-    except Exception as e: return {'error': str(e)}
 
 def convert_to_nurbs(p):
     h = _h(p.get('object_id'))
@@ -4367,9 +4504,24 @@ def _batch(p):
 
 # ── Script Execution ────────────────────────────────────────────────────────
 
+# Handle walks (`h = vs.FInGroup(g); while h: ...; h = vs.NextObj(h)`) spin
+# forever on VW2026 — twice on 2026-09-11 that froze Vectorworks completely
+# (one core pegged, memory frozen, only a restart helps). ForEachObject with a
+# criteria string is the safe traversal and descends into groups by itself.
+_HANDLE_WALK = re.compile(r'vs\.(Next|Prev)S?Obj\s*\(')
+
+
 def execute_script(p):
     import io, sys
     code = p.get('code', '')
+    if (_HANDLE_WALK.search(code) and re.search(r'\bwhile\b', code)
+            and not p.get('allow_handle_walk')):
+        return {'output': '', 'result': None, 'error':
+                "refused: a `while` loop over vs.NextObj/PrevObj hangs VW2026 "
+                "indefinitely (needs a Vectorworks restart). Traverse with "
+                "vs.ForEachObject(callback, \"(L='Layer')\") — it descends into "
+                "groups — or symbol instances via \"(S='Name')\". Pass "
+                "allow_handle_walk=true only if you know this build tolerates it."}
     ns = {'vs': vs, '__result__': None}
     buf = io.StringIO()
     old = sys.stdout
@@ -4745,20 +4897,68 @@ def resource_rename(p):
 def resource_delete(p):
     """Delete a resource. WARNING: deleting a Marionette style deletes bound
     instances — set unbind_instances=True (default) to unbind them first.
-    params: name, unbind_instances (bool, default True)."""
+
+    FREEZE RISK: finding which placed objects are bound to this style needs
+    a vs.ForEachObject(cb, "(T=PLUGINOBJECT)") scan. vs.ForEachObject has no
+    early-abort — it walks every object the criteria string can match, no
+    matter how few handles the Python callback keeps, and "(T=PLUGINOBJECT)"
+    alone has no layer filter, so unscoped this is a full-document walk: the
+    exact pattern that has frozen VW for 15+ minutes on a large office file
+    (see house rules / feedback_vwx_no_fulldoc_foreach). unbind_instances
+    defaults to True, so calling this with only {name} used to run that
+    unscoped walk on every single call, silently, including in a loop
+    cleaning up several old styles.
+
+    To bound the cost, pass layer (scan one layer) or layers (scan a list of
+    layers, one ForEachObject call per layer — still bounded, just several
+    smaller walks instead of one unbounded one). Without either, the
+    document-wide scan now requires confirm_full_scan=True to proceed
+    explicitly — it is not refused outright (unlike get_symbol_type's
+    single-instance lookup) because unbinding is a correctness requirement
+    here, not an optional lookup: skipping the scan on layers you didn't
+    list would leave THOSE instances still bound, and vs.DelObject on a
+    style with any remaining bound instance deletes those instances too.
+    A caller that truly needs every layer covered can pass
+    confirm_full_scan=True and accept the one-time full-document cost.
+
+    params: name, unbind_instances (bool, default True), layer (optional,
+    str — scan this one layer), layers (optional, list[str] — scan each of
+    these), confirm_full_scan (bool, default False — required to run the
+    unscoped full-document walk when neither layer nor layers is given)."""
     r = _safe(lambda: vs.GetObject(p.get('name', '')))
     if not r: return {'error': 'resource not found: %s' % p.get('name')}
     unbound = 0
+    scanned_scope = None
     if p.get('unbind_instances', True) and vs.GetTypeN(r) == 16:
-        objs = []
-        def cb(h): objs.append(h)
-        _safe(lambda: vs.ForEachObject(cb, "(T=PLUGINOBJECT)"))
-        for h in objs:
-            if _safe(lambda: vs.GetPluginStyle(h)) == (vs.GetName(r) or ''):
-                _safe(lambda: vs.SetPluginStyle(h, ''))
-                unbound += 1
+        style_name = vs.GetName(r) or ''
+        layer = p.get('layer')
+        layers = p.get('layers') or ([layer] if layer else None)
+        if not layers and not p.get('confirm_full_scan'):
+            return {'error': "unbind_instances needs a bounded scan: pass "
+                              "'layer' (one layer name) or 'layers' (a list) "
+                              "to scope the ForEachObject search, or pass "
+                              "'confirm_full_scan': true to explicitly accept "
+                              "an unscoped document-wide walk (can freeze VW "
+                              "for minutes on a large office file). Nothing "
+                              "was deleted."}
+        scopes = layers if layers else [None]  # [None] = confirmed full scan
+        for scope in scopes:
+            objs = []
+            def cb(h): objs.append(h)
+            if scope:
+                esc = str(scope).replace("'", "''")
+                crit = "(T=PLUGINOBJECT) & (L='%s')" % esc
+            else:
+                crit = "(T=PLUGINOBJECT)"
+            _safe(lambda: vs.ForEachObject(cb, crit))
+            for h in objs:
+                if _safe(lambda: vs.GetPluginStyle(h)) == style_name:
+                    _safe(lambda: vs.SetPluginStyle(h, ''))
+                    unbound += 1
+        scanned_scope = layers if layers else 'full-document (confirmed)'
     vs.DelObject(r)
-    return {'status': 'ok', 'unbound_instances': unbound}
+    return {'status': 'ok', 'unbound_instances': unbound,
+            'scanned_scope': scanned_scope}
 
 def resource_create_folder(p):
     """Try to create a symbol folder by script. UNRELIABLE on VW2026 (see block
