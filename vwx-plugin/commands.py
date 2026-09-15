@@ -6504,3 +6504,247 @@ def confirm_active_document(p):
                         'Aktives Dokument passt NICHT zu "expected" — der '
                         'Wechsel ist vermutlich noch nicht angekommen, oder '
                         'es wurde das falsche Fenster getroffen.')}
+
+
+# ── Zubehör v2: resource lists, native import/duplicate, style relink, nesting guard ──
+# Verified on VW2026 (2026-09-14/15, landscape site plan project):
+#   * No vs.* call creates a plug-in object style. SetPluginStyle / AddToPluginStyle /
+#     SetSymDefSubType only assign or tag. vs.CreateDuplicateObject(symDef, None) returns
+#     an invalid handle. BeginSym + CreateDuplicateObject(innerPIO, newSymDef) produces a
+#     style WITHOUT its hidden data (Data Tag layout fields, plant style parameter map);
+#     objects using it developed runaway nesting (hundreds of nested PIOs).
+#   * NEVER vs.ResetObject a plug-in object that lives inside a symbol definition (e.g. the
+#     inner plant of a plant style). Doing so filled plants with captured document content.
+#   * Data Tag field/layout definitions have no scripting API: UI only (Resource Manager).
+#   * A native duplicate works via import: rename the existing resource to a temp name,
+#     import the original name from a SAVED file (vs.BuildResourceListN + ImportResToCurFileN),
+#     rename the import to the new name, rename the temp back. Import skips resources that
+#     are identical to one already in the document (documented behaviour), which is why the
+#     temp rename is needed. The copy reflects the SAVED file, not unsaved edits.
+#   * Plants link to a plant style by name: Plant fields PlantDescription, 'Plant Name
+#     Formula' ("\"<style>\"") and isCustom=False, then ResetObject.
+#   * After editing a Data Tag style, new tags only render correctly after DT_ResetAllDataTags.
+#   * Resource type numbers (BuildResourceList): 16 symbol/style, 18 worksheet, 19 material,
+#     47 record format, 66 hatch, 92 symbol folder, 96 line type, 97 texture, 109 text style,
+#     120 gradient.
+
+RESOURCE_TYPES = {'symbol': 16, 'style': 16, 'worksheet': 18, 'material': 19, 'record': 47,
+                  'hatch': 66, 'folder': 92, 'linetype': 96, 'texture': 97,
+                  'textstyle': 109, 'gradient': 120}
+
+
+def _res_type(p):
+    t = p.get('type', 16)
+    if isinstance(t, str):
+        t = RESOURCE_TYPES.get(t.lower(), None) if not t.isdigit() else int(t)
+    return t
+
+
+def _res_names(rtype, path=None):
+    if path:
+        lid, n = vs.BuildResourceListN(rtype, path)
+    else:
+        lid, n = vs.BuildResourceList(rtype, 0, '')
+    return lid, [vs.GetNameFromResourceList(lid, i) for i in range(1, n + 1)]
+
+
+def resource_list(p):
+    """List resources of one type WITHOUT handle walks (BuildResourceList).
+    params: type (int or alias: symbol, style, worksheet, material, record, hatch, folder,
+            linetype, texture, textstyle, gradient; default 16), file_path (optional saved
+            .vwx to read from), filter (optional substring, case-insensitive)."""
+    rtype = _res_type(p)
+    if rtype is None:
+        return {'error': 'unknown type alias', 'aliases': sorted(RESOURCE_TYPES)}
+    try:
+        _, names = _res_names(rtype, p.get('file_path'))
+    except Exception as e:
+        return {'error': 'BuildResourceList failed: %r' % e}
+    f = (p.get('filter') or '').lower()
+    if f:
+        names = [n for n in names if f in n.lower()]
+    return {'status': 'ok', 'type': rtype, 'count': len(names), 'names': names}
+
+
+def _name_obj(name):
+    """vs.GetObject returns a dummy handle (type 0) for names that do not exist."""
+    h = _safe(lambda: vs.GetObject(name or ''))
+    if h is None or _safe(lambda: vs.GetTypeN(h), 0) == 0:
+        return None
+    return h
+
+
+def _pio_name(h):
+    return _safe(lambda: vs.GetName(vs.GetParametricRecord(h)), '')
+
+
+def _deep_count(h, cap=500, max_depth=4):
+    """Count objects inside a group-like container (PIO, group, symbol def), capped."""
+    c = [0]
+
+    # VW2026 trap: FInGroup() of an EMPTY group returns a handle into the PARENT list
+    # (e.g. the layer), so a naive walk counts the whole layer as 'nested'. Count a
+    # child only if its parent really is the container (compared by UUID).
+    def walk(container, first, depth):
+        cu = _safe(lambda: vs.GetObjectUuid(container), None)
+        items = []
+        vs.ForEachObjectInList(lambda o: items.append(o), 0, 0, first)
+        for o in items:
+            pu = _safe(lambda: vs.GetObjectUuid(vs.GetParent(o)), None)
+            if cu is not None and pu != cu:
+                continue
+            c[0] += 1
+            if c[0] >= cap:
+                return
+            if vs.GetTypeN(o) in (11, 86) and depth < max_depth:
+                g = vs.FInGroup(o)
+                if g is not None:
+                    walk(o, g, depth + 1)
+
+    first = vs.FInSymDef(h) if vs.GetTypeN(h) == 16 else vs.FInGroup(h)
+    if first is not None:
+        walk(h, first, 0)
+    return c[0]
+
+
+def resource_info(p):
+    """Inspect one resource by name. For symbol definitions reports subtype, whether it is a
+    plug-in style (and of which PIO), contents, and a capped nesting count.
+    params: name."""
+    h = _name_obj(p.get('name', ''))
+    if h is None:
+        return {'error': 'not found: %s' % p.get('name')}
+    t = vs.GetTypeN(h)
+    out = {'status': 'ok', 'name': vs.GetName(h), 'type': t}
+    if t == 16:
+        inner = []
+        first = vs.FInSymDef(h)
+        if first is not None:
+            vs.ForEachObjectInList(lambda o: inner.append(o), 0, 0, first)
+        pios = [_pio_name(o) for o in inner if vs.GetTypeN(o) == 86]
+        out.update({'subtype': _safe(lambda: vs.GetSymDefSubType(h)),
+                    'inner_types': [vs.GetTypeN(o) for o in inner][:50],
+                    'inner_pio': pios,
+                    'is_plugin_style': bool(pios) and len(inner) == 1,
+                    'nesting_count': _deep_count(h)})
+    return out
+
+
+def _import_one(path, rtype, name):
+    lid, names = _res_names(rtype, path)
+    if name not in names:
+        return None, 'not in source file: %s' % name
+    idx = names.index(name) + 1
+    h = vs.ImportResToCurFileN(lid, idx, lambda *a: 0)
+    return h, None
+
+
+def resource_import(p):
+    """Import a resource from a saved .vwx through Vectorworks' native import (hidden style
+    data travels with it). If the name already exists in the document, the existing resource
+    is kept and the import is placed under new_name via a temp-rename swap.
+    params: file_path, name, type (default 16), new_name (optional)."""
+    path, name, rtype = p.get('file_path'), p.get('name'), _res_type(p)
+    new_name = p.get('new_name')
+    if not path or not name:
+        return {'error': 'file_path and name required'}
+    if new_name and _name_obj(new_name) is not None:
+        return {'error': 'new_name already in use (global namespace): %s' % new_name}
+    existing = _name_obj(name)
+    tmp = None
+    if existing is not None:
+        if not new_name:
+            return {'error': 'name exists in document; give new_name to import a copy'}
+        tmp = '%s__vwxmcp_tmp' % name
+        vs.SetName(existing, tmp)
+        if vs.GetName(existing) != tmp:
+            return {'error': 'temp rename failed'}
+    try:
+        h, err = _import_one(path, rtype, name)
+        if err or h is None:
+            return {'error': err or 'import returned no handle'}
+        if new_name:
+            vs.SetName(h, new_name)
+        return {'status': 'ok', 'imported': vs.GetName(h), 'object_type': vs.GetTypeN(h),
+                'nesting_count': _deep_count(h) if vs.GetTypeN(h) == 16 else None}
+    finally:
+        if tmp is not None and existing is not None:
+            vs.SetName(existing, name)
+
+
+def resource_duplicate(p):
+    """Duplicate a resource natively (import-swap from the SAVED document). Unsaved edits to
+    the resource are NOT included — save first. Works for symbols and plug-in styles
+    (plant, data tag, ...). Never edits the copy's inner objects by ResetObject.
+    params: name, new_name, type (default 16), source_file (default: this document's saved
+            path; copied to a temp file before reading)."""
+    import os, shutil, tempfile
+    name, new_name = p.get('name'), p.get('new_name')
+    if not name or not new_name:
+        return {'error': 'name and new_name required'}
+    src = p.get('source_file') or _safe(lambda: vs.GetFPathName(), '')
+    if not src or not os.path.isfile(src):
+        return {'error': 'no saved source file (save the document first): %s' % src}
+    tmpdir = tempfile.mkdtemp(prefix='vwxmcp_dup_')
+    copy = os.path.join(tmpdir, 'source.vwx')
+    shutil.copy2(src, copy)
+    try:
+        r = resource_import({'file_path': copy, 'name': name, 'type': _res_type(p),
+                             'new_name': new_name})
+    finally:
+        _safe(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    if r.get('status') == 'ok':
+        r['note'] = 'copy reflects the saved file state of %s' % os.path.basename(src)
+    return r
+
+
+def pio_nesting_check(p):
+    """Read-only guard against runaway nesting: counts objects inside each matching plug-in
+    object (capped) and flags anything above threshold.
+    params: criteria (e.g. "(L='LL_03_Bäume') & (PON='Plant')"), cap (default 200),
+            threshold (default 50)."""
+    crit = p.get('criteria')
+    if not crit:
+        return {'error': 'criteria required (no full-document walks)'}
+    cap, thr = int(p.get('cap', 200)), int(p.get('threshold', 50))
+    hs = _collect(crit, limit=int(p.get('limit', 5000)))
+    heavy = []
+    for h in hs:
+        n = _deep_count(h, cap=cap)
+        if n > thr:
+            heavy.append({'object_id': _oid(h), 'count': n, 'class': vs.GetClass(h)})
+    return {'status': 'ok', 'checked': len(hs), 'heavy': heavy, 'clean': not heavy}
+
+
+def plant_style_relink(p):
+    """Link Plant objects to an existing plant style/definition by name.
+    Returns the previous links so a caller can restore them. Regeneration is delayed:
+    run pio_nesting_check in a SEPARATE call afterwards and restore if anything is heavy.
+    params: object_ids (list) or criteria, style (name of an existing plant style)."""
+    style = p.get('style')
+    sd = _name_obj(style)
+    if sd is None or vs.GetTypeN(sd) != 16:
+        return {'error': 'plant style not found: %s' % style}
+    hs = [_h(i) for i in (p.get('object_ids') or [])] or _collect(p.get('criteria') or '', 5000)
+    hs = [h for h in hs if h is not None and _pio_name(h) == 'Plant']
+    if not hs:
+        return {'error': 'no Plant objects matched'}
+    R = 'Plant'
+    prev = []
+    for h in hs:
+        prev.append((h, vs.GetRField(h, R, 'PlantDescription'), vs.GetRField(h, R, 'Plant Name Formula'),
+                     vs.GetRField(h, R, 'isCustom')))
+        vs.SetRField(h, R, 'PlantDescription', style)
+        vs.SetRField(h, R, 'Plant Name Formula', '"%s"' % style)
+        vs.SetRField(h, R, 'isCustom', 'Falsch')
+        vs.ResetObject(h)
+    return {'status': 'ok', 'relinked': len(hs),
+            'previous': [{'object_id': _oid(h), 'PlantDescription': d, 'Plant Name Formula': f,
+                          'isCustom': c} for h, d, f, c in prev],
+            'next': 'run pio_nesting_check in a separate call (regeneration is delayed)'}
+
+
+def datatag_refresh_all(p):
+    """Re-render every Data Tag in the document (needed after editing a Data Tag style)."""
+    vs.DT_ResetAllDataTags()
+    return {'status': 'ok'}
