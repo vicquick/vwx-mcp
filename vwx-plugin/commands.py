@@ -6524,6 +6524,13 @@ def confirm_active_document(p):
 #   * Plants link to a plant style by name: Plant fields PlantDescription, 'Plant Name
 #     Formula' ("\"<style>\"") and isCustom=False, then ResetObject.
 #   * After editing a Data Tag style, new tags only render correctly after DT_ResetAllDataTags.
+#   * A plant style's inner plant may be edited (spread/height + ResetObject); reset the
+#     instances twice afterwards (the first regen still shows the old hidden symbol size).
+#   * Maxon/Laubwerk 3D: copying lw_* fields does NOT generate the proxy mesh; the mesh is
+#     created by the UI inside the style. Set it once, then resource_duplicate that style for
+#     other sizes and change spread/height: the mesh scales with the instance.
+#   * vs.GetObject(name) returns a dummy handle (type 0) for unknown names (see _name_obj);
+#     vs.FInGroup() of an EMPTY group returns a handle into the parent list (see _deep_count).
 #   * Resource type numbers (BuildResourceList): 16 symbol/style, 18 worksheet, 19 material,
 #     47 record format, 66 hatch, 92 symbol folder, 96 line type, 97 texture, 109 text style,
 #     120 gradient.
