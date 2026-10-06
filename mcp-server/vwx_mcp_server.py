@@ -267,6 +267,14 @@ class VwxFileTransport:
                     return {'error': "the VWX Bridge palette is PAUSED — press "
                                      "Resume in the palette, then retry.",
                             'cid': cid, 'code': 'VW_BRIDGE_PAUSED'}
+            elif not os.path.exists(jp):
+                # Our job was CLAIMED: Vectorworks is executing it. A long vs.*
+                # call blocks VW's main thread, and with it the palette timer
+                # that writes the heartbeat — silence here means "busy", not
+                # "down" (seen live: a 41 s import answered ok after the server
+                # had already reported VW_BRIDGE_DOWN). Keep waiting for the
+                # result up to the normal timeout.
+                dead_since = None
             else:
                 now = time.monotonic()
                 dead_since = dead_since or now
@@ -1066,6 +1074,7 @@ def open_document(ctx: Context, path: str, wait_s: float = 180) -> str:
     if docs and _doc_open(docs, path):
         return json.dumps({"status": "ok", "document": os.path.basename(path),
                            "note": "already open"}, ensure_ascii=False)
+    before = (docs or {}).get("aktiv")
     try:
         os.startfile(path)          # the shell hands it to the running VW instance
     except Exception as e:
@@ -1075,9 +1084,16 @@ def open_document(ctx: Context, path: str, wait_s: float = 180) -> str:
         time.sleep(2.0)
         docs, err = _open_docs()
         if docs and _doc_open(docs, path):
+            # Vectorworks puts a freshly opened file in FRONT. Untargeted calls
+            # (the user, unbound agents) would land in it. Give the front back
+            # to whatever was there before — the opener reaches its file through
+            # use_document / document= anyway.
+            if before and _doc_key(before) != _doc_key(path):
+                get_vwx_connection().send_command("switch_document", {"name": before},
+                                                  {"_free": 1, "_prio": 1})
             _audit({"ts": round(time.time(), 3), "cmd": "open_document", "doc": path, "status": "ok"})
-            return json.dumps({"status": "ok", "document": os.path.basename(path)},
-                              ensure_ascii=False)
+            return json.dumps({"status": "ok", "document": os.path.basename(path),
+                               "front_restored_to": before}, ensure_ascii=False)
     return json.dumps({"error": f"{os.path.basename(path)} did not appear within {wait_s:.0f}s "
                                 "(large file still loading, or a dialog in Vectorworks waits "
                                 "for an answer — check with screenshot)",
