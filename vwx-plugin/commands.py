@@ -6755,3 +6755,254 @@ def datatag_refresh_all(p):
     """Re-render every Data Tag in the document (needed after editing a Data Tag style)."""
     vs.DT_ResetAllDataTags()
     return {'status': 'ok'}
+
+
+# ---------------------------------------------------------------------------
+# Erdbau (Auf-/Abtrag-Bilanz) — lived only in the deployed plug-in folder since
+# 2026-09 and was never committed; restored into the repo 2026-10-06 so a
+# redeploy of the repo copy cannot delete it.
+# ---------------------------------------------------------------------------
+
+def _erdbau_shoelace(pts):
+    s = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _erdbau_pip(x, y, poly):
+    """Ray casting. Eigene Implementierung, weil vs.PtInPoly bei Polygonen
+    mit Loch nicht verlaesslich ist."""
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _erdbau_contour(uuid, wbb):
+    """Aussenkontur der 2D-Komponente in Weltkoordinaten.
+    -> (punkte, bandflaeche, transformation_plausibel)"""
+    import math
+    o = vs.GetObjectByUuid(uuid)
+    if not o:
+        return None, None, False
+    rot = vs.GetSymRot(o)
+    sym = vs.GetObject(vs.GetSymName(o))
+    poly = None
+    c = vs.FInGroup(sym)
+    while c:
+        if vs.GetTypeN(c) in (5, 21):
+            try:
+                if vs.GetVertNum(c) >= 3:
+                    poly = c
+                    break
+            except Exception:
+                pass
+        c = vs.NextObj(c)
+    if not poly:
+        return None, None, False
+    n = vs.GetVertNum(poly)
+    P = [(vs.GetPolyPt(poly, k)[0], vs.GetPolyPt(poly, k)[1]) for k in range(1, n + 1)]
+    a = math.radians(rot)
+    ca, sa = math.cos(a), math.sin(a)
+    R = [(q[0] * ca - q[1] * sa, q[0] * sa + q[1] * ca) for q in P]
+    rminx, rminy = min(q[0] for q in R), min(q[1] for q in R)
+    rmaxx, rmaxy = max(q[0] for q in R), max(q[1] for q in R)
+    ok = (abs((rmaxx - rminx) - (wbb[1][0] - wbb[0][0])) < 0.5 and
+          abs((rmaxy - rminy) - (wbb[1][1] - wbb[0][1])) < 0.5)
+    tx, ty = wbb[0][0] - rminx, wbb[0][1] - rminy
+    return [(q[0] + tx, q[1] + ty) for q in R], vs.HAreaN(poly), ok
+
+
+def _erdbau_parse_m3(s):
+    s = str(s).strip()
+    if not s or s.startswith('<'):
+        return None
+    s = s.replace('m\u00b3', '').replace('m3', '').strip().replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def erdbau_bilanz(p):
+    """TG-Anteil im Auftrag rechnen und in LL-Erdbau schreiben.
+
+    params:
+      site_model_uuid  UUID des Gelaendemodells (Pflicht)
+      cell             Rasterweite in m, Vorgabe 2.0 (2.0 -> ca. 0,2 % Flaechenfehler)
+      tg_layer         Ebene der TG-Symbole, Vorgabe 'CGA_TG'
+      bodies           optional: [[uuid, name, z_uk, z_ok, [[x0,y0],[x1,y1]]], ...]
+      write            Vorgabe True; False = nur rechnen, nichts schreiben
+    """
+    import time
+    smu = p.get('site_model_uuid')
+    if not smu:
+        return {'error': 'site_model_uuid fehlt'}
+    sm = vs.GetObjectByUuid(smu)
+    if not sm:
+        return {'error': 'Gelaendemodell nicht gefunden'}
+    cell = float(p.get('cell', 2.0))
+    A = cell * cell
+    bodies = p.get('bodies') or _ERDBAU_BODIES_DEFAULT
+
+    out = []
+    tot = {'area': 0.0, 'env': 0.0, 'auf': 0.0, 'unter': 0.0, 'ueber': 0.0}
+    for b in bodies:
+        uuid, tag, z_lo, z_deck, wbb = b[0], b[1], float(b[2]), float(b[3]), b[4]
+        poly, band, ok = _erdbau_contour(uuid, wbb)
+        if not poly or not ok:
+            out.append({'sym': tag, 'error': 'Transformation nicht plausibel'})
+            continue
+        area = _erdbau_shoelace(poly)
+        x0 = min(q[0] for q in poly); x1 = max(q[0] for q in poly)
+        y0 = min(q[1] for q in poly); y1 = max(q[1] for q in poly)
+        cells = 0
+        auf = unter = ueber = 0.0
+        fails = 0
+        y = y0 + cell / 2.0
+        while y < y1:
+            x = x0 + cell / 2.0
+            while x < x1:
+                if _erdbau_pip(x, y, poly):
+                    cells += 1
+                    vs.Locus3D(x, y, 0.0); L = vs.LNewObj()
+                    okB = vs.DTM6_SendToSurface(sm, L, 3)
+                    zb = vs.GetLocus3D(L)[2]; vs.DelObject(L)
+                    vs.Locus3D(x, y, 0.0); L = vs.LNewObj()
+                    okS = vs.DTM6_SendToSurface(sm, L, 1)
+                    zs = vs.GetLocus3D(L)[2]; vs.DelObject(L)
+                    if okB and okS:
+                        ov = min(z_deck, zs) - max(z_lo, zb)
+                        if ov > 0: auf += ov * A
+                        ub = min(z_deck, zb) - z_lo
+                        if ub > 0: unter += ub * A
+                        ob = z_deck - max(z_lo, zs)
+                        if ob > 0: ueber += ob * A
+                    else:
+                        fails += 1
+                x += cell
+            y += cell
+        env = area * (z_deck - z_lo)
+        out.append({'sym': tag, 'area': round(area, 2),
+                    'band_area': round(band, 2) if band else None,
+                    'area_err_pct': round(100.0 * (cells * A - area) / area, 2),
+                    'envelope': round(env, 1), 'im_auftrag': round(auf, 1),
+                    'unter_bestand': round(unter, 1), 'ueber_soll': round(ueber, 1),
+                    'fails': fails})
+        tot['area'] += area; tot['env'] += env
+        tot['auf'] += auf; tot['unter'] += unter; tot['ueber'] += ueber
+
+    beton = 0.0
+    hs = []
+    vs.ForEachObject(lambda h: hs.append(h),
+                     "(L='%s')" % p.get('tg_layer', 'CGA_TG'))
+    for h in hs:
+        if vs.GetTypeN(h) != 15:
+            continue
+        sym = vs.GetObject(vs.GetSymName(h))
+        c = vs.FInGroup(sym)
+        while c:
+            if vs.GetTypeN(c) == 84:
+                v = vs.ObjVolume(c)
+                if v: beton += v
+            c = vs.NextObj(c)
+
+    fill = _erdbau_parse_m3(vs.GetRField(sm, 'DTM6', 'Fill Volume'))
+    cut = _erdbau_parse_m3(vs.GetRField(sm, 'DTM6', 'Cut Volume'))
+    res = {'status': 'ok', 'cell_m': cell, 'bodies': out,
+           'beton_m3': round(beton, 3),
+           'footprint_m2': round(tot['area'], 1),
+           'envelope_m3': round(tot['env'], 1),
+           'im_auftrag_m3': round(tot['auf'], 1),
+           'unter_bestand_m3': round(tot['unter'], 1),
+           'ueber_soll_m3': round(tot['ueber'], 1),
+           'fill_volume': fill, 'cut_volume': cut}
+
+    if p.get('write', True):
+        for nm, dv, ft in _ERDBAU_FIELDS:
+            try: vs.NewField(_ERDBAU_REC, nm, dv, ft, 0)
+            except Exception: pass
+        vs.SetRecord(sm, _ERDBAU_REC)
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Volumen_Beton', '%.3f' % beton)
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Huellvolumen', '%.3f' % tot['env'])
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Anteil_im_Auftrag', '%.3f' % tot['auf'])
+        # Die TG steht auf BEIDEN Seiten der Bilanz: auf der Auftragsseite wird
+        # sie abgezogen, auf der Abtragsseite addiert. DGM Cut vergleicht nur
+        # zwei Oberflaechen und enthaelt die Baugrube nicht.
+        vs.SetRField(sm, _ERDBAU_REC, 'TG_Anteil_im_Abtrag', '%.3f' % tot['unter'])
+        vs.SetRField(sm, _ERDBAU_REC, 'Stand', time.strftime('%Y-%m-%d %H:%M'))
+        if fill is not None:
+            vs.SetRField(sm, _ERDBAU_REC, 'Fuellboden_brutto', '%.3f' % fill)
+            vs.SetRField(sm, _ERDBAU_REC, 'Fuellboden_netto',
+                         '%.3f' % (fill - tot['auf']))
+            res['note'] = 'ok'
+        if cut is not None:
+            vs.SetRField(sm, _ERDBAU_REC, 'Aushub_brutto', '%.3f' % cut)
+            vs.SetRField(sm, _ERDBAU_REC, 'Aushub_gesamt',
+                         '%.3f' % (cut + tot['unter']))
+        else:
+            res['note'] = ('Fill Volume nicht gerechnet - erst '
+                           '"Auftrag/Abtrag aktualisieren" am Gelaendemodell')
+        res['written'] = {f[0]: vs.GetRField(sm, _ERDBAU_REC, f[0])
+                          for f in _ERDBAU_FIELDS}
+    return res
+
+
+def erdbau_read(p):
+    """Aktuelle LL-Erdbau-Werte am Gelaendemodell lesen. params: site_model_uuid."""
+    sm = vs.GetObjectByUuid(p.get('site_model_uuid', ''))
+    if not sm:
+        return {'error': 'Gelaendemodell nicht gefunden'}
+    if not vs.GetObject(_ERDBAU_REC):
+        return {'error': 'Datensatz %s existiert nicht' % _ERDBAU_REC}
+    return {'status': 'ok',
+            'values': {f[0]: vs.GetRField(sm, _ERDBAU_REC, f[0])
+                       for f in _ERDBAU_FIELDS},
+            'dtm6': {k: vs.GetRField(sm, 'DTM6', k)
+                     for k in ('Fill Volume', 'Cut Volume', 'Geometry Zref')}}
+
+
+def erdbau_tg_probe(p):
+    """Diagnose ohne Schreiben: Grundrissflaeche, Bandprobe (Umfang x 0,30
+    gegen die Netto-Polygonflaeche) und Hoehenstufen je TG-Koerper.
+    params: tg_layer (Vorgabe 'CGA_TG'), bodies (optional)."""
+    import math
+    bodies = p.get('bodies') or _ERDBAU_BODIES_DEFAULT
+    out = []
+    for b in bodies:
+        uuid, tag, z_lo, z_deck, wbb = b[0], b[1], float(b[2]), float(b[3]), b[4]
+        poly, band, ok = _erdbau_contour(uuid, wbb)
+        d = {'sym': tag, 'transform_ok': ok}
+        if poly:
+            per = 0.0
+            for i in range(len(poly)):
+                x1, y1 = poly[i]
+                x2, y2 = poly[(i + 1) % len(poly)]
+                per += math.hypot(x2 - x1, y2 - y1)
+            d.update({'verts': len(poly), 'area': round(_erdbau_shoelace(poly), 2),
+                      'perimeter': round(per, 2),
+                      'band_area': round(band, 2) if band else None,
+                      'band_check_30cm': round(per * 0.30, 2),
+                      'z_lo': z_lo, 'z_deck': z_deck})
+        o = vs.GetObjectByUuid(uuid)
+        if o:
+            sym = vs.GetObject(vs.GetSymName(o))
+            c = vs.FInGroup(sym)
+            while c:
+                if vs.GetTypeN(c) == 84:
+                    g = vs.Get3DInfo(c); cc = vs.Get3DCntr(c)
+                    d['solid'] = {'vol_beton': round(vs.ObjVolume(c), 3),
+                                  'z_lo_real': round(cc[1] - g[2] / 2.0, 3),
+                                  'z_hi_real': round(cc[1] + g[2] / 2.0, 3)}
+                c = vs.NextObj(c)
+        out.append(d)
+    return {'status': 'ok', 'bodies': out}

@@ -62,6 +62,9 @@ VWX_CACHE_TTL = int(os.environ.get("VWX_CACHE_TTL", "45"))
 # survive a palette restart and a Vectorworks modal that stalls the tick.
 VWX_ALIVE_MAX_AGE = float(os.environ.get("VWX_ALIVE_MAX_AGE", "8"))
 VWX_ALIVE_GRACE = float(os.environ.get("VWX_ALIVE_GRACE", "20"))
+# Heartbeat already older than this when a call starts = bridge is off, fail
+# immediately (no grace wait).
+VWX_ALIVE_STALE = float(os.environ.get("VWX_ALIVE_STALE", "60"))
 
 # MCP Tasks extension (RC spec, finalizes 2026-07-28). OFF by default: a task=True
 # tool returns a task handle the client must poll (tasks/get), which breaks clients
@@ -231,6 +234,18 @@ class VwxFileTransport:
             os.replace(tmp, jp)
         deadline = time.monotonic() + VWX_SOCKET_TIMEOUT
         dead_since = None
+        # Grace exists to ride out a palette restart or a modal that stalls the
+        # tick. A heartbeat that was already stale long before this call (VW
+        # still booting, palette never opened) is not a hiccup — answer at once
+        # instead of making every call wait the full grace (20 s each, 2026-10-02).
+        alive, _, age = self.bridge_state()
+        if not alive and age > VWX_ALIVE_STALE:
+            self._discard(jp)
+            seen = "never" if age == float('inf') else f"{age:.0f}s ago"
+            return {'error': "the VWX Bridge palette is not running "
+                             f"(last heartbeat: {seen}). Vectorworks may still be "
+                             "starting — open the VWX Bridge palette and retry.",
+                    'cid': cid, 'code': 'VW_BRIDGE_DOWN'}
         while time.monotonic() < deadline:
             result = self._read_result(cid)
             if result is not None:
@@ -2570,7 +2585,15 @@ def _vw_windows():
         u32.GetWindowRect(hwnd, ctypes.byref(rect))
         area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
         entry = (hwnd, buf.value, area)
-        (dialogs if u32.GetWindow(hwnd, 4) else doc).append(entry)   # GW_OWNER
+        owner = u32.GetWindow(hwnd, 4)                               # GW_OWNER
+        if not owner:
+            doc.append(entry)
+        # A modal disables its owner — that is what makes it modal. Any other
+        # owned window (overlay, tooltip, palette under a class name not
+        # listed above) leaves the frame usable and is ignored, never
+        # captured in place of the drawing.
+        elif not u32.IsWindowEnabled(owner):
+            dialogs.append(entry)
         return True
 
     u32.EnumWindows(_cb, 0)

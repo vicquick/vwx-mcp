@@ -20,7 +20,7 @@
 #     *_settings kwargs, ToolResult + utilities.types.Image, and run()'s
 #     host/port/uvicorn_config transport kwargs.
 # Re-verify tools/list emits no outputSchema before moving this pin again.
-fastmcp==4.0.3
+fastmcp==4.0.10
 
 # Window capture for the `screenshot` tool: PNG encoding and a quality
 # downscale. Vectorworks has no headless render-to-file API, so visual
