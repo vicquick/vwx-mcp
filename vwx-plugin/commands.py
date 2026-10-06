@@ -183,8 +183,8 @@ def save_document(p):
 def save_document_as(p):
     path = p.get('path', '')
     try:
-        vs.SaveActiveDocument(path, True)
-        return {'status': 'ok', 'path': path}
+        rc = vs.SaveActiveDocument(path)          # VW2026: one argument (vs_index)
+        return {'status': 'ok', 'path': path, 'rc': rc}
     except Exception as e:
         return {'error': str(e)}
 
@@ -589,7 +589,19 @@ def close_document(p):
     if not aktiv_hwnd:
         return {'error': 'aktives Dokumentfenster nicht gefunden', 'diagnose': diagnose}
     if save:
-        _safe(lambda: vs.DoMenuTextByName('Save', 0))
+        # NOT DoMenuTextByName('Save'): like every menu command it is queued
+        # and runs after this script — i.e. after the WM_CLOSE below, so
+        # Vectorworks asked "save changes?" and that modal blocked the whole
+        # bridge for 15 minutes (2026-10-06). SaveActiveDocument saves NOW,
+        # without dialogs, and reports success.
+        rc = _safe(lambda: vs.SaveActiveDocument(path), None)
+        if rc not in (0, True, None):
+            return {'error': 'Speichern fehlgeschlagen (rc=%r) — nicht geschlossen.' % (rc,),
+                    'code': 'DOC_SAVE_FAILED'}
+        if rc is None:
+            return {'error': 'SaveActiveDocument nicht ausfuehrbar — nicht geschlossen, '
+                             'damit kein Sichern-Dialog die Bridge blockiert.',
+                    'code': 'DOC_SAVE_FAILED'}
     WM_CLOSE = 0x0010
     u.PostMessageW(aktiv_hwnd, WM_CLOSE, 0, 0)
     return {'status': 'angestossen', 'dokument': name, 'gespeichert': bool(save),
