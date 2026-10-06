@@ -213,7 +213,7 @@ class VwxFileTransport:
             pass
         return result
 
-    def send_command(self, command_type, params=None):
+    def send_command(self, command_type, params=None, meta=None):
         cid = uuid.uuid4().hex[:12]
         t0 = time.perf_counter()
         # 'poll' (async retrieval): just look for the result file.
@@ -226,6 +226,8 @@ class VwxFileTransport:
                     'note': 'file transport: result not written yet'}
         job = {'type': command_type, 'params': params or {}, '_cid': cid,
                'ts': time.time()}
+        if meta:
+            job.update(meta)          # _doc, _prio, _session, _agent (v14 routing)
         jp = os.path.join(self.jobs, '%013d-%s.json' % (time.time() * 1000, cid))
         with self._lock:
             tmp = jp + '.tmp'
@@ -361,8 +363,11 @@ class VwxMCPServer:
             except Exception: pass
             self.socket = None
 
-    def send_command(self, command_type, params=None):
+    def send_command(self, command_type, params=None, meta=None):
         """Send newline-delimited JSON command, read newline-delimited response.
+
+        meta (v14 document routing) is accepted for interface parity and
+        ignored: the classic dialog bridge always runs in the active document.
 
         One round-trip is serialized under self._lock so concurrent tool calls
         can't interleave on the shared socket. A correlation id (cid) + latency
@@ -459,7 +464,159 @@ def get_vwx_connection():
     return _vwx_connection
 
 
-def cmd(command_type, params=None):
+# ═══════════════════════════════════════════════════════════════════
+# v14 — several agents, one Vectorworks
+# ═══════════════════════════════════════════════════════════════════
+#
+# Vectorworks runs one command at a time and every vs.* call acts on the
+# active document. Before v14 that made the front document shared mutable
+# state: agent A's switch_document silently redirected agent B's next write.
+# Now every job carries its target document and the in-VW pump activates it
+# (and verifies it) before running the job — see vwx_pump.py. This module
+# decides that target per call:
+#
+#   explicit `document=` argument  >  session binding (use_document)  >  none
+#
+# "none" keeps the pre-v14 meaning: the document the user is working in.
+# On top sit cooperative write locks per document, a priority per session
+# (interactive work overtakes batch harvests), a path policy and an audit log.
+
+# Paths a command may WRITE to or OPEN from. Y: is the office share: read it,
+# never write to it, never open originals from it (VW converts and asks to
+# save on close). Override with VWX_DENY_ROOTS="Y:\;Z:\" (";"-separated).
+VWX_DENY_ROOTS = [r.strip() for r in os.environ.get(
+    "VWX_DENY_ROOTS", "Y:\\;\\\\").split(";") if r.strip()]
+_PATH_KEYS = ("path", "file_path", "filepath", "out_path", "output", "output_path",
+              "folder", "dir", "pfad", "ziel", "target_path", "export_path")
+_WRITE_PATH_PREFIXES = ("export_", "save_document_as", "write_", "resource_export")
+_PRIO = {"interactive": 5, "batch": 8, "background": 9, "urgent": 1}
+
+# Commands that do not depend on which document is in front. They run
+# wherever the bridge currently is and never cause a document switch.
+_DOC_FREE = frozenset({
+    "ping", "list_documents", "vs_signature", "vs_index_stats", "list_commands",
+    "distance", "distance_3d", "polygon_centroid", "three_point_center",
+})
+# Document-free only when they read a SAVED file instead of the front document.
+_DOC_FREE_WITH_FILE = frozenset({"resource_list", "resource_info_file"})
+
+_coord_lock = threading.Lock()
+_sessions: Dict[str, Dict[str, Any]] = {}     # session id -> binding
+_locks: Dict[str, Dict[str, Any]] = {}        # document key -> lock
+
+
+def _doc_key(doc):
+    """Comparable key for a document reference (base name, case-insensitive).
+
+    Locks are per base name on purpose: two agents writing 'Plan.vwx' from
+    different folders is rare, and a lock that is too broad is harmless while
+    one that is too narrow is not."""
+    s = (doc or "").replace("\\", "/").strip().rsplit("/", 1)[-1].strip(" *").lower()
+    return s or None
+
+
+def _session_info():
+    """(session id, agent name) of the calling MCP session, or (None, None)."""
+    try:
+        from fastmcp.server.dependencies import get_context
+        ctx = get_context()
+    except Exception:
+        return None, None
+    sid = None
+    try:
+        sid = ctx.session_id
+    except Exception:
+        pass
+    agent = None
+    try:
+        info = ctx.session.client_params.clientInfo
+        agent = "%s %s" % (info.name, getattr(info, "version", "") or "")
+    except Exception:
+        try:
+            agent = ctx.client_id
+        except Exception:
+            agent = None
+    return sid, (agent or "").strip() or None
+
+
+def _under_denied_root(p):
+    n = os.path.normcase(os.path.abspath(p)) if p else ""
+    for root in VWX_DENY_ROOTS:
+        r = os.path.normcase(root)
+        if n.startswith(r) or (p or "").replace("/", "\\").lower().startswith(root.lower()):
+            return root
+    return None
+
+
+def _path_violation(command_type, params):
+    """A write/open aimed at a protected root, or None."""
+    if not (command_type.startswith(_WRITE_PATH_PREFIXES) or command_type == "open_document"):
+        return None
+    for k, v in (params or {}).items():
+        if k.lower() in _PATH_KEYS and isinstance(v, str):
+            root = _under_denied_root(v)
+            if root:
+                return {"error": f"refused: {command_type} would write to or open "
+                                 f"from the protected location {root} ({v}). "
+                                 "Copy the file to a local folder first.",
+                        "code": "PATH_DENIED"}
+    return None
+
+
+_AUDIT_MAX = 5 * 1024 * 1024
+
+
+def _audit(rec):
+    """Append one line to ipc/audit.jsonl (rotated at 5 MB)."""
+    base = _plugin_dir()
+    if not base:
+        return
+    path = os.path.join(base, "ipc", "audit.jsonl")
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > _AUDIT_MAX:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _route(command_type, params, document):
+    """Decide target document + priority; enforce locks. Returns (meta, error)."""
+    sid, agent = _session_info()
+    with _coord_lock:
+        binding = _sessions.get(sid) if sid else None
+        if binding is not None:
+            binding["last"] = time.time()
+        doc = document or (binding or {}).get("doc")
+        prio = (binding or {}).get("prio", _PRIO["interactive"])
+        key = _doc_key(doc)
+        if key and not _is_readonly(command_type):
+            lk = _locks.get(key)
+            if lk and lk["until"] < time.time():
+                _locks.pop(key, None)
+                lk = None
+            if lk and lk["sid"] != sid:
+                return None, {"error": f"{doc} is locked by {lk.get('agent') or 'another agent'} "
+                                       f"until {time.strftime('%H:%M:%S', time.localtime(lk['until']))} "
+                                       f"({lk.get('reason') or 'no reason given'}). Reads are allowed; "
+                                       "writes wait for unlock_document or the lock expiry.",
+                              "code": "DOC_LOCKED"}
+    meta = {"_prio": prio}
+    free = (command_type in _DOC_FREE
+            or (command_type in _DOC_FREE_WITH_FILE and (params or {}).get("file_path")))
+    if free and not document:
+        meta["_free"] = 1                 # run in whatever document is in front
+    elif doc:
+        meta["_doc"] = doc
+    if sid:
+        meta["_session"] = sid[:16]
+    if agent:
+        meta["_agent"] = agent[:60]
+    return meta, None
+
+
+def cmd(command_type, params=None, document=None):
     """Send command and return JSON string.
 
     Compact separators, not indent=2. Every tool returns through here, so the
@@ -467,9 +624,29 @@ def cmd(command_type, params=None):
     the payload depending on nesting depth. ensure_ascii=False keeps German
     layer, class and plant names (Winkelstützen, Grünfläche) as real characters
     instead of \\uXXXX escapes, which is both shorter and readable.
+
+    document: target document for this one call (base name or full path);
+    overrides the session binding from use_document.
     """
-    return json.dumps(get_vwx_connection().send_command(command_type, params),
-                      ensure_ascii=False, separators=(",", ":"))
+    t0 = time.perf_counter()
+    result = _path_violation(command_type, params)
+    meta = None
+    if result is None:
+        meta, result = _route(command_type, params, document)
+    if result is None:
+        result = get_vwx_connection().send_command(command_type, params, meta)
+    rec = {"ts": round(time.time(), 3), "cmd": command_type,
+           "ms": round((time.perf_counter() - t0) * 1000),
+           "doc": (meta or {}).get("_doc"), "prio": (meta or {}).get("_prio"),
+           "session": (meta or {}).get("_session"), "agent": (meta or {}).get("_agent"),
+           "status": ("err" if isinstance(result, dict) and result.get("error") else "ok"),
+           "code": result.get("code") if isinstance(result, dict) else None}
+    if command_type == "execute_script":
+        code = str((params or {}).get("code", ""))
+        rec["script_head"] = code[:160]
+        rec["script_len"] = len(code)
+    _audit(rec)
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 @asynccontextmanager
@@ -708,6 +885,10 @@ def list_documents(ctx: Context) -> str:
 def switch_document(ctx: Context, name: str = None, hwnd: int = None) -> str:
     """Bring another open document to the front, by file name or window handle.
 
+    With more than one agent, prefer use_document (or document= on vwx /
+    execute_script): switching the front document here changes it for every
+    agent that has not bound itself to a document.
+
     QUEUED, NOT DONE: the switch takes effect after the call returns, so this
     answer reports what was asked for, not what happened. Confirm with
     confirm_active_document as the next call before writing anything — a
@@ -719,6 +900,195 @@ def switch_document(ctx: Context, name: str = None, hwnd: int = None) -> str:
     if name: p["name"] = name
     if hwnd: p["hwnd"] = hwnd
     return cmd("switch_document", p)
+
+# ── v14 coordination: several agents in one Vectorworks ─────────────────────
+
+def _open_docs():
+    try:
+        r = get_vwx_connection().send_command("list_documents", {}, {"_free": 1, "_prio": 1})
+    except Exception as e:
+        return None, str(e)
+    if not isinstance(r, dict) or r.get("error"):
+        return None, (r or {}).get("error") if isinstance(r, dict) else str(r)
+    return r, None
+
+
+def _doc_open(docs, document):
+    key = _doc_key(document)
+    return any(_doc_key(d.get("datei")) == key for d in (docs or {}).get("dokumente", []))
+
+
+@vtool
+def use_document(ctx: Context, document: Optional[str] = None,
+                 priority: str = "interactive") -> str:
+    """Bind THIS agent session to one open document (file name or full path).
+
+    Every later call of this session — explicit tools, vwx, vwx_batch,
+    execute_script — runs in that document, no matter which document the user
+    or another agent has in front. The bridge activates it, verifies it, runs
+    the job, and brings the user's document back when the queue is done. Call
+    with no document to unbind (calls then go to the user's active document
+    again). priority: interactive (default) | batch | background — batch work
+    yields to interactive calls of other agents. Use this INSTEAD of
+    switch_document whenever more than one agent may be working."""
+    if priority not in _PRIO:
+        return json.dumps({"error": f"priority must be one of {sorted(_PRIO)}"})
+    sid, agent = _session_info()
+    if not sid:
+        return json.dumps({"error": "no MCP session id — binding needs the HTTP transport"})
+    if document:
+        docs, err = _open_docs()
+        if err:
+            return json.dumps({"error": err})
+        if not _doc_open(docs, document):
+            return json.dumps({"error": f"{document} is not open in Vectorworks",
+                               "code": "DOC_NOT_OPEN",
+                               "offen": [d.get("datei") for d in docs.get("dokumente", [])],
+                               "hint": "open it with open_document(path) first"},
+                              ensure_ascii=False)
+    with _coord_lock:
+        if document:
+            _sessions[sid] = {"doc": document, "prio": _PRIO[priority], "agent": agent,
+                              "since": time.time(), "last": time.time()}
+        else:
+            _sessions.pop(sid, None)
+    return json.dumps({"status": "ok", "session": sid[:16], "document": document,
+                       "priority": priority}, ensure_ascii=False)
+
+
+@vtool
+def lock_document(ctx: Context, document: str, minutes: float = 15,
+                  reason: str = "") -> str:
+    """Reserve WRITE access to one document for this session (cooperative lock).
+
+    Other agents can still read it; their writes get DOC_LOCKED until you call
+    unlock_document or the lock expires (default 15 min, renew by calling
+    again). Take a lock before a multi-step build so nobody edits in between."""
+    sid, agent = _session_info()
+    key = _doc_key(document)
+    if not key:
+        return json.dumps({"error": "document required"})
+    with _coord_lock:
+        lk = _locks.get(key)
+        if lk and lk["sid"] != sid and lk["until"] > time.time():
+            return json.dumps({"error": f"already locked by {lk.get('agent')}",
+                               "code": "DOC_LOCKED", "until": lk["until"]})
+        _locks[key] = {"sid": sid, "agent": agent, "doc": document, "reason": reason,
+                       "until": time.time() + max(1.0, float(minutes)) * 60}
+    return json.dumps({"status": "ok", "document": document,
+                       "until": time.strftime("%H:%M:%S", time.localtime(_locks[key]["until"]))},
+                      ensure_ascii=False)
+
+
+@vtool
+def unlock_document(ctx: Context, document: str) -> str:
+    """Release a lock taken with lock_document (only the holder can release)."""
+    sid, _agent = _session_info()
+    key = _doc_key(document)
+    with _coord_lock:
+        lk = _locks.get(key)
+        if not lk:
+            return json.dumps({"status": "ok", "note": "was not locked"})
+        if lk["sid"] != sid and lk["until"] > time.time():
+            return json.dumps({"error": f"locked by {lk.get('agent')}, not by this session",
+                               "code": "DOC_LOCKED"})
+        _locks.pop(key, None)
+    return json.dumps({"status": "ok", "document": document}, ensure_ascii=False)
+
+
+@vtool
+def get_bridge_status(ctx: Context, audit_lines: int = 20) -> str:
+    """Who is doing what: queued jobs per document/agent, bindings, locks, the
+    bridge's document routing state and the last audit entries. Read-only,
+    answered by the server without a Vectorworks round-trip."""
+    base = _plugin_dir()
+    out = {"status": "ok"}
+    try:
+        t = get_vwx_connection()
+        alive, paused, age = t.bridge_state() if hasattr(t, "bridge_state") else (None, None, None)
+        out["bridge"] = {"alive": alive, "paused": paused,
+                         "heartbeat_age_s": None if age in (None, float("inf")) else round(age, 1)}
+    except Exception as e:
+        out["bridge"] = {"error": str(e)}
+    queued = []
+    if base:
+        jd = os.path.join(base, "ipc", "jobs")
+        for fn in sorted(os.listdir(jd)) if os.path.isdir(jd) else []:
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(jd, fn), encoding="utf-8") as fh:
+                    j = json.load(fh)
+                queued.append({"cmd": j.get("type"), "doc": j.get("_doc"), "prio": j.get("_prio"),
+                               "agent": j.get("_agent"), "age_s": round(time.time() - j.get("ts", time.time()), 1)})
+            except Exception:
+                pass
+        try:
+            with open(os.path.join(base, "ipc", "docstate.json"), encoding="utf-8") as fh:
+                out["routing"] = json.load(fh)
+        except Exception:
+            out["routing"] = {}
+        try:
+            with open(os.path.join(base, "ipc", "audit.jsonl"), encoding="utf-8") as fh:
+                out["audit"] = [json.loads(l) for l in fh.readlines()[-max(0, int(audit_lines)):]]
+        except Exception:
+            out["audit"] = []
+    out["queued"] = queued
+    now = time.time()
+    with _coord_lock:
+        for sid in [s for s, b in _sessions.items() if now - b.get("last", now) > 4 * 3600]:
+            _sessions.pop(sid, None)
+        out["sessions"] = [{"session": s[:16], "agent": b.get("agent"), "doc": b.get("doc"),
+                            "prio": b.get("prio")} for s, b in _sessions.items()]
+        out["locks"] = [{"doc": l.get("doc"), "agent": l.get("agent"), "reason": l.get("reason"),
+                         "until": time.strftime("%H:%M:%S", time.localtime(l["until"]))}
+                        for l in _locks.values() if l["until"] > now]
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+
+@vtool
+def open_document(ctx: Context, path: str, wait_s: float = 180) -> str:
+    """Open a .vwx in the running Vectorworks (no clicking) and wait until it
+    shows up as an open document. Refuses files on the protected office share
+    (copy them locally first — VW converts old versions and asks to save on
+    close). Pair with use_document to work in it, close_document when done."""
+    if not path or not path.lower().endswith(".vwx"):
+        return json.dumps({"error": "path to a .vwx file required"})
+    bad = _path_violation("open_document", {"path": path})
+    if bad:
+        return json.dumps(bad, ensure_ascii=False)
+    if not os.path.isfile(path):
+        return json.dumps({"error": f"file not found: {path}"}, ensure_ascii=False)
+    docs, err = _open_docs()
+    if docs and _doc_open(docs, path):
+        return json.dumps({"status": "ok", "document": os.path.basename(path),
+                           "note": "already open"}, ensure_ascii=False)
+    try:
+        os.startfile(path)          # the shell hands it to the running VW instance
+    except Exception as e:
+        return json.dumps({"error": f"could not hand the file to Windows: {e}"})
+    deadline = time.monotonic() + max(5.0, float(wait_s))
+    while time.monotonic() < deadline:
+        time.sleep(2.0)
+        docs, err = _open_docs()
+        if docs and _doc_open(docs, path):
+            _audit({"ts": round(time.time(), 3), "cmd": "open_document", "doc": path, "status": "ok"})
+            return json.dumps({"status": "ok", "document": os.path.basename(path)},
+                              ensure_ascii=False)
+    return json.dumps({"error": f"{os.path.basename(path)} did not appear within {wait_s:.0f}s "
+                                "(large file still loading, or a dialog in Vectorworks waits "
+                                "for an answer — check with screenshot)",
+                       "code": "DOC_OPEN_TIMEOUT"}, ensure_ascii=False)
+
+
+@vtool
+def close_document(ctx: Context, document: str, save: bool = True) -> str:
+    """Close one open document (by file name or path). save=True saves first
+    (no dialog); save=False only closes a document without unsaved changes —
+    otherwise Vectorworks would ask, so it is refused. Never closes the
+    document the user is working in unless you name it."""
+    return cmd("close_document", {"save": save}, document=document)
+
 
 @vtool
 def get_document_preferences(ctx: Context) -> str:
@@ -1548,12 +1918,17 @@ def apply_texture(ctx: Context, object_id: str, texture_name: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @vtool
-def execute_script(ctx: Context, code: str, allow_handle_walk: bool = False) -> str:
+def execute_script(ctx: Context, code: str, allow_handle_walk: bool = False,
+                   document: Optional[str] = None) -> str:
     """Execute arbitrary vs.* Python code inside Vectorworks.
     Code runs on VW main thread. Use __result__ to return a value.
     Example: '__result__ = vs.GetDocumentName()'
-    All vs.* functions available. Stdout captured in 'output' key."""
-    return cmd("execute_script", {"code": code, "allow_handle_walk": allow_handle_walk})
+    All vs.* functions available. Stdout captured in 'output' key.
+    document: run in this open document (file name or full path) instead of
+    the session's bound / the user's active one — the bridge brings it to the
+    front, verifies it, runs, and later restores the user's document."""
+    return cmd("execute_script", {"code": code, "allow_handle_walk": allow_handle_walk},
+               document=document)
 
 @vtool
 def run_menu_command(ctx: Context, menu_name: str) -> str:
@@ -1566,7 +1941,8 @@ def run_menu_command(ctx: Context, menu_name: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 @vtool
-def vwx(ctx: Context, command: str, params: Optional[Dict[str, Any]] = None) -> str:
+def vwx(ctx: Context, command: str, params: Optional[Dict[str, Any]] = None,
+        document: Optional[str] = None) -> str:
     """Generic VWX command dispatcher.
 
     Calls ANY function defined in the bridge's commands.py by name. The bridge
@@ -1574,14 +1950,17 @@ def vwx(ctx: Context, command: str, params: Optional[Dict[str, Any]] = None) -> 
     immediately. Use `list_commands(filter)` to discover what's available —
     typical examples: `vwx('create_pio', {'name':'Door','x':0,'y':0})`,
     `vwx('offset_polygon', {'object_id':uuid,'distance':500})`,
-    `vwx('send_to_surface', {'object_id':uuid})`, `vwx('list_components', {...})`."""
-    return cmd(command, params or {})
+    `vwx('send_to_surface', {'object_id':uuid})`, `vwx('list_components', {...})`.
+    document: target open document for this call (see use_document)."""
+    return cmd(command, params or {}, document=document)
 
 @vtool
-def vwx_batch(ctx: Context, calls: List[Dict[str, Any]]) -> str:
+def vwx_batch(ctx: Context, calls: List[Dict[str, Any]],
+              document: Optional[str] = None) -> str:
     """Run multiple VWX commands in one round-trip (saves socket + main-thread trips).
-    calls: [{'command': str, 'params': dict}, ...]. Returns list of results in order."""
-    return cmd("_batch", {"calls": calls})
+    calls: [{'command': str, 'params': dict}, ...]. Returns list of results in order.
+    document: run the whole batch in this open document (see use_document)."""
+    return cmd("_batch", {"calls": calls}, document=document)
 
 @vtool
 def list_commands(ctx: Context, filter: Optional[str] = None) -> str:
@@ -3045,6 +3424,32 @@ def _install_middleware():
             logger.warning(f"response caching unavailable: {e}")
 
 
+class _BearerTokenGuard:
+    """Optional shared-secret check on every HTTP request (pure ASGI).
+
+    Active only when VWX_MCP_TOKEN is set. Clients then send
+    'Authorization: Bearer <token>' (Claude Code: "headers" in .mcp.json).
+    The server listens on 127.0.0.1 only, so this guards against other local
+    processes and users — anything that can reach the port could otherwise
+    drive Vectorworks, including execute_script."""
+
+    def __init__(self, app, token):
+        self.app = app
+        self.expected = ("Bearer " + token).encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            auth = dict(scope.get("headers") or []).get(b"authorization", b"")
+            import hmac
+            if not hmac.compare_digest(auth, self.expected):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body",
+                            "body": b'{"error":"missing or wrong bearer token"}'})
+                return
+        await self.app(scope, receive, send)
+
+
 def main():
     _init_otel()
     _install_middleware()
@@ -3060,10 +3465,30 @@ def main():
 
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport in ("http", "streamable-http", "sse"):
+        host = os.environ.get("FASTMCP_HOST", "127.0.0.1")
+        port = int(os.environ.get("FASTMCP_PORT", "8082"))
+        extra = {}
+        # Host/Origin guard: a web page in any browser on this machine can send
+        # requests to 127.0.0.1:8082 — and via DNS rebinding even pass the
+        # same-origin rules. Strict mode accepts only local Host headers and
+        # rejects foreign browser Origins, which closes that door without
+        # affecting non-browser MCP clients. VWX_ORIGIN_GUARD=0 turns it off.
+        if os.environ.get("VWX_ORIGIN_GUARD", "1") != "0":
+            extra["host_origin_protection"] = True
+            extra["allowed_hosts"] = [f"127.0.0.1:{port}", f"localhost:{port}"]
+        token = os.environ.get("VWX_MCP_TOKEN", "").strip()
+        if token:
+            from starlette.middleware import Middleware as _ASGIMw
+            extra["middleware"] = [_ASGIMw(_BearerTokenGuard, token=token)]
+            logger.info("bearer token required on every request (VWX_MCP_TOKEN)")
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning(f"listening on {host} — Vectorworks becomes reachable from "
+                           "the network; set VWX_MCP_TOKEN")
         mcp.run(
             transport=transport,
-            host=os.environ.get("FASTMCP_HOST", "0.0.0.0"),
-            port=int(os.environ.get("FASTMCP_PORT", "8082")),
+            host=host,
+            port=port,
+            **extra,
             # uvicorn's default timeout_keep_alive is 5s: any two tool calls
             # spaced further apart raced the server's FIN on the idle keep-alive
             # connection -> sporadic "Unable to connect" on the first call,

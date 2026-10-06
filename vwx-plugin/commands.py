@@ -546,6 +546,46 @@ def switch_document(p):
                        'Antwort belegt ihn nicht.'}
 
 
+def close_document(p):
+    """Close the ACTIVE document (the v14 pump has already brought the
+    requested one to the front and verified it). params: save (default True),
+    force (close without saving — Vectorworks will ask if there are changes).
+
+    The close is POSTED (WM_CLOSE to the document window), not executed here:
+    this script runs inside the very document being closed, and tearing it
+    down underneath a running script is exactly the kind of context change VW
+    does not survive. The message is handled after the script returns. Saving
+    happens now, synchronously, via the Save menu command (same as
+    save_document). A never-saved document is refused — Save would open the
+    Save-As dialog and block the bridge.
+    """
+    name = _safe(vs.GetFName, '') or ''
+    path = _safe(vs.GetFPathName, '') or ''
+    save = p.get('save', True)
+    if save and not path:
+        return {'error': '%s was never saved — Save would open a dialog. '
+                         'Use save_document_as first.' % name, 'code': 'DOC_UNSAVED'}
+    if not save and not p.get('force'):
+        return {'error': 'save=False needs force=True: Vectorworks asks before '
+                         'discarding changes, and that dialog blocks the bridge.',
+                'code': 'DOC_CLOSE_NEEDS_FORCE'}
+    teile = _win32()
+    if not teile:
+        return {'error': 'Schliessen gibt es nur unter Windows.'}
+    u, _pid, _ctypes, _wt = teile
+    fenster, _client, diagnose = _dokumentfenster()
+    aktiv_hwnd = diagnose.get('aktiv_hwnd')
+    if not aktiv_hwnd:
+        return {'error': 'aktives Dokumentfenster nicht gefunden', 'diagnose': diagnose}
+    if save:
+        _safe(lambda: vs.DoMenuTextByName('Save', 0))
+    WM_CLOSE = 0x0010
+    u.PostMessageW(aktiv_hwnd, WM_CLOSE, 0, 0)
+    return {'status': 'angestossen', 'dokument': name, 'gespeichert': bool(save),
+            'hinweis': 'Das Fenster schliesst, sobald dieses Skript zurueck ist; '
+                       'list_documents bestaetigt es.'}
+
+
 # ── Layers ──────────────────────────────────────────────────────────────────
 
 def get_layers(p):

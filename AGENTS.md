@@ -10,6 +10,33 @@ draws) rather than errors.
 MCP endpoint: `http://127.0.0.1:8082/mcp` (streamable-http). The VW-side bridge
 must be running first (see README). `ping` confirms the full chain is live.
 
+## Working next to other agents (v14) — read this first
+
+Several agents (and the user) can share one Vectorworks. The rules:
+
+1. **Bind, don't switch.** Call `use_document("MyFile.vwx")` once (or pass
+   `document=` on `vwx` / `vwx_batch` / `execute_script`). Every later call of
+   your session runs in that document; the bridge activates and verifies it,
+   and brings the user's document back afterwards. `switch_document` changes
+   the front document for everyone — avoid it when others may be working.
+2. **Unbound calls go to the user's document**, even while the bridge is
+   visiting another file for someone else.
+3. **Lock before multi-step builds:** `lock_document(doc, minutes, reason)` →
+   other sessions get `DOC_LOCKED` on writes (reads pass). `unlock_document`
+   when done.
+4. **Batch work yields:** `use_document(doc, priority="batch")` lets
+   interactive calls of other agents overtake your queue.
+5. **Open/close without clicking:** `open_document(local_path)` (never from
+   `Y:` — copy first), `close_document(doc, save=True)`.
+6. **See who does what:** `get_bridge_status` (queue, bindings, locks, routing,
+   audit tail).
+7. `screenshot` always shows the FRONT document — with bindings that is not
+   necessarily yours; check `get_bridge_status` → `routing`.
+
+Error codes: `DOC_NOT_OPEN`, `DOC_AMBIGUOUS`, `DOC_SWITCH_FAILED`,
+`DOC_LOCKED`, `DOC_UNSAVED`, `DOC_CLOSE_NEEDS_FORCE`, `DOC_OPEN_TIMEOUT`,
+`PATH_DENIED` — none of them ran anything.
+
 ## Three access layers — pick the narrowest that works
 
 1. **Explicit tools** (248). Typed, documented, safe. Prefer these.
@@ -268,7 +295,11 @@ Set in `bridge/vwx-mcp.bat`.
 | `VWX_TASKS` | _(off)_ | Opt long-running tools into the MCP Tasks extension. Needs `pip install 'fastmcp[tasks]'` **and** a Tasks-capable client; warns + stays off otherwise |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | _(off)_ | If set, exports fastmcp's spans via OTLP. Needs `opentelemetry-exporter-otlp` |
 | `MCP_TRANSPORT` | `stdio` | `streamable-http` for the HTTP server, `stdio` for local |
-| `FASTMCP_HOST` / `FASTMCP_PORT` | `0.0.0.0` / `8082` | HTTP bind |
+| `FASTMCP_HOST` / `FASTMCP_PORT` | `127.0.0.1` / `8082` | HTTP bind (a non-local bind logs a warning — set a token) |
+| `VWX_MCP_TOKEN` | _(off)_ | Shared secret; clients must send `Authorization: Bearer <token>` |
+| `VWX_ORIGIN_GUARD` | `1` | Strict Host/Origin check against browser pages / DNS rebinding |
+| `VWX_DENY_ROOTS` | `Y:\;\\` | `;`-separated roots that exports, saves and `open_document` refuse |
+| `VWX_DRAIN_BUDGET_S` | `2.0` | (VW process env) max seconds per drain before the UI gets a turn |
 | `DESKTOP_HOST` / `VWX_MCP_PORT` | `127.0.0.1` / `9878` | VW bridge socket |
 
 ## Reliability & observability notes

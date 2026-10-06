@@ -50,6 +50,42 @@ enforced structurally: no other code path calls it, which is why the bridge
 cannot crash VW even when a trigger misfires (jobs simply stay queued and the
 MCP call times out visibly).
 
+## v14 — several agents, one Vectorworks
+
+Every `vs.*` call acts on the active document, so before v14 the front
+document was shared state between all agents: one agent's `switch_document`
+silently redirected another agent's next write. v14 removes that coupling
+without adding any new execution context (mutations still run only in the
+Python menu-command runner):
+
+| Layer | What it does |
+|---|---|
+| server `_route()` | stamps every job with `_doc` (explicit `document=` > session binding from `use_document`), `_prio` (interactive 5 / batch 8 / background 9), `_session`, `_agent`; document-independent commands (`ping`, `list_documents`, `vs_signature`, `resource_list` with `file_path`, …) get `_free` instead |
+| server locks | `lock_document` = cooperative write lock per document (base name); writes of other sessions get `DOC_LOCKED`, reads pass |
+| pump `pump_all()` | runs all jobs whose target is the active document (priority, then arrival), within a 2 s budget; then posts `WM_MDIACTIVATE` for the next target and returns; the next trigger verifies the switch (`GetFName`/`GetFPathName`) before running anything there |
+| pump home | untargeted jobs belong to the user's document ("home"); when the targeted work is done the bridge brings home back to the front; a manual switch by the user becomes the new home and is never fought |
+| pump failures | `DOC_NOT_OPEN`, `DOC_AMBIGUOUS` (same base name twice), `DOC_SWITCH_FAILED` (switch did not land within 15 s / 6 tries) — the job is answered, never run in the wrong document |
+| `pump_readonly()` | never switches; runs read jobs whose target is already in front |
+| `close_document` | saves, posts `WM_CLOSE`, stops the drain (nothing may run in a closing document) |
+| `open_document` | server-side `os.startfile` of a local `.vwx`, waits until the window appears |
+
+State lives in `ipc/docstate.json` (`home`, `switch`, `bridge_doc`); every
+call is appended to `ipc/audit.jsonl` (session, agent, document, command,
+duration, status, first 160 chars of each `execute_script`), rotated at 5 MB.
+`get_bridge_status` shows queue, bindings, locks, routing state and the audit
+tail without a Vectorworks round-trip.
+
+Security defaults: listens on 127.0.0.1; strict Host/Origin guard (blocks
+browser pages and DNS rebinding from reaching the bridge; `VWX_ORIGIN_GUARD=0`
+to disable); optional shared secret `VWX_MCP_TOKEN` (clients send
+`Authorization: Bearer …`); path policy `VWX_DENY_ROOTS` (default `Y:\` and
+UNC shares) refuses exports/saves/opens there — reading saved files there is
+allowed.
+
+Tests without Vectorworks: `python tests/test_pump_routing.py` (6 routing
+scenarios against a fake `vs`) and `tests/test_server_coord.py` (bindings,
+locks, path policy; run with the server venv).
+
 ## Command lifecycle
 
 1. Tool call → server writes `ipc/jobs/<ts>-<cid>.json` (atomic tmp+replace).

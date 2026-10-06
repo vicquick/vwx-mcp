@@ -183,10 +183,11 @@ def _list_jobs():
 
 
 _peek_cache = {}
+FREE = '*'                     # routing marker: document-independent job
 
 
-def _peek_cmd(fn):
-    """Read a job's command name WITHOUT claiming it.
+def _peek(fn):
+    """Read a job's routing header WITHOUT claiming it: (type, doc, prio).
 
     Cached by filename. Job files are written once under a unique
     <timestamp>-<cid> name and never rewritten, so the answer cannot go stale.
@@ -199,13 +200,27 @@ def _peek_cmd(fn):
         return hit
     try:
         with open(os.path.join(_JOBS, fn), 'r', encoding='utf-8') as f:
-            cmd = json.load(f).get('type', '')
+            msg = json.load(f)
     except Exception:
         return None
+    try:
+        prio = int(msg.get('_prio', 5))
+    except Exception:
+        prio = 5
+    # doc: None = the user's document; FREE = runs in whichever document is
+    # in front and never causes a switch (ping, list_documents, reading a
+    # saved file, ...)
+    doc = FREE if msg.get('_free') else ((msg.get('_doc') or '').strip() or None)
+    hit = (msg.get('type', ''), doc, prio)
     if len(_peek_cache) > 512:          # bounded: a stuck queue must not grow it forever
         _peek_cache.clear()
-    _peek_cache[fn] = cmd
-    return cmd
+    _peek_cache[fn] = hit
+    return hit
+
+
+def _peek_cmd(fn):
+    hit = _peek(fn)
+    return hit[0] if hit else None
 
 
 def _claim_and_run(fn):
@@ -288,39 +303,254 @@ def _housekeep():
         pass
 
 
-def pump_readonly():
-    """Drain read-only jobs only. Safe in the OnIdle / notification context."""
-    _housekeep()
-    done = 0
+# ── v14: document-targeted jobs (several agents, one Vectorworks) ──────────
+#
+# Every vs.* call acts on the ACTIVE document; VectorScript has no handle to
+# any other open document. So instead of one shared "front document" that
+# every agent fights over, each job may name its target in `_doc` (base file
+# name or full path). The pump runs all jobs for the active document first,
+# then asks for the next target to come to the front (posted WM_MDIACTIVATE,
+# same mechanism as switch_document) and returns; the palette re-triggers on
+# the next tick and the drain continues in the new document. Because VW runs
+# exactly one job at a time, nothing can interleave between "activate" and
+# "run" — the switch is verified with vs.GetFName/GetFPathName before any job
+# of that target executes.
+#
+# Untargeted jobs keep their old meaning ("the user's document"): once the
+# bridge has moved away from the document the user was in, they are routed to
+# that HOME document, and when no targeted work is left the bridge puts the
+# user's document back in front. If the user switches documents by hand in the
+# meantime, the bridge takes that as the new home and does not fight it.
+#
+# Mutations still run ONLY here, in pump_all (VW's Python menu-command runner).
+# The OnIdle read drain never switches documents; it only runs read jobs whose
+# target is already active.
+
+_DOCSTATE = os.path.join(_IPC, 'docstate.json')
+SWITCH_RETRY_S = 15.0          # give a posted switch this long to land
+SWITCH_MAX_TRIES = 6
+DRAIN_BUDGET_S = float(os.environ.get('VWX_DRAIN_BUDGET_S', '2.0'))
+
+
+def _norm_path(s):
+    return (s or '').replace('\\', '/').strip().lower()
+
+
+def _base(s):
+    return _norm_path(s).rsplit('/', 1)[-1].strip(' *')
+
+
+def _active_doc():
+    try:
+        import vs
+        return (vs.GetFName() or ''), (vs.GetFPathName() or '')
+    except Exception:
+        return '', ''
+
+
+def _doc_is_active(target, active):
+    """target: base name or full path; active: (name, path) of the front doc."""
+    if not target or target == FREE:
+        return True
+    name, path = active
+    t = _norm_path(target)
+    if '/' in t:                         # a path pins the exact file
+        return bool(path) and _norm_path(path) == t
+    return _base(name) == _base(t) or (bool(path) and _base(path) == _base(t))
+
+
+def _load_state():
+    try:
+        with open(_DOCSTATE, 'r', encoding='utf-8') as f:
+            st = json.load(f)
+            if isinstance(st, dict):
+                return st
+    except Exception:
+        pass
+    return {}
+
+
+def _save_state(st):
+    try:
+        _write_json(_DOCSTATE, st)
+    except Exception as e:
+        _log("docstate not writable: %s" % e)
+
+
+def _effective_target(doc, st):
+    """Untargeted jobs belong to the user's (home) document."""
+    if doc:                      # explicit target, or FREE
+        return doc
+    home = st.get('home')
+    if not home:
+        return None
+    return home.get('path') or home.get('name') or None
+
+
+def _fail_job(fn, code, message, extra=None):
+    """Answer a queued job with an error without running it."""
+    src = os.path.join(_JOBS, fn)
+    work = src + '.working'
+    _peek_cache.pop(fn, None)
+    try:
+        os.replace(src, work)
+    except Exception:
+        return
+    try:
+        with open(work, 'r', encoding='utf-8') as f:
+            msg = json.load(f)
+    except Exception:
+        msg = {}
+    try: os.remove(work)
+    except Exception: pass
+    cid = str(msg.get('_cid', fn))
+    res = {'error': message, 'code': code}
+    if extra:
+        res.update(extra)
+    _write_json(os.path.join(_RESULTS, cid + '.json'), res)
+    _log("cid=%s cmd=%s %s" % (cid, msg.get('type', ''), code))
+
+
+def _ordered_jobs():
+    """Queued jobs as (fn, type, doc, prio), interactive first, then by arrival."""
+    out = []
     for fn in _list_jobs():
-        if _is_readonly(_peek_cmd(fn) or ''):
-            if _claim_and_run(fn):
-                done += 1
+        hit = _peek(fn)
+        if hit is None:
+            continue
+        out.append((fn,) + hit)
+    out.sort(key=lambda j: (j[3], j[0]))
+    return out
+
+
+def _request_switch(target):
+    """Post the activation of `target`. Returns None or an error code+info."""
+    try:
+        commands = _get_commands()
+        r = commands.switch_document({'hwnd': target} if isinstance(target, int)
+                                     else {'name': _base(target)})
+    except Exception as e:
+        return 'DOC_SWITCH_FAILED', {'detail': repr(e)}
+    if isinstance(r, dict) and r.get('error'):
+        if r.get('kandidaten'):
+            return 'DOC_AMBIGUOUS', {'kandidaten': r.get('kandidaten')}
+        return 'DOC_NOT_OPEN', {'offen': r.get('offen', [])}
+    return None
+
+
+def pump_readonly():
+    """Drain read-only jobs only. Safe in the OnIdle / notification context.
+
+    Never switches documents: a read aimed at another document waits for
+    pump_all, which owns all document changes.
+    """
+    _housekeep()
+    st = _load_state()
+    active = _active_doc()
+    done = 0
+    for fn, cmd, doc, _prio in _ordered_jobs():
+        if not _is_readonly(cmd or ''):
+            continue
+        if not _doc_is_active(_effective_target(doc, st), active):
+            continue
+        if _claim_and_run(fn):
+            done += 1
     if done:
         _log("readonly drain: %d job(s)" % done)
 
 
 def pump_all():
-    """Drain EVERY job. Call ONLY from genuine command dispatch (DoInterface)."""
+    """Drain jobs for the active document, then move on to the next target.
+
+    Call ONLY from genuine command dispatch (VW's Python menu-command runner).
+    """
     _housekeep()
-    _log("pump_all: genuine dispatch — draining everything")
+    st = _load_state()
+    active = _active_doc()
+    t0 = time.time()
+
+    # The bridge left document X in front, nothing is pending, and now Y is in
+    # front: the user switched by hand. Y is the new home; do not switch back.
+    bridge_doc = st.get('bridge_doc')
+    if bridge_doc and not st.get('switch') and not _doc_is_active(bridge_doc, active):
+        st['home'] = {'name': active[0], 'path': active[1]}
+        st.pop('bridge_doc', None)
+        _log("user switched to %s — new home" % active[0])
+
+    # A switch we asked for earlier: landed, still pending, or failed.
+    sw = st.get('switch')
+    if sw:
+        if _doc_is_active(sw['target'], active):
+            st['bridge_doc'] = sw['target']
+            st.pop('switch', None)
+            _log("switch landed: %s" % active[0])
+        elif time.time() - sw.get('since', 0) > SWITCH_RETRY_S or sw.get('tries', 0) >= SWITCH_MAX_TRIES:
+            for fn, _c, doc, _p in _ordered_jobs():
+                if _effective_target(doc, st) == sw['target']:
+                    _fail_job(fn, 'DOC_SWITCH_FAILED',
+                              'Vectorworks did not bring %s to the front.' % sw['target'],
+                              {'aktiv': active[0]})
+            st.pop('switch', None)
+
     done = 0
-    # Re-list only after a pass that actually ran something: a job arriving
-    # mid-drain still gets picked up, but a pass that claimed nothing ends the
-    # loop instead of spinning on directory enumerations. The pass cap is a
-    # backstop against a job that can neither be claimed nor removed, which
-    # would otherwise wedge this loop inside VW's command dispatch — the one
-    # context where a hang is most visible to the user.
     for _pass in range(64):
-        jobs = _list_jobs()
+        jobs = _ordered_jobs()
         if not jobs:
             break
         ran = 0
-        for fn in jobs:
-            if _claim_and_run(fn):
-                ran += 1
+        closed = False
+        for fn, _cmd, doc, _prio in jobs:
+            if time.time() - t0 > DRAIN_BUDGET_S:
+                break                     # give the UI (and priorities) a turn
+            if _doc_is_active(_effective_target(doc, st), active):
+                if _claim_and_run(fn):
+                    ran += 1
+                    if _cmd == 'close_document':
+                        closed = True
+                        break             # the front document is about to go away
+        if closed:
+            # Nothing else may run in a document whose WM_CLOSE is queued; the
+            # next trigger re-reads the front document from scratch.
+            st.pop('bridge_doc', None)
+            done += ran
+            _save_state(st)
+            _log("close_document posted — drain stops here")
+            return
         done += ran
-        if ran == 0:
+        if ran == 0 or time.time() - t0 > DRAIN_BUDGET_S:
             break
+
+    remaining = [(fn, doc) for fn, _c, doc, _p in _ordered_jobs()]
+    waiting = [(fn, _effective_target(doc, st)) for fn, doc in remaining
+               if not _doc_is_active(_effective_target(doc, st), active)]
+    if waiting and time.time() - t0 <= DRAIN_BUDGET_S:
+        target = waiting[0][1]
+        sw = st.get('switch')
+        if sw and sw.get('target') == target:
+            sw['tries'] = sw.get('tries', 0) + 1
+            err = _request_switch(target)          # nudge again
+        else:
+            if not st.get('home'):
+                st['home'] = {'name': active[0], 'path': active[1]}
+            err = _request_switch(target)
+            st['switch'] = {'target': target, 'since': time.time(), 'tries': 1}
+        if err:
+            code, info = err
+            for fn, tgt in waiting:
+                if tgt == target:
+                    _fail_job(fn, code, 'Document %s cannot be activated.' % target, info)
+            st.pop('switch', None)
+        else:
+            _log("switch requested -> %s (%d job(s) waiting)" % (target, len(waiting)))
+    elif not remaining and st.get('home') and not st.get('switch'):
+        home = st['home']
+        home_t = home.get('path') or home.get('name')
+        if home_t and not _doc_is_active(home_t, active):
+            if not _request_switch(home_t):
+                _log("all targeted work done — back to %s" % home.get('name'))
+        st.pop('home', None)
+        st.pop('bridge_doc', None)
+
+    _save_state(st)
     if done:
-        _log("pump_all done: %d job(s)" % done)
+        _log("pump_all done: %d job(s) in %s" % (done, active[0]))

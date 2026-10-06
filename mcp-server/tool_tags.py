@@ -26,6 +26,12 @@ TOOL_TAGS = {
     "save_document_as": "document",
     "list_documents": "document",
     "switch_document": "document",
+    "use_document": "document",
+    "lock_document": "document",
+    "unlock_document": "document",
+    "get_bridge_status": "document",
+    "open_document": "document",
+    "close_document": "document",
     "get_document_preferences": "document",
     "set_document_preferences": "document",
     # layers
