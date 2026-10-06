@@ -55,6 +55,8 @@ class Harness:
             sys.modules.pop(m, None)
         sys.path.insert(0, self.dir)
         self.pump = importlib.import_module("vwx_pump")
+        self.pump.STICKY_S = 0.0     # time does not pass in these tests; see test_dwell
+        self.pump.RESTORE_DELAY_S = 0.0   # see test_restore_delay
         import commands
         commands.STATE = self.state
         commands._vwx_loaded_mtime = os.path.getmtime(os.path.join(self.dir, "commands.py"))
@@ -191,6 +193,94 @@ def test_user_switch_becomes_home():
         h.run()
         check(h.result(u)["ran_in"] == "C.vwx", "untargeted job ran in the user's new doc C")
         check(h.state["active"] == "C.vwx", "bridge did not pull the user back to A")
+    finally:
+        h.close()
+
+
+def test_job_arriving_while_restore_is_in_flight():
+    print("untargeted job arriving between 'restore posted' and 'restore landed'")
+    h = Harness()
+    try:
+        h.job("get_layers", doc="B.vwx")
+        h.pump.pump_all(); h.tick()          # -> B
+        h.pump.pump_readonly()
+        h.pump.pump_all()                    # B job done, restore to A POSTED (not landed)
+        check(h.state["active"] == "B.vwx" and h.state["pending"] == "A.vwx",
+              "restore is in flight")
+        u = h.job("get_layers")              # agent A, unbound, arrives right now
+        h.pump.pump_readonly()
+        h.pump.pump_all()
+        check(h.result(u) is None, "it did NOT run in B while the restore was pending")
+        h.tick()
+        h.run(2)
+        check(h.result(u)["ran_in"] == "A.vwx", "it ran in A once the restore landed")
+    finally:
+        h.close()
+
+
+def test_dwell_keeps_interactive_agent_in_front():
+    print("an interactive agent mid-sequence is not interrupted by batch work")
+    import time as _t
+    h = Harness()
+    try:
+        h.pump.STICKY_S = 0.3
+        h.job("get_layers", prio=5)               # interactive, user's doc
+        h.pump.pump_all(); h.tick()
+        b = h.job("get_layers", doc="B.vwx", prio=8)
+        h.pump.pump_all(); h.tick()
+        check(h.state["active"] == "A.vwx" and h.result(b) is None,
+              "batch job for B waits while A is still busy")
+        _t.sleep(0.35)
+        h.run(3)
+        check(h.result(b)["ran_in"] == "B.vwx", "after the dwell it runs in B")
+        check(h.state["active"] == "A.vwx", "and A is back in front")
+    finally:
+        h.close()
+
+
+def test_restore_delay_batches_a_bound_agents_calls():
+    print("a bound agent's call sequence costs ONE switch, not one per call")
+    import time as _t
+    h = Harness()
+    try:
+        h.pump.RESTORE_DELAY_S = 0.3
+        switches = []
+        orig = h.pump._request_switch
+        h.pump._request_switch = lambda t: (switches.append(t), orig(t))[1]
+        for _ in range(3):                         # calls arrive one after another
+            h.job("get_layers", doc="B.vwx")
+            h.run(2)
+        check(h.state["active"] == "B.vwx", "still in B between the calls")
+        check(os.path.exists(h.pump._WAKE), "wake marker keeps the palette firing")
+        _t.sleep(0.35)
+        h.run(2)
+        check(h.state["active"] == "A.vwx", "back in A after the idle delay")
+        check(not os.path.exists(h.pump._WAKE), "wake marker removed")
+        check(len(switches) == 2, "exactly one switch there and one back (%d)" % len(switches))
+    finally:
+        h.close()
+
+
+def test_hold_pins_document_for_screenshot():
+    print("_hold keeps a document in front until _release, others wait")
+    h = Harness()
+    try:
+        import commands
+        commands._hold = lambda p: commands._rec("_hold", p)
+        commands._release = lambda p: commands._rec("_release", p)
+        h.job("_hold", doc="B.vwx")
+        h.run(2)
+        check(h.state["active"] == "B.vwx", "B held in front")
+        c = h.job("get_layers", doc="C.vwx")
+        u = h.job("get_layers")
+        h.run(3)
+        check(h.result(c) is None and h.result(u) is None, "C job and home job wait during the hold")
+        check(h.state["active"] == "B.vwx", "no switch away while held")
+        h.job("_release", free=True)
+        h.run(6)
+        check(h.result(c)["ran_in"] == "C.vwx" and h.result(u)["ran_in"] == "A.vwx",
+              "after release both ran in their documents")
+        check(h.state["active"] == "A.vwx", "user's document back in front")
     finally:
         h.close()
 

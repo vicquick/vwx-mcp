@@ -330,6 +330,52 @@ _DOCSTATE = os.path.join(_IPC, 'docstate.json')
 SWITCH_RETRY_S = 15.0          # give a posted switch this long to land
 SWITCH_MAX_TRIES = 6
 DRAIN_BUDGET_S = float(os.environ.get('VWX_DRAIN_BUDGET_S', '2.0'))
+# Hysteresis against ping-pong: an agent working interactively sends one call,
+# waits for the answer, sends the next. Between two of its calls the queue for
+# its document is briefly empty — without a dwell the bridge would switch to a
+# lower-priority (batch) target in that gap and back again for every call.
+STICKY_S = float(os.environ.get('VWX_STICKY_S', '0.4'))
+# Do not bring the user's document back the instant a bound agent's queue is
+# empty: its next call is usually a fraction of a second away, and every
+# switch costs a full redraw of a large plan (1-2 s, measured live). Restore
+# only after the visited document has been idle this long.
+RESTORE_DELAY_S = float(os.environ.get('VWX_RESTORE_DELAY_S', '1.5'))
+# The palette only fires the pump while ipc/jobs holds a *.json. To wait out
+# the restore delay with an otherwise empty queue, the pump parks this marker
+# there; it is never dispatched and is removed once the restore is issued.
+_WAKE = os.path.join(_JOBS, 'wake-restore.json')
+# Screenshots: Vectorworks has ONE drawing surface — an inactive document
+# window renders the ACTIVE document's view (verified live: three document
+# windows, three pixel-identical captures). So an agent that wants to see its
+# document sends `_hold` (targeted: brings it to the front), captures, then
+# `_release`. While held, the bridge does not switch away. Capped so a crashed
+# client can never pin the front document.
+HOLD_MAX_S = 10.0
+
+
+def _hold_active(st, active):
+    h = st.get('hold')
+    if not h:
+        return False
+    if time.time() > h.get('until', 0) or not _doc_is_active(h.get('doc'), active):
+        st.pop('hold', None)
+        return False
+    return True
+
+
+def _set_wake():
+    if not os.path.exists(_WAKE):
+        try:
+            _write_json(_WAKE, {'type': '_wake'})
+        except Exception:
+            pass
+
+
+def _clear_wake():
+    try:
+        os.remove(_WAKE)
+    except Exception:
+        pass
 
 
 def _norm_path(s):
@@ -415,6 +461,8 @@ def _ordered_jobs():
     """Queued jobs as (fn, type, doc, prio), interactive first, then by arrival."""
     out = []
     for fn in _list_jobs():
+        if fn.startswith('wake-'):
+            continue                      # restore-delay marker, never a job
         hit = _peek(fn)
         if hit is None:
             continue
@@ -448,6 +496,7 @@ def pump_readonly():
     st = _load_state()
     active = _active_doc()
     done = 0
+    best = None
     for fn, cmd, doc, _prio in _ordered_jobs():
         if not _is_readonly(cmd or ''):
             continue
@@ -455,6 +504,16 @@ def pump_readonly():
             continue
         if _claim_and_run(fn):
             done += 1
+            if doc != FREE:
+                best = _prio if best is None else min(best, _prio)
+    if best is not None:
+        # Reads count as activity for the dwell in pump_all — an agent that
+        # only reads is just as "mid-sequence" as one that writes.
+        last = st.get('last_run') or {}
+        if time.time() - last.get('ts', 0) < STICKY_S:
+            best = min(best, last.get('prio', 99))
+        st['last_run'] = {'ts': time.time(), 'prio': best}
+        _save_state(st)
     if done:
         _log("readonly drain: %d job(s)" % done)
 
@@ -471,19 +530,41 @@ def pump_all():
 
     # The bridge left document X in front, nothing is pending, and now Y is in
     # front: the user switched by hand. Y is the new home; do not switch back.
+    # Same while we are on our way back home: if neither the document we left
+    # in front nor the home we asked for is in front, the user chose a third
+    # one — that choice wins.
     bridge_doc = st.get('bridge_doc')
-    if bridge_doc and not st.get('switch') and not _doc_is_active(bridge_doc, active):
+    sw = st.get('switch')
+    restoring = bool(sw and sw.get('restore'))
+    if (bridge_doc and (not sw or restoring)
+            and not _doc_is_active(bridge_doc, active)
+            and not (restoring and _doc_is_active(sw['target'], active))):
         st['home'] = {'name': active[0], 'path': active[1]}
         st.pop('bridge_doc', None)
+        st.pop('switch', None)
         _log("user switched to %s — new home" % active[0])
 
     # A switch we asked for earlier: landed, still pending, or failed.
     sw = st.get('switch')
     if sw:
         if _doc_is_active(sw['target'], active):
-            st['bridge_doc'] = sw['target']
             st.pop('switch', None)
-            _log("switch landed: %s" % active[0])
+            if sw.get('restore'):
+                # Back in the user's document: the visit is over.
+                st.pop('home', None)
+                st.pop('bridge_doc', None)
+                _log("restore landed: %s" % active[0])
+            else:
+                st['bridge_doc'] = sw['target']
+                _log("switch landed: %s" % active[0])
+        elif sw.get('restore') and (time.time() - sw.get('since', 0) > SWITCH_RETRY_S
+                                    or sw.get('tries', 0) >= SWITCH_MAX_TRIES):
+            # Could not bring the user's document back: stop insisting and let
+            # untargeted work run where the bridge is, rather than failing it.
+            st.pop('switch', None)
+            st.pop('home', None)
+            st.pop('bridge_doc', None)
+            _log("restore did not land — home released")
         elif time.time() - sw.get('since', 0) > SWITCH_RETRY_S or sw.get('tries', 0) >= SWITCH_MAX_TRIES:
             for fn, _c, doc, _p in _ordered_jobs():
                 if _effective_target(doc, st) == sw['target']:
@@ -505,6 +586,16 @@ def pump_all():
             if _doc_is_active(_effective_target(doc, st), active):
                 if _claim_and_run(fn):
                     ran += 1
+                    if doc != FREE:
+                        last = st.get('last_run') or {}
+                        st['last_run'] = {'ts': time.time(),
+                                          'prio': min(_prio, last.get('prio', 99))
+                                          if time.time() - last.get('ts', 0) < STICKY_S else _prio}
+                    if _cmd == '_hold':
+                        st['hold'] = {'doc': _effective_target(doc, st) or active[0],
+                                      'until': time.time() + HOLD_MAX_S}
+                    elif _cmd == '_release':
+                        st.pop('hold', None)
                     if _cmd == 'close_document':
                         closed = True
                         break             # the front document is about to go away
@@ -520,10 +611,22 @@ def pump_all():
         if ran == 0 or time.time() - t0 > DRAIN_BUDGET_S:
             break
 
-    remaining = [(fn, doc) for fn, _c, doc, _p in _ordered_jobs()]
+    queue = _ordered_jobs()
+    remaining = [(fn, doc) for fn, _c, doc, _p in queue]
     waiting = [(fn, _effective_target(doc, st)) for fn, doc in remaining
                if not _doc_is_active(_effective_target(doc, st), active)]
-    if waiting and time.time() - t0 <= DRAIN_BUDGET_S:
+    best_waiting = min([p for fn, _c, doc, p in queue
+                        if not _doc_is_active(_effective_target(doc, st), active)] or [99])
+    last = st.get('last_run') or {}
+    dwell = (bool(waiting) and not st.get('switch')
+             and time.time() - last.get('ts', 0) < STICKY_S
+             and best_waiting > last.get('prio', 99))
+    held = _hold_active(st, active)
+    if held and (waiting or st.get('home')):
+        _set_wake()                       # held for a screenshot: keep firing, don't move
+    elif dwell:
+        pass                              # stay: the busier, more urgent agent is mid-sequence
+    elif waiting and time.time() - t0 <= DRAIN_BUDGET_S:
         target = waiting[0][1]
         sw = st.get('switch')
         if sw and sw.get('target') == target:
@@ -542,15 +645,30 @@ def pump_all():
             st.pop('switch', None)
         else:
             _log("switch requested -> %s (%d job(s) waiting)" % (target, len(waiting)))
+    elif (not remaining and st.get('home') and not st.get('switch')
+          and time.time() - (st.get('last_run') or {}).get('ts', 0) < RESTORE_DELAY_S):
+        _set_wake()                       # the visited document was busy a moment ago
     elif not remaining and st.get('home') and not st.get('switch'):
+        # Targeted work done: bring the user's document back. Keep `home` until
+        # the restore has demonstrably landed — an untargeted job arriving in
+        # between must still wait for (and run in) the user's document.
+        _clear_wake()
         home = st['home']
         home_t = home.get('path') or home.get('name')
         if home_t and not _doc_is_active(home_t, active):
             if not _request_switch(home_t):
+                st['switch'] = {'target': home_t, 'since': time.time(), 'tries': 1,
+                                'restore': True}
                 _log("all targeted work done — back to %s" % home.get('name'))
-        st.pop('home', None)
-        st.pop('bridge_doc', None)
+            else:
+                st.pop('home', None)
+                st.pop('bridge_doc', None)
+        else:
+            st.pop('home', None)
+            st.pop('bridge_doc', None)
 
+    if (not st.get('home') or st.get('switch') or waiting) and not held:
+        _clear_wake()                     # nothing to wait out any more
     _save_state(st)
     if done:
         _log("pump_all done: %d job(s) in %s" % (done, active[0]))

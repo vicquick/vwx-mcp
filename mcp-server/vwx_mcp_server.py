@@ -496,6 +496,7 @@ _PRIO = {"interactive": 5, "batch": 8, "background": 9, "urgent": 1}
 _DOC_FREE = frozenset({
     "ping", "list_documents", "vs_signature", "vs_index_stats", "list_commands",
     "distance", "distance_3d", "polygon_centroid", "three_point_center",
+    "_release",
 })
 # Document-free only when they read a SAVED file instead of the front document.
 _DOC_FREE_WITH_FILE = frozenset({"resource_list", "resource_info_file"})
@@ -529,7 +530,9 @@ def _session_info():
         pass
     agent = None
     try:
-        info = ctx.session.client_params.clientInfo
+        cp = ctx.session.client_params
+        # mcp >= 1.2x renamed the pydantic field clientInfo -> client_info
+        info = getattr(cp, "client_info", None) or getattr(cp, "clientInfo", None)
         agent = "%s %s" % (info.name, getattr(info, "version", "") or "")
     except Exception:
         try:
@@ -1014,8 +1017,8 @@ def get_bridge_status(ctx: Context, audit_lines: int = 20) -> str:
     if base:
         jd = os.path.join(base, "ipc", "jobs")
         for fn in sorted(os.listdir(jd)) if os.path.isdir(jd) else []:
-            if not fn.endswith(".json"):
-                continue
+            if not fn.endswith(".json") or fn.startswith("wake-"):
+                continue                  # wake-* = the pump's restore-delay marker
             try:
                 with open(os.path.join(jd, fn), encoding="utf-8") as fh:
                     j = json.load(fh)
@@ -3116,7 +3119,7 @@ def _capture_window(hwnd, max_width, crop_to=None):
 
 @vtool
 def screenshot(ctx: Context, max_width: int = 1400, fit_to_objects: bool = False,
-               region: str = "canvas"):
+               region: str = "canvas", document: Optional[str] = None):
     """SEE the Vectorworks drawing as an image, instead of reading JSON about it.
 
     Use this to VERIFY visually after drawing, editing or changing a view —
@@ -3133,10 +3136,32 @@ def screenshot(ctx: Context, max_width: int = 1400, fit_to_objects: bool = False
     just drawn is actually in frame (this changes the view, nothing else).
     max_width trades detail for tokens — images are billed by area and are not
     covered by the large-result annotation, so keep it modest unless detail
-    genuinely matters."""
+    genuinely matters.
+
+    document (or this session's use_document binding): capture THAT document.
+    Vectorworks has a single drawing surface — a background document cannot be
+    photographed — so the bridge brings it to the front, holds it there for the
+    capture (max 10 s) and lets the user's document come back afterwards.
+    Without a document this shows whatever is in front."""
     if sys.platform != "win32":
         return "Screenshots need the Windows build (window capture is Win32)."
 
+    sid, _agent = _session_info()
+    with _coord_lock:
+        target_doc = document or (_sessions.get(sid) or {}).get("doc") if sid else document
+    if target_doc:
+        held = json.loads(cmd("_hold", {}, document=target_doc))
+        if isinstance(held, dict) and held.get("error"):
+            return f"Could not bring {target_doc} to the front: {held.get('error')}"
+        time.sleep(0.4)            # the switch landed; let VW finish its redraw
+    try:
+        return _screenshot_front(max_width, fit_to_objects, region)
+    finally:
+        if target_doc:
+            cmd("_release", {})
+
+
+def _screenshot_front(max_width, fit_to_objects, region):
     _dpi_aware()                   # before any rect is measured, not after
     doc, dialogs = _vw_windows()
     if not doc and not dialogs:
@@ -3378,13 +3403,13 @@ class ProgressHeartbeatMiddleware(Middleware):
 # the command catalogue and the vs.* signature index do not change while the
 # document is open; layer and class lists do, which is why they are absent
 # despite being read-only.
+#
+# v14: everything document-specific is OUT. The cache key is tool name +
+# arguments — it knows neither the session nor the target document, so with
+# document routing (and before that, after any switch_document) it served one
+# document's info, units or georeference as the answer for another. Found live:
+# agent A's get_document_info returned agent B's document from the cache.
 _CACHEABLE = [
-    "ping",
-    "get_document_info",
-    "get_document_preferences",
-    "get_document_units",
-    "get_georeferencing",
-    "get_projection",
     "list_commands",
     "vs_signature",
     "vs_index_stats",

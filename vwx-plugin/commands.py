@@ -546,6 +546,17 @@ def switch_document(p):
                        'Antwort belegt ihn nicht.'}
 
 
+def _hold(p):
+    """Pin the (already activated) document to the front for a screenshot.
+    The pump records the hold; this only reports where we are."""
+    return {'status': 'ok', 'dokument': _safe(vs.GetFName, '') or ''}
+
+
+def _release(p):
+    """End a _hold (the pump clears it)."""
+    return {'status': 'ok'}
+
+
 def close_document(p):
     """Close the ACTIVE document (the v14 pump has already brought the
     requested one to the front and verified it). params: save (default True),
