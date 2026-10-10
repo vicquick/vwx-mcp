@@ -100,6 +100,22 @@ Verified live on VW2026 (Sept 2026). Commands: `resource_list`, `resource_info`,
 | Import: identical resource already present | skipped | documented behaviour: exact match is no conflict, callback not called, existing handle returned |
 | Names | global | resources share one namespace with layers and objects (a layer named X blocks a style named X) |
 
+## Terrain: grades, stakes, hardscape surface modifiers (verified 2026-10-10)
+
+| Task | Command | Notes |
+|---|---|---|
+| Grade (Gefälle-Grundriss) on a layer | `create_grade` → `grade_finish` (separate call) | Needs ONE tool-placed Grade CW on the target layer (or `template`): a Grade made by `CreateCustomObjectPath` stays uninitialised (stub arrow at −10/−10, length 0). The template's height Data Tags only appear after the script ends — `grade_finish` moves the end tag and drops duplicates at network nodes |
+| 3D polygon → grades | `convert_3dpoly_to_grades` (+ `hardscape` to put them into a hardscape) | one grade per edge; `GetPolyPt3D` is 0-based |
+| Stake (Höhenpunkt) | `create_stake` | elevation = the object's 3D position; a reset rewrites `Z Value` from it |
+| Grade INSIDE an aligned hardscape (shapes the surface without a site model) | `hardscape_prepare_modifiers` → `python tools/belag_modifikatoren_oeffnen.py` (once per hardscape, then `--verlassen`) → `hardscape_add_grade` | The modifier group exists only after the UI command "Oberflächenmodifikatoren bearbeiten" was entered once; groups built by script are discarded on reset. Aligned = `Config=Aligned` + `Mode 3D=7` + `Site Model Interaction=ActAsBoth` (`Mode 3D` alone leaves the menu item missing) |
+| Read a hardscape surface | `hardscape_sample_z`, `hardscape_modifier_info` | `GetZatXY` on a hardscape returns 0 almost everywhere — the sampler triangulates a `MeshToGroup` copy instead |
+
+Coordinate rules (all checked against the georeferenced Lageplan, origin −2047217/−6626760, hardscape rotated −13.9°):
+- PIO paths are stored RAW: `raw = local − GetOrigin()`. A path written with `AddPoint(0,0)` starts at `+origin`, kilometres off in a georeferenced file. `_grade_shape` subtracts the origin.
+- Inside a hardscape, modifiers live in its local raw frame: `v = R(−rz)·(world − offset) − GetOrigin()`; mesh and path use the same frame.
+- Heights are absolute; the surface = grade height + the grade object's z → keep inner grades at z = 0.
+- Changing the user origin afterwards does not disturb existing inner modifiers (re-sampled after `SetOrigin`).
+
 ## VW2026 API renames (function does not exist under the old name)
 
 These raise `module 'vs' has no attribute …` (or wrong-arg engine errors). All

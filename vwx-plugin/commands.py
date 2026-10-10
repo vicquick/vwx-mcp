@@ -3677,26 +3677,19 @@ def grade_finish(p=None):
     return {'status': 'ok', 'moved': moved, 'pending': left}
 
 
-def _grade_one(x1, y1, z1, x2, y2, z2, opts):
-    layer = vs.GetLName(vs.ActLayer())
-    src = _grade_template(opts, layer)
-    if not src:
-        return {'error': 'Keine Vorlage: bitte ein Gefälle-Grundriss mit dem Werkzeug auf '
-                         'Ebene „%s" setzen (oder template=<UUID>)' % layer}
-    sp = vs.GetCustomObjectPath(src)
-    s_end = vs.GetPolyPt(sp, vs.GetVertNum(sp))
-    ok, s_off, _, _, s_rz = vs.GetEntityMatrix(src)
-    h = vs.HDuplicate(src, 0, 0)
-    if vs.GetLayer(h) != vs.ActLayer():
-        vs.SetParent(h, vs.ActLayer())
-    vs.HMove(h, x1 - s_off[0], y1 - s_off[1])
-    # Werkzeug legt das Objekt auf z = Mittel der Endhöhen
-    vs.Move3DObj(h, 0, 0, (z1 + z2) / 2 - s_off[2])
-    # Pfad und ControlPoints sind objekt-lokal (Ursprung = Punkt 1, Drehung rz)
-    a = math.radians(-s_rz)
-    dx = (x2 - x1) * math.cos(a) - (y2 - y1) * math.sin(a)
-    dy = (x2 - x1) * math.sin(a) + (y2 - y1) * math.cos(a)
-    vs.BeginPoly(); vs.AddPoint(0, 0); vs.AddPoint(dx, dy); vs.EndPoly()
+def _grade_shape(h, wx, wy, rz, z1, z2):
+    """Pfad, ControlPoints, Höhen und Neigungsfelder eines Grade CW setzen.
+    (wx, wy) = Vektor Punkt 1 → Punkt 2 im Rahmen des Containers; rz = Drehung
+    des Grade-Objekts darin. Pfad/ControlPoints sind objekt-lokal (Ursprung = Punkt 1)."""
+    a = math.radians(-rz)
+    dx = wx * math.cos(a) - wy * math.sin(a)
+    dy = wx * math.sin(a) + wy * math.cos(a)
+    # Der Pfad wird ROH gespeichert: roh = lokal − GetOrigin() (im Lageplan
+    # beginnt der Pfad eines Grades bei 2047217/6626760 = −Ursprung). Ohne die
+    # Korrektur liegt Punkt 1 um den Ursprungsversatz daneben — bei Ursprung 0
+    # unsichtbar, im georeferenzierten Plan Kilometer weit (verifiziert 10.10.).
+    O = vs.GetOrigin()
+    vs.BeginPoly(); vs.AddPoint(-O[0], -O[1]); vs.AddPoint(dx - O[0], dy - O[1]); vs.EndPoly()
     poly = vs.LNewObj()
     pl = vs.ConvertToPolyline(poly, False)
     vs.DelObject(poly)
@@ -3711,13 +3704,35 @@ def _grade_one(x1, y1, z1, x2, y2, z2, opts):
     cp(5, mx, my); cp(6, mx, my - 0.05); cp(7, mx, my - 0.10)
     vs.SetRField(h, _GRADE, 'Known Param 1', 'Elevation 1')
     vs.SetRField(h, _GRADE, 'Known Param 2', 'Elevation 2')
+    vs.SetRField(h, _GRADE, _fld(h, _GRADE, 'he Punkt 1'), _num(z1))
+    vs.SetRField(h, _GRADE, _fld(h, _GRADE, 'he Punkt 2'), _num(z2))
     # Neigungsfelder aus der Vorlage überschreiben (Berichte/Arbeitsblätter)
-    ln2 = math.hypot(x2 - x1, y2 - y1)
-    pc = abs(z2 - z1) / ln2 * 100 if ln2 else 0
+    ln = math.hypot(wx, wy)
+    pc = abs(z2 - z1) / ln * 100 if ln else 0
     up, dn = ('%.3f' % pc if z2 > z1 else '0'), ('%.3f' % pc if z2 < z1 else '0')
     for f, v in (('Neigung in % steigend', up), ('Upgrade pc', up),
                  ('Neigung in % fallend', dn), ('Downgrade pc', dn)):
         vs.SetRField(h, _GRADE, f, v.replace('.', ','))
+
+
+def _grade_one(x1, y1, z1, x2, y2, z2, opts):
+    layer = vs.GetLName(vs.ActLayer())
+    src = _grade_template(opts, layer)
+    if not src:
+        return {'error': 'Keine Vorlage: bitte ein Gefälle-Grundriss mit dem Werkzeug auf '
+                         'Ebene „%s" setzen (oder template=<UUID>)' % layer}
+    sp = vs.GetCustomObjectPath(src)
+    s_end = vs.GetPolyPt(sp, vs.GetVertNum(sp))
+    O = vs.GetOrigin()
+    s_end = (s_end[0] + O[0], s_end[1] + O[1])     # Pfad roh → lokal
+    ok, s_off, _, _, s_rz = vs.GetEntityMatrix(src)
+    h = vs.HDuplicate(src, 0, 0)
+    if vs.GetLayer(h) != vs.ActLayer():
+        vs.SetParent(h, vs.ActLayer())
+    vs.HMove(h, x1 - s_off[0], y1 - s_off[1])
+    # Werkzeug legt das Objekt auf z = Mittel der Endhöhen
+    vs.Move3DObj(h, 0, 0, (z1 + z2) / 2 - s_off[2])
+    _grade_shape(h, x2 - x1, y2 - y1, s_rz, z1, z2)
     # Mitkopierte Höhenstempel (Data Tag) entstehen erst NACH Skriptende und
     # bleiben am alten Endpunkt-Versatz stehen → vormerken, grade_finish verschiebt
     ca, sa = math.cos(math.radians(s_rz)), math.sin(math.radians(s_rz))
@@ -3806,6 +3821,9 @@ def convert_3dpoly_to_grades(p):
     src = _h(p.get('object_id'))
     if not src: return {'error': 'Objekt nicht gefunden'}
     if vs.GetTypeN(src) != 25: return {'error': 'kein 3D-Polygon (Typ %d)' % vs.GetTypeN(src)}
+    belag = _h(p['hardscape']) if p.get('hardscape') else None
+    if p.get('hardscape') and not belag:
+        return {'error': 'Belag nicht gefunden'}
     q = dict(p)
     q.setdefault('layer', vs.GetLName(vs.GetLayer(src)))
     prev = _with_layer_class(q)
@@ -3828,12 +3846,258 @@ def convert_3dpoly_to_grades(p):
             ln = ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5
             if ln < minl or (p.get('skip_flat') and abs(b[2] - a[2]) < 1e-4):
                 skipped += 1; continue
-            r = _grade_one(a[0], a[1], a[2], b[0], b[1], b[2], q)
+            if belag:
+                r = _belag_grade(belag, a[0], a[1], a[2], b[0], b[1], b[2], q)
+            else:
+                r = _grade_one(a[0], a[1], a[2], b[0], b[1], b[2], q)
             if 'error' in r: return {'error': r['error'], 'made': made}
             made.append(r['object_id'])
-        return {'status': 'ok', 'grades': made, 'count': len(made), 'skipped': skipped}
+        if belag:
+            _belag_refit(belag)
+        return {'status': 'ok', 'grades': made, 'count': len(made), 'skipped': skipped,
+                'in_belag': bool(belag)}
     finally:
         _restore(prev)
+
+
+# ── Belag (Hardscape): Oberflächenmodifikatoren ─────────────────────────────
+# Am 10.10.2026 in VW2026 verifiziert. Ein „angepasster" Belag (Config =
+# Aligned, Mode 3D = 7, Site Model Interaction = ActAsBoth)
+# trägt seine Oberflächenmodifikatoren (Grade CW / Stake Object) in seiner
+# ERSTEN Untergruppe. Diese Gruppe legt VW erst an, wenn man einmal
+# „Oberflächenmodifikatoren bearbeiten" betritt (Kontextmenü; Server-Werkzeug
+# hardscape_open_modifiers). Selbst gebaute Gruppen oder lose Kinder verwirft
+# der nächste Reset. In die bestehende Gruppe kopierte Grades
+# (CreateDuplicateObject) bleiben und formen die Oberfläche OHNE Geländemodell.
+# Koordinaten innen sind belag-lokal, im Rahmen von Pfad und Mesh:
+#     v = R(−rz_belag) · (Welt − Versatz_belag) − GetOrigin()
+# z: Oberfläche = „Höhe Punkt" + z-Lage des Grade-Objekts → Höhen absolut
+# eintragen, Objekt auf z = 0 (sonst doppelt: 60,12 statt 30,12).
+
+_HARDSCAPE = 'Hardscape'
+_BELAG_ANGEPASST = '7'
+
+
+def _children(h):
+    out = []
+    c = vs.FInGroup(h)
+    while c and vs.GetTypeN(c) != 0:
+        out.append(c)
+        c = vs.NextObj(c)
+    return out
+
+
+def _belag_container(h):
+    """Modifikatoren-Gruppe des Belags oder None. Ein Belag ohne Modifikatoren
+    hat genau eine Untergruppe (Konturpolylinie); mit Modifikatoren steht davor
+    eine weitere Gruppe aus Plug-in-Objekten (Grades, Stakes, Datenstempel)."""
+    groups = [c for c in _children(h) if vs.GetTypeN(c) == 11]
+    if len(groups) < 2:
+        return None
+    first = groups[0]
+    kinds = {vs.GetTypeN(k) for k in _children(first)}
+    if kinds and kinds != {86}:
+        return None
+    return first
+
+
+def _belag_local(h, x, y):
+    """Weltpunkt → belag-lokaler Rahmen der Modifikatoren."""
+    ok, off, _, _, rz = vs.GetEntityMatrix(h)
+    O = vs.GetOrigin()
+    a = math.radians(-rz)
+    dx, dy = x - off[0], y - off[1]
+    return (dx * math.cos(a) - dy * math.sin(a) - O[0],
+            dx * math.sin(a) + dy * math.cos(a) - O[1])
+
+
+def _belag_angepasst(h):
+    return (vs.GetRField(h, _HARDSCAPE, 'Config') == 'Aligned'
+            and vs.GetRField(h, _HARDSCAPE, 'Mode 3D') == _BELAG_ANGEPASST)
+
+
+def _belag_refit(h):
+    vs.SetRField(h, _HARDSCAPE, '__RecreateAlignedTIN', 'True')
+    vs.ResetObject(h)
+
+
+def _belag_grade(h, x1, y1, z1, x2, y2, z2, opts):
+    cont = _belag_container(h)
+    if not cont:
+        return {'error': 'Belag hat noch keine Modifikatoren-Gruppe — einmal '
+                         'hardscape_open_modifiers (Server-Werkzeug) ausführen'}
+    src = _h(opts['template']) if opts.get('template') else None
+    if not src:
+        inner = [k for k in _children(cont) if vs.GetTypeN(k) == 86
+                 and vs.GetName(vs.GetParametricRecord(k)) == _GRADE]
+        src = inner[0] if inner else _grade_template(opts, vs.GetLName(vs.GetLayer(h)))
+    if not src:
+        return {'error': 'Keine Grade-Vorlage: template=<UUID> eines Gefälle-Grundrisses angeben'}
+    vorher = {vs.GetObjectUuid(k) for k in _children(cont)}
+    g = vs.CreateDuplicateObject(src, cont)
+    if not g:
+        return {'error': 'Grade konnte nicht in den Belag kopiert werden'}
+    # Die Höhenstempel der Vorlage reisen mit, behalten aber deren Lage — weit
+    # außerhalb des Belags (Bbox und „Zoom auf Objekte" laufen dann ins Leere)
+    for k in _children(cont):
+        if vs.GetObjectUuid(k) not in vorher and k != g and vs.GetTypeN(k) == 86 \
+                and vs.GetName(vs.GetParametricRecord(k)) == 'Data Tag':
+            vs.DelObject(k)
+    ok, g_off, _, _, g_rz = vs.GetEntityMatrix(g)
+    v1 = _belag_local(h, x1, y1)
+    v2 = _belag_local(h, x2, y2)
+    vs.HMove(g, v1[0] - g_off[0], v1[1] - g_off[1])
+    vs.Move3DObj(g, 0, 0, -g_off[2])
+    _grade_shape(g, v2[0] - v1[0], v2[1] - v1[1], g_rz, z1, z2)
+    vs.SetRField(g, _GRADE, 'Einstellungen', 'Eigene Hoehen')
+    vs.SetRField(g, _GRADE, 'Grade Mode Static', 'Eigene Höhen')
+    vs.ResetObject(g)
+    ln = math.hypot(x2 - x1, y2 - y1)
+    return {'object_id': vs.GetObjectUuid(g), 'local': [list(v1), list(v2)],
+            'slope_pc': round((z2 - z1) / ln * 100, 3) if ln else None}
+
+
+def hardscape_modifier_info(p):
+    """Zustand eines Belags für Oberflächenmodifikatoren. params: object_id.
+    Liefert angepasst (Mode 3D = 7), ob die Modifikatoren-Gruppe existiert und
+    welche Modifikatoren darin liegen (Grade: Weltkoordinaten der Endpunkte)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    cont = _belag_container(h)
+    mods = []
+    if cont:
+        ok, off, _, _, rz = vs.GetEntityMatrix(h)
+        O = vs.GetOrigin(); a = math.radians(rz)
+        def welt(v):
+            lx, ly = v[0] + O[0], v[1] + O[1]
+            return [round(off[0] + lx * math.cos(a) - ly * math.sin(a), 3),
+                    round(off[1] + lx * math.sin(a) + ly * math.cos(a), 3)]
+        for k in _children(cont):
+            n = vs.GetName(vs.GetParametricRecord(k))
+            d = {'pio': n, 'object_id': vs.GetObjectUuid(k)}
+            if n == _GRADE:
+                ok2, go, _, _, grz = vs.GetEntityMatrix(k)
+                pth = vs.GetCustomObjectPath(k)
+                e = vs.GetPolyPt(pth, vs.GetVertNum(pth)) if pth else (-O[0], -O[1])
+                e = (e[0] + O[0], e[1] + O[1])          # Pfad roh → lokal
+                ga = math.radians(grz)
+                end = (go[0] + e[0] * math.cos(ga) - e[1] * math.sin(ga),
+                       go[1] + e[0] * math.sin(ga) + e[1] * math.cos(ga))
+                d.update(p1=welt(go), p2=welt(end),
+                         z1=vs.GetRField(k, _GRADE, _fld(k, _GRADE, 'he Punkt 1')),
+                         z2=vs.GetRField(k, _GRADE, _fld(k, _GRADE, 'he Punkt 2')))
+            mods.append(d)
+    return {'status': 'ok', 'angepasst': _belag_angepasst(h),
+            'container': bool(cont), 'modifikatoren': mods}
+
+
+def hardscape_prepare_modifiers(p):
+    """Belag für hardscape_open_modifiers vorbereiten: auf „Angepasst" stellen
+    (set_aligned, Default True), allein auswählen, Ansicht darauf zoomen.
+    params: object_id, set_aligned."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    if p.get('set_aligned', True) and not _belag_angepasst(h):
+        # „Angepasst" im Dialog setzt drei Felder; Mode 3D allein reicht nicht
+        # (Kontextmenüeintrag fehlt dann, verifiziert 10.10.2026)
+        vs.SetRField(h, _HARDSCAPE, 'Config', 'Aligned')
+        vs.SetRField(h, _HARDSCAPE, 'Mode 3D', _BELAG_ANGEPASST)
+        vs.SetRField(h, _HARDSCAPE, 'Site Model Interaction', 'ActAsBoth')
+        vs.ResetObject(h)
+    # Rechtsklick trifft die Belagfläche nur in der 2D-Planansicht (in 3D-Oben
+    # ist das Innere im Drahtmodell leer → Kontextmenü der Zeichenfläche).
+    # Projektion 6 = 2D-Plan; ein gedrehter Plan bleibt dabei unangetastet.
+    if vs.GetProjection(vs.GetLayer(h)) != 6:
+        _safe(lambda: vs.DoMenuTextByName('Standard Views', 1))
+    vs.DSelectAll()
+    vs.SetSelect(h)
+    _safe(lambda: zoom_to_selection({}))
+    return {'status': 'ok', 'container': bool(_belag_container(h)),
+            'angepasst': _belag_angepasst(h)}
+
+
+def hardscape_add_grade(p):
+    """Gefälle-Grundriss als Oberflächenmodifikator IN einen angepassten Belag
+    legen (wirkt ohne Geländemodell). params: object_id (Belag),
+    x1,y1,z1,x2,y2,z2 in Dokumentkoordinaten wie Lineal/HCenter (werden in den
+    belag-lokalen Rahmen umgerechnet; Höhen absolut), template (Grade-UUID,
+    sonst erstes Grade im Belag bzw. auf seiner Ebene), refit (True: Belag neu
+    berechnen). Voraussetzung: Modifikatoren-Gruppe vorhanden (einmal
+    hardscape_open_modifiers)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    if not _belag_angepasst(h):
+        return {'error': 'Belag ist nicht „Angepasst" — hardscape_prepare_modifiers'}
+    try:
+        r = _belag_grade(h, float(p['x1']), float(p['y1']), float(p['z1']),
+                         float(p['x2']), float(p['y2']), float(p['z2']), p)
+    except KeyError as e:
+        return {'error': 'Parameter fehlt: %s' % e}
+    if 'error' in r: return r
+    if p.get('refit', True):
+        _belag_refit(h)
+    r['status'] = 'ok'
+    return r
+
+
+def _belag_faces(h):
+    """Dreiecke/Vierecke der Belagsoberfläche in Weltkoordinaten. Das Mesh im
+    Belag liegt im Rohrahmen (Welt = Versatz + R(rz)·(v + Ursprung)); eine
+    Kopie wird per MeshToGroup in 3D-Polygone zerlegt und wieder gelöscht.
+    (GetZatXY am Belag trifft nur zufällig — meist 0 —, nicht verwenden.)"""
+    ok, off, _, _, rz = vs.GetEntityMatrix(h)
+    O = vs.GetOrigin(); a = math.radians(rz); ca, sa = math.cos(a), math.sin(a)
+    faces = []
+    for m in [c for c in _children(h) if vs.GetTypeN(c) == 40]:
+        d = vs.CreateDuplicateObject(m, vs.ActLayer())
+        if not d:
+            continue
+        g = vs.MeshToGroup(d) or vs.LNewObj()
+        polys = []
+        def walk(o):
+            c = vs.FInGroup(o)
+            while c and vs.GetTypeN(c) != 0:
+                if vs.GetTypeN(c) == 25: polys.append(c)
+                elif vs.GetTypeN(c) == 11: walk(c)
+                c = vs.NextObj(c)
+        if g and vs.GetTypeN(g) == 11: walk(g)
+        for poly in polys:
+            pts = []
+            for i in range(vs.GetVertNum(poly)):
+                x, y, z = vs.GetPolyPt3D(poly, i)
+                lx, ly = x + O[0], y + O[1]
+                pts.append((off[0] + lx * ca - ly * sa, off[1] + lx * sa + ly * ca, z))
+            if len(pts) >= 3: faces.append(pts)
+        for o in (g, d):
+            if o and vs.GetTypeN(o) != 0: _safe(lambda: vs.DelObject(o))
+    return faces
+
+
+def _z_in_face(f, x, y):
+    """z im (fächertriangulierten) Polygon f, sonst None."""
+    for i in range(1, len(f) - 1):
+        (x1, y1, z1), (x2, y2, z2), (x3, y3, z3) = f[0], f[i], f[i + 1]
+        det = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+        if abs(det) < 1e-12: continue
+        l1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / det
+        l2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / det
+        l3 = 1 - l1 - l2
+        if min(l1, l2, l3) >= -1e-9:
+            return l1 * z1 + l2 * z2 + l3 * z3
+    return None
+
+
+def hardscape_sample_z(p):
+    """Belagsoberfläche (Oberseite) abtasten. params: object_id, points
+    [[x,y],…] in Dokumentkoordinaten. Rückgabe z je Punkt (None = außerhalb)."""
+    h = _h(p.get('object_id'))
+    if not h: return {'error': 'Belag nicht gefunden'}
+    faces = _belag_faces(h)
+    out = []
+    for x, y in p.get('points', []):
+        zs = [z for z in (_z_in_face(f, float(x), float(y)) for f in faces) if z is not None]
+        out.append(round(max(zs), 4) if zs else None)
+    return {'status': 'ok', 'z': out, 'faces': len(faces)}
 
 
 def get_pio_parameters(p):
