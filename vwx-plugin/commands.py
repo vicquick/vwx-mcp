@@ -17,7 +17,7 @@ Key API facts:
   FInLayer: vs.FInLayer(layerH)
   ForEachObject: build list in callback — never create/delete/re-layer inside
 """
-import vs, traceback, os, json, re
+import vs, traceback, os, json, re, math
 
 # ── vs.* signature index (knowledge index) ───────────────────────────────────
 # vs_index.json (built by tools/build_vs_index.py from the SDK vs.py stub) maps
@@ -3610,17 +3610,120 @@ def _new_on_layer(layer, pio, before):
     return new[0] if len(new) == 1 else None
 
 
+def _grade_template(opts, layer):
+    """Vorlage-Grade finden: params template (UUID) oder erstes Grade CW auf
+    der Zielebene. Per CreateCustomObjectPath erzeugte Grades bleiben
+    uninitialisiert (ControlPoints 0, Pfeil als Stummel bei −10/−10, Länge 0,
+    kein Symbol) — nur ein mit dem Werkzeug gesetztes Grade zeichnet richtig."""
+    if opts.get('template'):
+        return _h(opts['template'])
+    found = []
+    vs.ForEachObject(lambda o: found.append(o) if not found else None,
+                     "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), _GRADE))
+    return found[0] if found else None
+
+
+_GRADE_PENDING = 'grade_tag_pending'
+
+
+def _grade_pending_get():
+    try:
+        return json.loads(vs.GetSavedSetting('vwxmcp', _GRADE_PENDING)[1] or '[]')
+    except Exception:
+        return []
+
+
+def _grade_pending_add(layer, stale, target):
+    lst = _grade_pending_get()
+    lst.append({'doc': vs.GetFName(), 'layer': layer, 'stale': list(stale), 'target': list(target)})
+    vs.SetSavedSetting('vwxmcp', _GRADE_PENDING, json.dumps(lst))
+
+
+def _grade_finish_pending():
+    """Vorgemerkte Endpunkt-Stempel verschieben (nur im selben Dokument)."""
+    lst, rest, moved = _grade_pending_get(), [], 0
+    doc = vs.GetFName()
+    for e in lst:
+        if e['doc'] != doc:
+            rest.append(e); continue
+        tags = []
+        vs.ForEachObject(lambda o: tags.append(o),
+                         "(L='%s') & (PON='Data Tag')" % e['layer'].replace("'", "''"))
+        sx, sy = e['stale']
+        best, bd = None, 0.6 ** 2   # Stempelmitte liegt ~0,35 m neben dem Punkt
+        for t in tags:
+            c = vs.HCenter(t); d = (c[0] - sx) ** 2 + (c[1] - sy) ** 2
+            if d < bd: best, bd = t, d
+        if best is None:
+            rest.append(e); continue
+        vs.HMove(best, e['target'][0] - sx, e['target'][1] - sy)
+        vs.ResetObject(best)
+        moved += 1
+        # Gefällenetz: an gemeinsamen Ecken liegen jetzt zwei gleiche Stempel
+        c0 = vs.HCenter(best)
+        for t in tags:
+            if t != best and vs.GetTypeN(t) != 0:
+                c = vs.HCenter(t)
+                if abs(c[0] - c0[0]) < 0.01 and abs(c[1] - c0[1]) < 0.01:
+                    vs.DelObject(best); break
+    vs.SetSavedSetting('vwxmcp', _GRADE_PENDING, json.dumps(rest))
+    return moved, len(rest)
+
+
+def grade_finish(p=None):
+    """Nach create_grade / convert_3dpoly_to_grades aufrufen (eigener Aufruf):
+    setzt die mitkopierten Höhenstempel an die neuen Endpunkte."""
+    moved, left = _grade_finish_pending()
+    return {'status': 'ok', 'moved': moved, 'pending': left}
+
+
 def _grade_one(x1, y1, z1, x2, y2, z2, opts):
     layer = vs.GetLName(vs.ActLayer())
-    crit = "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), _GRADE)
-    before = _crit_uuids(crit)
-    vs.BeginPoly(); vs.AddPoint(x1, y1); vs.AddPoint(x2, y2); vs.EndPoly()
-    path = vs.LNewObj()
-    vs.CreateCustomObjectPath(_GRADE, path, None)
-    u = _new_on_layer(layer, _GRADE, before)
-    if not u:
-        return {'error': 'Grade nicht eindeutig gefunden'}
-    h = vs.GetObjectByUuid(u)
+    src = _grade_template(opts, layer)
+    if not src:
+        return {'error': 'Keine Vorlage: bitte ein Gefälle-Grundriss mit dem Werkzeug auf '
+                         'Ebene „%s" setzen (oder template=<UUID>)' % layer}
+    sp = vs.GetCustomObjectPath(src)
+    s_end = vs.GetPolyPt(sp, vs.GetVertNum(sp))
+    ok, s_off, _, _, s_rz = vs.GetEntityMatrix(src)
+    h = vs.HDuplicate(src, 0, 0)
+    if vs.GetLayer(h) != vs.ActLayer():
+        vs.SetParent(h, vs.ActLayer())
+    vs.HMove(h, x1 - s_off[0], y1 - s_off[1])
+    # Werkzeug legt das Objekt auf z = Mittel der Endhöhen
+    vs.Move3DObj(h, 0, 0, (z1 + z2) / 2 - s_off[2])
+    # Pfad und ControlPoints sind objekt-lokal (Ursprung = Punkt 1, Drehung rz)
+    a = math.radians(-s_rz)
+    dx = (x2 - x1) * math.cos(a) - (y2 - y1) * math.sin(a)
+    dy = (x2 - x1) * math.sin(a) + (y2 - y1) * math.cos(a)
+    vs.BeginPoly(); vs.AddPoint(0, 0); vs.AddPoint(dx, dy); vs.EndPoly()
+    poly = vs.LNewObj()
+    pl = vs.ConvertToPolyline(poly, False)
+    vs.DelObject(poly)
+    vs.SetCustomObjectPath(h, pl)
+    def cp(i, x, y):
+        vs.SetRField(h, _GRADE, 'ControlPoint0%dX' % i, _num(x))
+        vs.SetRField(h, _GRADE, 'ControlPoint0%dY' % i, _num(y))
+    # Versätze wie vom Werkzeug: Höhentexte −0,075/+0,1775, Neigungstext Mitte +0,075/+0,1795
+    cp(1, 0, 0); cp(2, dx, dy)
+    cp(3, -0.075, 0.1775); cp(4, dx - 0.075, dy + 0.1775)
+    mx, my = dx / 2 + 0.075, dy / 2 + 0.1795
+    cp(5, mx, my); cp(6, mx, my - 0.05); cp(7, mx, my - 0.10)
+    vs.SetRField(h, _GRADE, 'Known Param 1', 'Elevation 1')
+    vs.SetRField(h, _GRADE, 'Known Param 2', 'Elevation 2')
+    # Neigungsfelder aus der Vorlage überschreiben (Berichte/Arbeitsblätter)
+    ln2 = math.hypot(x2 - x1, y2 - y1)
+    pc = abs(z2 - z1) / ln2 * 100 if ln2 else 0
+    up, dn = ('%.3f' % pc if z2 > z1 else '0'), ('%.3f' % pc if z2 < z1 else '0')
+    for f, v in (('Neigung in % steigend', up), ('Upgrade pc', up),
+                 ('Neigung in % fallend', dn), ('Downgrade pc', dn)):
+        vs.SetRField(h, _GRADE, f, v.replace('.', ','))
+    # Mitkopierte Höhenstempel (Data Tag) entstehen erst NACH Skriptende und
+    # bleiben am alten Endpunkt-Versatz stehen → vormerken, grade_finish verschiebt
+    ca, sa = math.cos(math.radians(s_rz)), math.sin(math.radians(s_rz))
+    old_end = (x1 + s_end[0] * ca - s_end[1] * sa, y1 + s_end[0] * sa + s_end[1] * ca)
+    _grade_pending_add(layer, old_end, (x2, y2))
+    u = vs.GetObjectUuid(h)
     f1 = _fld(h, _GRADE, 'he Punkt 1'); f2 = _fld(h, _GRADE, 'he Punkt 2')
     vs.SetRField(h, _GRADE, f1, _num(z1))
     vs.SetRField(h, _GRADE, f2, _num(z2))
@@ -3632,15 +3735,21 @@ def _grade_one(x1, y1, z1, x2, y2, z2, opts):
     if lh:
         vs.SetRField(h, _GRADE, lh, 'True' if opts.get('label_heights', False) else 'False')
     vs.ResetObject(h)
+    ln = math.hypot(x2 - x1, y2 - y1)
+    # Längen-/Neigungsfelder rechnet das PIO erst beim nächsten Reset nach
     return {'object_id': u, 'z1': vs.GetRField(h, _GRADE, f1), 'z2': vs.GetRField(h, _GRADE, f2),
-            'slope_pc': vs.GetRField(h, _GRADE, 'Downgrade pc') or vs.GetRField(h, _GRADE, 'Upgrade pc')}
+            'length': round(ln, 4), 'slope_pc': round((z2 - z1) / ln * 100, 3) if ln else None}
 
 
 def create_grade(p):
     """Gefälle-Grundriss (Grade CW) zwischen zwei Punkten anlegen.
+    Braucht eine Vorlage: ein mit dem Werkzeug gesetztes Grade auf der
+    Zielebene (oder template=<UUID>) — es wird dupliziert und umgesetzt.
     params: x1,y1,z1,x2,y2,z2 (Dokumentkoordinaten wie Lineal), layer, class,
     modifier (True = „Als Modifikator verwenden"), model ('Proposed'/'Existing'),
-    label_slope (True), label_heights (False)."""
+    label_slope (True), label_heights (False), template (UUID).
+    Danach grade_finish in EIGENEM Aufruf (Höhenstempel ans Ende setzen)."""
+    _grade_finish_pending()
     prev = _with_layer_class(p)
     try:
         r = _grade_one(float(p['x1']), float(p['y1']), float(p['z1']),
@@ -3672,6 +3781,9 @@ def create_stake(p):
                 '2d': '2D/3D graphics only'}.get(p.get('mode', 'modifier'), p.get('mode'))
         vs.SetRField(h, _STAKE, 'Mode', mode)
         vs.SetRField(h, _STAKE, 'Site Model', p.get('model', 'Proposed'))
+        # Höhe = 3D-Lage des Objekts; Reset schreibt Z Value daraus zurück
+        ok, off, _, _, _ = vs.GetEntityMatrix(h)
+        vs.Move3DObj(h, 0, 0, float(p['z']) - off[2])
         vs.SetRField(h, _STAKE, 'Z Value', _num(p['z']))
         vs.ResetObject(h)
         return {'status': 'ok', 'object_id': u, 'mode': vs.GetRField(h, _STAKE, 'Mode'),
@@ -3688,7 +3800,9 @@ def convert_3dpoly_to_grades(p):
     layer/class für die Grades (Default: Ebene des Polygons), closed (auto),
     min_length (0.05 m; kürzere Kanten überspringen), skip_flat (False:
     Kanten ohne Höhenunterschied trotzdem anlegen), modifier, label_slope,
-    label_heights. Das Polygon selbst bleibt unverändert."""
+    label_heights, template. Das Polygon selbst bleibt unverändert.
+    Danach grade_finish in EIGENEM Aufruf (Höhenstempel ans Ende setzen)."""
+    _grade_finish_pending()
     src = _h(p.get('object_id'))
     if not src: return {'error': 'Objekt nicht gefunden'}
     if vs.GetTypeN(src) != 25: return {'error': 'kein 3D-Polygon (Typ %d)' % vs.GetTypeN(src)}
@@ -3697,7 +3811,7 @@ def convert_3dpoly_to_grades(p):
     prev = _with_layer_class(q)
     try:
         pts = []
-        for i in range(1, vs.GetVertNum(src) + 1):
+        for i in range(vs.GetVertNum(src)):   # GetPolyPt3D ist 0-basiert
             x, y, z = vs.GetPolyPt3D(src, i)
             if abs(x) < 1e9 and abs(z) < 1e9: pts.append((x, y, z))
         closed = p.get('closed')
