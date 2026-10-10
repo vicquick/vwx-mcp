@@ -3572,6 +3572,156 @@ def create_pio_from_path(p):
         _restore(prev)
 
 
+# ── Gelände: Gefälle-Grundriss (Grade CW) und Höhenpunkte (Stake Object) ────
+# Feldnamen am 10.10.2026 an handgesetzten Objekten (VW2026 DE) ausgelesen.
+# „Höhe Punkt 1/2" heißen intern ohne Umlaut („Hhe Punkt 1"), Werte stehen mit
+# deutschem Dezimalkomma im Record. Grade CW ist ein Pfad-PIO mit 2 Punkten;
+# Einfügepunkt = Punkt 1, Pfad lokal. Endpunkte, die sich treffen, verbindet
+# VW selbst zu einem Gefällenetz.
+
+_GRADE = 'Grade CW'
+_STAKE = 'Stake Object'
+
+
+def _fld(h, rec, *needles):
+    """Feldname im Parametric Record über Teilstrings finden (robust gegen
+    Umlaut-Verlust in internen Namen)."""
+    r = vs.GetParametricRecord(h)
+    for i in range(1, vs.NumFields(r) + 1):
+        n = vs.GetFldName(r, i)
+        if all(s in n for s in needles):
+            return n
+    return None
+
+
+def _num(v):
+    return ('%.12g' % float(v)).replace('.', ',')
+
+
+def _crit_uuids(crit):
+    s = set()
+    vs.ForEachObject(lambda o: s.add(vs.GetObjectUuid(o)), crit)
+    return s
+
+
+def _new_on_layer(layer, pio, before):
+    crit = "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), pio)
+    new = [u for u in _crit_uuids(crit) if u not in before]
+    return new[0] if len(new) == 1 else None
+
+
+def _grade_one(x1, y1, z1, x2, y2, z2, opts):
+    layer = vs.GetLName(vs.ActLayer())
+    crit = "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), _GRADE)
+    before = _crit_uuids(crit)
+    vs.BeginPoly(); vs.AddPoint(x1, y1); vs.AddPoint(x2, y2); vs.EndPoly()
+    path = vs.LNewObj()
+    vs.CreateCustomObjectPath(_GRADE, path, None)
+    u = _new_on_layer(layer, _GRADE, before)
+    if not u:
+        return {'error': 'Grade nicht eindeutig gefunden'}
+    h = vs.GetObjectByUuid(u)
+    f1 = _fld(h, _GRADE, 'he Punkt 1'); f2 = _fld(h, _GRADE, 'he Punkt 2')
+    vs.SetRField(h, _GRADE, f1, _num(z1))
+    vs.SetRField(h, _GRADE, f2, _num(z2))
+    if opts.get('modifier', True):
+        vs.SetRField(h, _GRADE, 'Einstellungen', 'Als Modifikator verwenden')
+    vs.SetRField(h, _GRADE, 'Model Type', opts.get('model', 'Proposed'))
+    vs.SetRField(h, _GRADE, _fld(h, _GRADE, 'Neigung beschriften'), 'True' if opts.get('label_slope', True) else 'False')
+    lh = _fld(h, _GRADE, 'hen beschriften')
+    if lh:
+        vs.SetRField(h, _GRADE, lh, 'True' if opts.get('label_heights', False) else 'False')
+    vs.ResetObject(h)
+    return {'object_id': u, 'z1': vs.GetRField(h, _GRADE, f1), 'z2': vs.GetRField(h, _GRADE, f2),
+            'slope_pc': vs.GetRField(h, _GRADE, 'Downgrade pc') or vs.GetRField(h, _GRADE, 'Upgrade pc')}
+
+
+def create_grade(p):
+    """Gefälle-Grundriss (Grade CW) zwischen zwei Punkten anlegen.
+    params: x1,y1,z1,x2,y2,z2 (Dokumentkoordinaten wie Lineal), layer, class,
+    modifier (True = „Als Modifikator verwenden"), model ('Proposed'/'Existing'),
+    label_slope (True), label_heights (False)."""
+    prev = _with_layer_class(p)
+    try:
+        r = _grade_one(float(p['x1']), float(p['y1']), float(p['z1']),
+                       float(p['x2']), float(p['y2']), float(p['z2']), p)
+        if 'error' in r: return r
+        r['status'] = 'ok'
+        return r
+    except KeyError as e:
+        return {'error': 'Parameter fehlt: %s' % e}
+    finally:
+        _restore(prev)
+
+
+def create_stake(p):
+    """Höhenpunkt (Stake Object) setzen. params: x,y,z, layer, class,
+    mode ('modifier' = Geländemodifikator, 'data' = Geländemodelldaten,
+    '2d' = nur Darstellung), model ('Proposed'/'Existing')."""
+    prev = _with_layer_class(p)
+    try:
+        layer = vs.GetLName(vs.ActLayer())
+        crit = "(L='%s') & (PON='%s')" % (layer.replace("'", "''"), _STAKE)
+        before = _crit_uuids(crit)
+        vs.CreateCustomObjectN(_STAKE, (float(p['x']), float(p['y'])), 0, False)
+        u = _new_on_layer(layer, _STAKE, before)
+        if not u:
+            return {'error': 'Stake nicht eindeutig gefunden'}
+        h = vs.GetObjectByUuid(u)
+        mode = {'modifier': 'Site modifier object', 'data': 'Site model data',
+                '2d': '2D/3D graphics only'}.get(p.get('mode', 'modifier'), p.get('mode'))
+        vs.SetRField(h, _STAKE, 'Mode', mode)
+        vs.SetRField(h, _STAKE, 'Site Model', p.get('model', 'Proposed'))
+        vs.SetRField(h, _STAKE, 'Z Value', _num(p['z']))
+        vs.ResetObject(h)
+        return {'status': 'ok', 'object_id': u, 'mode': vs.GetRField(h, _STAKE, 'Mode'),
+                'site_model': vs.GetRField(h, _STAKE, 'Site Model'), 'z': vs.GetRField(h, _STAKE, 'Z Value')}
+    except KeyError as e:
+        return {'error': 'Parameter fehlt: %s' % e}
+    finally:
+        _restore(prev)
+
+
+def convert_3dpoly_to_grades(p):
+    """3D-Polygon (GM-Modifikator) in Gefälle-Grundriss umwandeln: je Kante ein
+    Grade CW mit den z-Werten der Eckpunkte. params: object_id (3D-Polygon),
+    layer/class für die Grades (Default: Ebene des Polygons), closed (auto),
+    min_length (0.05 m; kürzere Kanten überspringen), skip_flat (False:
+    Kanten ohne Höhenunterschied trotzdem anlegen), modifier, label_slope,
+    label_heights. Das Polygon selbst bleibt unverändert."""
+    src = _h(p.get('object_id'))
+    if not src: return {'error': 'Objekt nicht gefunden'}
+    if vs.GetTypeN(src) != 25: return {'error': 'kein 3D-Polygon (Typ %d)' % vs.GetTypeN(src)}
+    q = dict(p)
+    q.setdefault('layer', vs.GetLName(vs.GetLayer(src)))
+    prev = _with_layer_class(q)
+    try:
+        pts = []
+        for i in range(1, vs.GetVertNum(src) + 1):
+            x, y, z = vs.GetPolyPt3D(src, i)
+            if abs(x) < 1e9 and abs(z) < 1e9: pts.append((x, y, z))
+        closed = p.get('closed')
+        if closed is None:
+            closed = _safe(lambda: vs.GetPolyClosed(src)) if hasattr(vs, 'GetPolyClosed') else False
+            if not closed and len(pts) > 2:
+                closed = abs(pts[0][0] - pts[-1][0]) < 1e-6 and abs(pts[0][1] - pts[-1][1]) < 1e-6
+        segs = list(zip(pts, pts[1:]))
+        if closed and len(pts) > 2 and (pts[0][:2] != pts[-1][:2]):
+            segs.append((pts[-1], pts[0]))
+        minl = float(p.get('min_length', 0.05))
+        made, skipped = [], 0
+        for a, b in segs:
+            ln = ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5
+            if ln < minl or (p.get('skip_flat') and abs(b[2] - a[2]) < 1e-4):
+                skipped += 1; continue
+            r = _grade_one(a[0], a[1], a[2], b[0], b[1], b[2], q)
+            if 'error' in r: return {'error': r['error'], 'made': made}
+            made.append(r['object_id'])
+        return {'status': 'ok', 'grades': made, 'count': len(made), 'skipped': skipped}
+    finally:
+        _restore(prev)
+
+
 def get_pio_parameters(p):
     """Read all PIO parameter fields (PIO name == record name on the object)."""
     h = _h(p.get('object_id'))
