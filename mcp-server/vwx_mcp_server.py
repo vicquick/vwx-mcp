@@ -62,6 +62,9 @@ VWX_CACHE_TTL = int(os.environ.get("VWX_CACHE_TTL", "45"))
 # survive a palette restart and a Vectorworks modal that stalls the tick.
 VWX_ALIVE_MAX_AGE = float(os.environ.get("VWX_ALIVE_MAX_AGE", "8"))
 VWX_ALIVE_GRACE = float(os.environ.get("VWX_ALIVE_GRACE", "20"))
+# A Vectorworks modal dialog open this long while a call waits = report it
+# (title, text, buttons) instead of waiting out the whole timeout.
+VWX_MODAL_GRACE = float(os.environ.get("VWX_MODAL_GRACE", "2"))
 # Heartbeat already older than this when a call starts = bridge is off, fail
 # immediately (no grace wait).
 VWX_ALIVE_STALE = float(os.environ.get("VWX_ALIVE_STALE", "60"))
@@ -248,6 +251,8 @@ class VwxFileTransport:
                              f"(last heartbeat: {seen}). Vectorworks may still be "
                              "starting — open the VWX Bridge palette and retry.",
                     'cid': cid, 'code': 'VW_BRIDGE_DOWN'}
+        next_dialog_check = time.monotonic() + 1.0
+        modal_since = None
         while time.monotonic() < deadline:
             result = self._read_result(cid)
             if result is not None:
@@ -257,6 +262,35 @@ class VwxFileTransport:
                 logger.info(f"tool={command_type} cid={cid} ms={ms:.0f} "
                             f"status={status} transport=file")
                 return result
+            # A modal dialog blocks VW's main thread, so nothing will answer
+            # until someone clicks it. Report it (with its text and buttons)
+            # after a short grace instead of waiting out the whole timeout —
+            # the caller can read it and answer with vw_dialog_press.
+            if time.monotonic() >= next_dialog_check:
+                next_dialog_check = time.monotonic() + 1.0
+                dlg = _open_dialogs()
+                if dlg:
+                    modal_since = modal_since or time.monotonic()
+                    if time.monotonic() - modal_since >= VWX_MODAL_GRACE:
+                        claimed = not os.path.exists(jp)
+                        if not claimed:
+                            self._discard(jp)      # never ran: safe to retry
+                        logger.warning(f"tool={command_type} cid={cid} "
+                                       f"status=modal dialog={dlg[0]['title']!r}")
+                        return {
+                            'error': "Vectorworks zeigt einen modalen Dialog und "
+                                     "blockiert damit die Bridge: "
+                                     + " | ".join(f"{d['title']}: {d['text'] or '(Text nicht lesbar – screenshot)'}"
+                                                  f" [Knöpfe: {', '.join(d['buttons']) or '-'}]" for d in dlg),
+                            'code': 'VW_MODAL_DIALOG', 'dialogs': dlg, 'cid': cid,
+                            'job': ('läuft (nach dem Schließen mit poll/cid abholen, '
+                                    'NICHT wiederholen)' if claimed else
+                                    'nicht gestartet (verworfen, Wiederholen ist sicher)'),
+                            'hint': "Text lesen, dann vw_dialog_press(button=...) — "
+                                    "nur harmlose Antworten (OK/Nein/Abbrechen) selbst "
+                                    "geben, alles Folgenreiche den Nutzer fragen."}
+                else:
+                    modal_since = None
             # Fail fast on a bridge that is not running rather than burning the
             # whole (now long) timeout on a queue nobody is draining.
             alive, paused, age = self.bridge_state()
@@ -2999,6 +3033,70 @@ def _vw_windows():
     return (doc[0] if doc else None), dialogs
 
 
+def _dialog_details(hwnd, title):
+    """What a modal dialog says and which buttons it offers.
+
+    Standard Win32 dialogs (#32770 — the warning/question boxes VW raises,
+    e.g. "Die ausgewählte Einfassung ist mit einem Belag/Weg verknüpft …")
+    expose their message as Static children and their choices as Button
+    children, so both can be read without touching the dialog. Custom-drawn
+    dialogs have no readable children; then only the title is known and the
+    caller should look at it with the screenshot tool.
+    """
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.windll.user32
+    texts, buttons = [], []
+
+    def _txt(h):
+        n = u32.GetWindowTextLengthW(h)
+        if n <= 0:
+            return ""
+        b = ctypes.create_unicode_buffer(n + 1)
+        u32.GetWindowTextW(h, b, n + 1)
+        return b.value
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _child(h, _):
+        if not u32.IsWindowVisible(h):
+            return True
+        cls = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(h, cls, 64)
+        t = _txt(h).strip()
+        if not t:
+            return True
+        if cls.value == "Button":
+            style = u32.GetWindowLongW(h, -16) & 0x0F          # BS_TYPEMASK
+            # check boxes, radio buttons and group boxes are options, not
+            # answers; everything else is a push button — VW draws its own
+            # (BS_OWNERDRAW), so "only BS_PUSHBUTTON" missed its OK (13.10.)
+            if style in (2, 3, 4, 5, 6, 7, 9):
+                texts.append("[Option] " + t.replace("&", ""))
+            else:
+                buttons.append(t.replace("&", ""))
+        elif cls.value in ("Static", "Edit", "RichEdit20W", "RICHEDIT50W"):
+            texts.append(t)
+        return True
+
+    u32.EnumChildWindows(hwnd, _child, 0)
+    cls = ctypes.create_unicode_buffer(64)
+    u32.GetClassNameW(hwnd, cls, 64)
+    return {"title": title, "text": "\n".join(texts), "buttons": buttons,
+            "class": cls.value, "readable": bool(texts or buttons)}
+
+
+def _open_dialogs():
+    """Details of every modal dialog Vectorworks shows right now ([] if none)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        _doc, dialogs = _vw_windows()
+        return [_dialog_details(h, t) for h, t, _a in dialogs]
+    except Exception as e:                      # never let detection break a call
+        logger.warning(f"dialog detection failed: {e}")
+        return []
+
+
 def _dpi_aware():
     """Make this process DPI-aware. Must run before ANY window measurement.
 
@@ -3231,6 +3329,82 @@ def _screenshot_front(max_width, fit_to_objects, region):
     from mcp.types import TextContent
     return ToolResult(content=[TextContent(type="text", text=note),
                                img.to_image_content()])
+
+
+@vtool
+def vw_dialog(ctx: Context) -> str:
+    """READ the modal dialog(s) Vectorworks is showing right now.
+
+    A modal dialog blocks VW's main thread and with it every bridge command;
+    commands then come back with code VW_MODAL_DIALOG. This tool works
+    regardless (it reads the window from outside VW): title, message text and
+    the push buttons it offers. Empty list = no dialog open.
+    Custom-drawn dialogs may be unreadable ("readable": false) — look at them
+    with the screenshot tool."""
+    if sys.platform != "win32":
+        return json.dumps({"error": "only on Windows"})
+    return json.dumps({"dialogs": _open_dialogs()}, ensure_ascii=False)
+
+
+@vtool
+def vw_dialog_press(ctx: Context, button: str, title: Optional[str] = None) -> str:
+    """ANSWER a Vectorworks modal dialog by pressing one of its buttons.
+
+    button: the button label as vw_dialog lists it (case-insensitive, '&'
+    ignored), e.g. "OK", "Nein", "Abbrechen". Special value "close" sends
+    WM_CLOSE (like the X) for dialogs without readable buttons.
+    title: pick the dialog by (part of) its title when several are open.
+    Read the text first. Answer harmless notices yourself (OK on a warning,
+    Nein/Abbrechen on an unexpected question); anything that changes or
+    deletes data, saves, or discards work is the user's decision — ask.
+    Works while VW is blocked (Windows messages from outside, no mouse).
+    After the dialog closes, a command that was running continues; fetch
+    its result with the 'poll' command and its cid instead of re-running it."""
+    if sys.platform != "win32":
+        return json.dumps({"error": "only on Windows"})
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.windll.user32
+    _doc, dialogs = _vw_windows()
+    if title:
+        dialogs = [d for d in dialogs if title.lower() in d[1].lower()]
+    if not dialogs:
+        return json.dumps({"error": "kein passender Dialog offen"})
+    hwnd, dtitle, _a = max(dialogs, key=lambda e: e[2])
+    want = button.replace("&", "").strip().lower()
+    if want == "close":
+        u32.PostMessageW(hwnd, 0x0010, 0, 0)                     # WM_CLOSE
+        pressed = "close"
+    else:
+        hits = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _child(h, _):
+            cls = ctypes.create_unicode_buffer(64)
+            u32.GetClassNameW(h, cls, 64)
+            if cls.value == "Button" and u32.IsWindowVisible(h) and u32.IsWindowEnabled(h):
+                n = u32.GetWindowTextLengthW(h)
+                b = ctypes.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(h, b, n + 1)
+                if b.value.replace("&", "").strip().lower() == want:
+                    hits.append(h)
+            return True
+
+        u32.EnumChildWindows(hwnd, _child, 0)
+        if not hits:
+            return json.dumps({"error": f"Knopf {button!r} nicht gefunden",
+                               "dialog": _dialog_details(hwnd, dtitle)}, ensure_ascii=False)
+        u32.PostMessageW(hits[0], 0x00F5, 0, 0)                  # BM_CLICK
+        pressed = button
+    for _ in range(30):                                          # bis 3 s warten
+        time.sleep(0.1)
+        if not u32.IsWindow(hwnd) or not u32.IsWindowVisible(hwnd):
+            break
+    still = _open_dialogs()
+    logger.info(f"tool=vw_dialog_press dialog={dtitle!r} button={pressed!r} "
+                f"remaining={len(still)}")
+    return json.dumps({"status": "ok", "dialog": dtitle, "pressed": pressed,
+                       "noch_offen": still}, ensure_ascii=False)
 
 
 # ═══════════════════════════════════════════════════════════════════
