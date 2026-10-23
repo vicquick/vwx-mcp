@@ -119,6 +119,11 @@ static TXString VwxPluginDir()
 			FindClose( h );
 		}
 		std::sort( versions.begin(), versions.end(), std::greater<std::string>() );
+		// The host this binary was compiled for goes first. With 2026 and 2027
+		// both installed, "newest first" alone would let a 2026 host drain the
+		// 2027 queue (and vice versa). SDK_VERSION 3200 = 2027, 3100 = 2026.
+		const std::string hostYear = std::to_string( SDK_VERSION / 100 + 1995 );
+		versions.insert( versions.begin(), hostYear );
 	}
 
 	for ( const std::string& version : versions ) {
@@ -220,6 +225,12 @@ static const char* kPumpReadonlyScript =
 	"        vs = sorted((d for d in os.listdir(r) if len(d) == 4 and d.isdigit()), reverse=True)\n"
 	"    except Exception:\n"
 	"        vs = []\n"
+	// Host year first (embedded Python lives under 'Vectorworks <year>'), so
+	// a 2026 and a 2027 running side by side never drain each other's queue.
+	"    import re\n"
+	"    m = re.search(r'Vectorworks ?(\\d{4})', (sys.executable or '') + ' ' + (sys.prefix or ''))\n"
+	"    if m:\n"
+	"        vs.insert(0, m.group(1))\n"
 	"p = ''\n"
 	"for v in vs:\n"
 	"    for n in ('VW-MCP', 'VWX-MCP'):\n"

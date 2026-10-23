@@ -13,8 +13,9 @@ if %errorlevel% neq 0 (
 
 REM Build output sits next to this script in the repo — deriving it keeps the
 REM script working from any clone (and keeps a developer's home directory out
-REM of a public repository).
-set "SRC=%~dp0..\native\Output\Release"
+REM of a public repository). Each Vectorworks year builds into its own
+REM Output\<year>\Release so a 2026 binary can never land in a 2027 install;
+REM SRC is set below, once VWVER is known.
 
 REM Vectorworks major version was hardcoded as 2026 here, in the deploy target
 REM AND in the process name below. The process-name copy is the dangerous one:
@@ -30,7 +31,14 @@ if not defined VWVER (
 )
 if not defined VWVER (
   echo   No "C:\Program Files\Vectorworks ^<year^>" install found.
-  echo   Set VWX_VW_VERSION=2026 ^(or your version^) and rerun.
+  echo   Set VWX_VW_VERSION=2027 ^(or your version^) and rerun.
+  pause
+  exit /b 1
+)
+set "SRC=%~dp0..\native\Output\%VWVER%\Release"
+if not exist "%SRC%\VwxBridge.vlb" (
+  echo   No build for Vectorworks %VWVER% at %SRC%.
+  echo   Build native\VwxBridge%VWVER%.vcxproj first.
   pause
   exit /b 1
 )

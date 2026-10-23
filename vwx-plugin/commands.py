@@ -242,7 +242,7 @@ def set_document_preferences(p):
 # VectorScript cannot see past the active document. There is no
 # GetDocumentCount, no NextDocument, no SetActiveDocument — GetFName tells you
 # which file you are in and nothing about the others. Confirmed against the
-# 3071-function index, not assumed.
+# 3098-function index, not assumed.
 #
 # What does know is Windows: every open document is a window in this very
 # process, and this code runs inside it. So the list comes from the window

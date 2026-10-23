@@ -24,6 +24,13 @@ else:
                             if len(d) == 4 and d.isdigit()), reverse=True)
     except Exception:
         _versions = []
+    # Host year first (embedded Python lives under 'Vectorworks <year>'), so a
+    # 2026 and a 2027 running side by side never drain each other's queue.
+    import re
+    _m = re.search(r'Vectorworks ?(\d{4})',
+                   (sys.executable or '') + ' ' + (sys.prefix or ''))
+    if _m:
+        _versions.insert(0, _m.group(1))
 
 _dir = None
 for _v in _versions:

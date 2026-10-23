@@ -1,8 +1,8 @@
 # vwx-mcp
 
-**Vectorworks 2026 MCP server — 248 tools + a 3071-function `vs.*` knowledge index, true background control (bridge v13).**
+**Vectorworks 2027 MCP server — 248 tools + a 3098-function `vs.*` knowledge index, true background control (bridge v13).**
 
-Drive a live Vectorworks 2026 session from any MCP client (Claude Code, Claude
+Drive a live Vectorworks 2027 session (2026: branch \w2026\; port notes: [docs/VECTORWORKS_2027.md](docs/VECTORWORKS_2027.md)) from any MCP client (Claude Code, Claude
 Desktop, …) **while you work in another app**: reads drain invisibly via VW's
 OnIdle notification queue, writes reach VW through its own message queue — no
 watchdog process, no focus juggling, structurally crash-proof.
@@ -38,16 +38,16 @@ bridge remains for macOS/remote (`VWX_TRANSPORT=tcp`, [legacy/](legacy/README.md
 
 ## Install (Windows)
 
-1. Copy `vwx-plugin/` contents to `%APPDATA%\Nemetschek\Vectorworks\2026\Plug-ins\VWX-MCP\`
+1. Vectorworks closed: `bridge/install_user_plugin.ps1` copies `vwx-plugin/` to `%APPDATA%\Nemetschek\Vectorworks\<year>\Plug-ins\VW-MCP\`, carries `VWX Bridge Start.vsm` over from the previous year and puts the bridge items back into the Extras menu (see [docs/VECTORWORKS_2027.md](docs/VECTORWORKS_2027.md)). Manual: copy `vwx-plugin/` there yourself
    (the legacy folder name `VW-MCP` also works).
 2. Copy `mcp-server/vwx_mcp_server.py`, `mcp-server/tool_tags.py`, and
    `mcp-server/requirements.txt` to `%USERPROFILE%\.local\share\vwx-mcp\`
 3. Copy `bridge/vwx-mcp.bat` to `%USERPROFILE%\bridge\`. `python` on PATH —
    the launcher creates a venv + installs `fastmcp` on first run.
-4. **Native palette**: build `native/VwxBridge2026.vcxproj` (VS2022 BuildTools,
-   `VWSDK2026` env → SDK root containing `SDKLib`), then copy
-   `native/Output/Release/VwxBridge.vlb` + `VwxBridge.vwr` to
-   `C:\Program Files\Vectorworks 2026\Plug-ins\` (VW closed, admin).
+4. **Native palette**: build `native/VwxBridge2027.vcxproj` (VS2022 BuildTools,
+   `VWSDK2027` env → SDK root containing `SDKLib`), then copy
+   `native/Output/2027/Release/VwxBridge.vlb` + `VwxBridge.vwr` to
+   `C:\Program Files\Vectorworks 2027\Plug-ins\` (VW closed, admin; `bridge/deploy_native_bridge.bat` does it).
 5. **Executor command (one-time, in VW)**: Plug-in Manager → Eigene Plug-ins →
    Neu… → Menübefehl (Python) named **"VWX Bridge Start"**, code =
    `vwx-plugin/BridgeStart_MenuCommand.py`. Workspace editor: add it to a menu +

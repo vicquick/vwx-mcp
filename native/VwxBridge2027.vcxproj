@@ -1,7 +1,7 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Build:  msbuild VwxBridge2026.vcxproj -p:Configuration=Release -p:Platform=x64
-     Requires env var VWSDK2026 pointing at the SDK root that CONTAINS SDKLib,
-     e.g.  set VWSDK2026=C:\Users\me\Documents\vwx-sdk\sdk\SDK\SDKVW(832364)   -->
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!-- Build:  msbuild VwxBridge2027.vcxproj -p:Configuration=Release -p:Platform=x64
+     Requires env var VWSDK2027 pointing at the SDK root that CONTAINS SDKLib,
+     e.g.  set VWSDK2027=C:\Users\me\Documents\vwx-sdk\2027\sdk\SDK\SDKVW(882699)   -->
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
     <PreferredToolArchitecture>x64</PreferredToolArchitecture>
@@ -30,7 +30,7 @@
   </ImportGroup>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
-    <Import Project="$(VWSDK2026)\SDKLib\Include\OnlyWin\NNA_PluginBuild_RELEASE.props" />
+    <Import Project="$(VWSDK2027)\SDKLib\Include\OnlyWin\NNA_PluginBuild_RELEASE.props" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
@@ -39,8 +39,8 @@
     <TargetExt Condition="'$(Configuration)|$(Platform)'=='Release|x64'">.vlb</TargetExt>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <OutDir>$(ProjectDir)Output\$(Configuration)\</OutDir>
-    <IntDir>$(ProjectDir)Output\Intermediate\$(Configuration)\</IntDir>
+    <OutDir>$(ProjectDir)Output\2027\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)Output\2027\Intermediate\$(Configuration)\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Midl>
@@ -48,7 +48,7 @@
     </Midl>
     <ClCompile>
       <Optimization>MaxSpeed</Optimization>
-      <AdditionalIncludeDirectories>.\Source\Prefix;.\Source;$(VWSDK2026)\SDKLib\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\Source\Prefix;.\Source;$(VWSDK2027)\SDKLib\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>NDEBUG;WIN32;_WINDOWS;_USRDLL;_WIN_EXTERNAL_;RELEASE_BLD;_WINDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>false</MinimalRebuild>
       <BasicRuntimeChecks>Default</BasicRuntimeChecks>
@@ -70,7 +70,7 @@
       <AdditionalDependencies>VWSDK.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <OutputFile>$(TargetPath)</OutputFile>
       <SuppressStartupBanner>true</SuppressStartupBanner>
-      <AdditionalLibraryDirectories>$(VWSDK2026)\SDKLib\LibWin\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(VWSDK2027)\SDKLib\LibWin\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <GenerateDebugInformation>false</GenerateDebugInformation>
       <ProgramDatabaseFile>$(IntDir)$(TargetName).pdb</ProgramDatabaseFile>
       <SubSystem>Windows</SubSystem>
@@ -81,8 +81,8 @@
 set VWR_INPUT=$(ProjectDir)$(TargetName).vwr
 set VWR_OUTPUT=$(TargetDir)$(TargetName).vwr
 set VWR_MODE=$(Configuration)
-set VWR_7ZCMD=$(VWSDK2026)\SDKLib\ToolsWin\BuildVWR\7z
-"$(VWSDK2026)\SDKLib\ToolsWin\BuildVWR\buildvwr.exe"</Command>
+set VWR_7ZCMD=$(VWSDK2027)\SDKLib\ToolsWin\BuildVWR\7z
+"$(VWSDK2027)\SDKLib\ToolsWin\BuildVWR\buildvwr.exe"</Command>
       <Message>Creating VWR file.</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>

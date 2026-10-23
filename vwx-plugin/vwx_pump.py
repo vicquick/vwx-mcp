@@ -48,6 +48,13 @@ def _vw_roots():
                                if len(d) == 4 and d.isdigit()), reverse=True)
         except Exception:
             versions = []
+        # Host year first (embedded Python lives under 'Vectorworks <year>'),
+        # so a 2026 and a 2027 running side by side never share a queue.
+        import re
+        m = re.search(r'Vectorworks ?(\d{4})',
+                      (sys.executable or '') + ' ' + (sys.prefix or ''))
+        if m:
+            versions.insert(0, m.group(1))
     return [os.path.join(root, v, 'Plug-ins') for v in versions]
 
 
