@@ -1799,8 +1799,12 @@ def get_object_metrics(p):
     """Area + perimeter of a 2D object (doc units). params: {object_id}."""
     h = _h(p.get('object_id'))
     if not h: return {'error': 'object not found'}
-    return {'status': 'ok', 'area': _safe(lambda: vs.HArea(h)),
-            'perimeter': _safe(lambda: vs.HPerim(h))}
+    # HArea returns None on VW2027 (live 2026-10-23, closed polygon of
+    # 17.77 m2); HAreaN works. Keep HArea only as a fallback.
+    area = _safe(lambda: vs.HAreaN(h))
+    if area is None:
+        area = _safe(lambda: vs.HArea(h))
+    return {'status': 'ok', 'area': area, 'perimeter': _safe(lambda: vs.HPerim(h))}
 
 def get_document_units(p):
     """Current document unit settings (raw GetUnits tuple: fraction, display,
