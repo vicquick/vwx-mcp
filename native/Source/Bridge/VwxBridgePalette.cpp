@@ -675,12 +675,15 @@ void CVwxJSProvider::OnInit(IInitContext* context)
 
 void CVwxJSProvider::OnPaletteVisibilityChange(bool visible, IWebPaletteFrame* frame)
 {
-	// Palette open = bridge alive. Palette closed = bridge off. The Pause
-	// button in the palette pauses without closing.
+	// Shown = bridge on. Hidden does NOT stop it: VW2027 docks palettes into
+	// collapsible side tabs and reports "not visible" every time the tab folds
+	// in, which killed the bridge seconds after each start (seen 2026-10-23).
+	// The callback cannot tell a collapsed tab from a closed palette, so the
+	// bridge runs until Pause or until Vectorworks quits.
 	if ( visible )
 		VwxBridge_StartPumpTimer();
 	else
-		VwxBridge_StopPumpTimer();
+		LogLine( "palette hidden (bridge stays on; use Pause to stop)" );
 }
 
 void CVwxJSProvider::OnPump(const TXString& objName, const TXString& functionName, const std::vector<nlohmann::json>& args, VectorWorks::UI::IJSFunctionCallbackContext* context)

@@ -530,6 +530,7 @@ def pump_all():
 
     Call ONLY from genuine command dispatch (VW's Python menu-command runner).
     """
+    _log("pump_all: entered (%d queued)" % len(_ordered_jobs()))
     _housekeep()
     st = _load_state()
     active = _active_doc()
