@@ -2687,23 +2687,151 @@ def set_ifc_entity(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        vs.IFC_SetIFCEntity(h, p.get('entity', 'IfcBuildingElement'), '', '')
-        return {'status': 'ok'}
+        # Two arguments (vs_index). The old call passed four and tripped an
+        # engine error. NOTE: changing the entity DROPS every attached pset —
+        # ifc_set_entity_keep_psets re-attaches them (2026-10-23).
+        ok = vs.IFC_SetIFCEntity(h, p.get('entity', 'IfcBuildingElementProxy'))
+        if not ok:
+            return {'error': 'entity not accepted by the active IFC scheme: %s' % p.get('entity')}
+        return {'status': 'ok', 'entity': p.get('entity')}
     except Exception as e:
         return {'error': str(e)}
+
+# ---- IFC pset snapshot / restore -------------------------------------------
+# Enumeration works through the pset DEFINITION, not the object: the object
+# names its psets (IFC_GetNumPsets / IFC_GetPsetName, 1-based), the definition
+# lists the property names (IFC_GetNumPsetProps / IFC_GetPsetPropName,
+# 1-based), and IFC_GetPsetProp(h, pset, prop) returns (ok, value, typeCode).
+# Every getter returns an (ok, value) tuple. Verified on VW2027, 2026-10-23.
+
+def _ifc_v(x):
+    return x[1] if isinstance(x, tuple) else x
+
+_IFC_PROP_NAMES = {}
+
+def _ifc_prop_names(pset):
+    if pset not in _IFC_PROP_NAMES:
+        n = int(_ifc_v(vs.IFC_GetNumPsetProps(pset)) or 0)
+        names = (_ifc_v(vs.IFC_GetPsetPropName(pset, i)) for i in range(1, n + 1))
+        _IFC_PROP_NAMES[pset] = [x for x in names if x]
+    return _IFC_PROP_NAMES[pset]
+
+def _ifc_pset_snapshot(h):
+    """{pset: {prop: value-as-string}} for every attached pset; empty values skipped."""
+    out = {}
+    n = int(_ifc_v(vs.IFC_GetNumPsets(h)) or 0)
+    for i in range(1, n + 1):
+        ps = _ifc_v(vs.IFC_GetPsetName(h, i))
+        if not ps:
+            continue
+        out[ps] = {}
+        for prop in _ifc_prop_names(ps):
+            r = vs.IFC_GetPsetProp(h, ps, prop)
+            if r[0] and str(r[1]) != '':
+                out[ps][prop] = str(r[1])
+    return out
+
+def _ifc_pset_restore(h, snap):
+    for ps, values in snap.items():
+        vs.IFC_AttachPset(h, ps)
+        for prop, val in values.items():
+            vs.IFC_SetPsetProp(h, ps, prop, val)
 
 def get_ifc_properties(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        # IFC property enumeration — best-effort via IFC_GetPSetAttribute iteration
-        psets = {}
-        # No full enumeration API; return placeholder with entity
-        ok, entity = vs.IFC_GetIFCEntity(h)
-        return {'entity': entity if ok else '', 'psets': psets,
-                'note': 'Full pset enumeration requires IFC_PSetList API'}
+        e2 = vs.IFC_GetIFCEntity2(h)   # (ok, source 1=mapping 2=record, effective, mapped)
+        return {'entity': _ifc_v(vs.IFC_GetIFCEntity(h)) or '',
+                'effective_entity': e2[2], 'mapping_entity': e2[3],
+                'source': {0: 'none', 1: 'data mapping', 2: 'object record'}.get(e2[1], e2[1]),
+                'name': _ifc_v(vs.IFC_GetEntityProp(h, 'Name')),
+                'psets': _ifc_pset_snapshot(h)}
     except Exception as e:
         return {'error': str(e)}
+
+def ifc_set_entity_keep_psets(p):
+    """Change the IFC class of many objects WITHOUT losing their property sets.
+
+    IFC_SetIFCEntity silently drops every attached pset (verified 2026-10-23:
+    a pipe lost Pset_LILASp). This snapshots, switches, restores and compares.
+
+    params: entity (required), criteria OR object_ids, name (optional IFC Name
+    for objects whose Name is empty or a generated '<uuid>IfcXxx'), dry_run.
+    """
+    import re
+    entity = p.get('entity')
+    if not entity:
+        return {'error': 'entity required'}
+    handles = []
+    if p.get('object_ids'):
+        handles = [h for h in (_h(u) for u in p['object_ids']) if h]
+    elif p.get('criteria'):
+        vs.ForEachObject(lambda h: handles.append(h), p['criteria'])
+    else:
+        return {'error': 'criteria or object_ids required'}
+    junk = re.compile(r'^([0-9a-f-]{36})?Ifc\w+$')
+    stats, problems = {}, []
+    for h in handles:
+        cur = _ifc_v(vs.IFC_GetIFCEntity(h)) or 'none'
+        if cur == entity:
+            stats['already'] = stats.get('already', 0) + 1
+            continue
+        key = '%s <- %s' % (entity, cur)
+        stats[key] = stats.get(key, 0) + 1
+        if p.get('dry_run'):
+            continue
+        before = _ifc_pset_snapshot(h)
+        if not vs.IFC_SetIFCEntity(h, entity):
+            problems.append({'object_id': _oid(h), 'error': 'entity rejected by IFC scheme'})
+            continue
+        _ifc_pset_restore(h, before)
+        nm = str(_ifc_v(vs.IFC_GetEntityProp(h, 'Name')) or '')
+        if p.get('name') and (not nm or junk.match(nm)):
+            vs.IFC_SetEntityProp(h, 'Name', p['name'])
+        if _ifc_pset_snapshot(h) != before:
+            problems.append({'object_id': _oid(h), 'error': 'pset values differ after restore'})
+    return {'status': 'ok', 'matched': len(handles), 'changes': stats,
+            'problems': problems[:20], 'n_problems': len(problems), 'dry_run': bool(p.get('dry_run'))}
+
+def ifc_audit(p):
+    """Effective IFC class per object kind: where it comes from (object record
+    vs data mapping) and where the two disagree. Proxies and *Type entities on
+    instances are flagged — both export wrong.
+
+    params: criteria (required; scope it to layers, e.g. "(L='EG')" —
+    a whole-document walk freezes big files).
+    """
+    crit = p.get('criteria')
+    if not crit:
+        return {'error': "criteria required (e.g. \"(L='EG')\") — full-document walks freeze big files"}
+    groups = {}
+    def visit(h):
+        t = vs.GetTypeN(h)
+        kind = (vs.GetName(vs.GetParametricRecord(h)) if t == 86 else
+                vs.GetSymName(h) if t == 15 else 'type %d' % t)
+        try:
+            e2 = vs.IFC_GetIFCEntity2(h)
+            eff, mapped, src = e2[2] or '(none)', e2[3] or '', e2[1]
+        except Exception:
+            eff, mapped, src = '(error)', '', -1
+        k = (vs.GetLName(vs.GetLayer(h)), kind, eff, mapped, src)
+        g = groups.setdefault(k, {'count': 0, 'example': _oid(h)})
+        g['count'] += 1
+    vs.ForEachObject(visit, crit)
+    rows = []
+    for (layer, kind, eff, mapped, src), g in sorted(groups.items()):
+        flags = []
+        if eff == 'IfcBuildingElementProxy':
+            flags.append('proxy')
+        if eff.endswith('Type'):
+            flags.append('type entity on instance')
+        if mapped and eff != mapped:
+            flags.append('record overrides mapping (%s)' % mapped)
+        rows.append({'layer': layer, 'kind': kind, 'entity': eff, 'mapping': mapped,
+                     'source': {0: 'none', 1: 'mapping', 2: 'record'}.get(src, src),
+                     'count': g['count'], 'example': g['example'], 'flags': flags})
+    return {'status': 'ok', 'scheme': _ifc_v(vs.IFC_GetIFCScheme()), 'groups': rows}
 
 def set_ifc_property(p):
     h = _h(p.get('object_id'))
@@ -4609,7 +4737,8 @@ def offset_polygon(p):
     if not h: return {'error': 'Object not found'}
     dist = float(p.get('distance', 10))
     try:
-        nh = vs.OffsetPoly(h, dist)
+        # OffsetPoly takes seven arguments; OffsetPolyN (Parasolid) takes three.
+        nh = vs.OffsetPolyN(h, dist, bool(p.get('smooth', False)))
         return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
     except Exception as e: return {'error': str(e)}
 
@@ -4657,7 +4786,7 @@ def polygon_centroid(p):
 def polygon_perimeter(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
-    try: return {'perimeter': vs.CalcPolySegLen(h)}
+    try: return {'perimeter': vs.HPerim(h)}   # CalcPolySegLen needs (h, i1, i2)
     except Exception as e: return {'error': str(e)}
 
 def point_in_polygon(p):
@@ -4682,7 +4811,7 @@ def convert_to_nurbs(p):
     h = _h(p.get('object_id'))
     if not h: return {'error': 'Object not found'}
     try:
-        nh = vs.ConvertToNURBS(h)
+        nh = vs.ConvertToNURBS(h, bool(p.get('keep_original', False)))
         return {'status': 'ok', 'object_id': _oid(nh) if nh else None}
     except Exception as e: return {'error': str(e)}
 
@@ -4731,8 +4860,8 @@ def get_material_info(p):
         name = vs.GetObjMaterialName(h) if hasattr(vs, 'GetObjMaterialName') else (vs.GetName(mh) if mh else None)
         return {
             'material_name': name,
-            'area':   _safe(lambda: vs.GetMaterialArea(h)),
-            'volume': _safe(lambda: vs.GetMaterialVolume(h)),
+            'area':   _safe(lambda: vs.GetMaterialArea(h, name)) if name else None,
+            'volume': _safe(lambda: vs.GetMaterialVolume(h, name)) if name else None,
             'is_simple': _safe(lambda: vs.IsMaterialSimple(mh)) if mh else None,
         }
     except Exception as e: return {'error': str(e)}
