@@ -1,18 +1,20 @@
 <#
 Install the user-side half of the VWX bridge for one Vectorworks year:
+vwx-plugin\*  ->  %APPDATA%\Nemetschek\Vectorworks\<year>\Plug-ins\VW-MCP\
+A new major version's Migration Manager does not copy that folder.
 
-  1. vwx-plugin\*  ->  %APPDATA%\Nemetschek\Vectorworks\<year>\Plug-ins\VW-MCP\
-  2. "VWX Bridge Start.vsm" (the Python menu command, Ctrl+Shift+B) carried over
-     from an older year if the target has none. A new major version's
-     Migration Manager does not copy it, nor the VW-MCP folder.
-  3. Workspaces: the three bridge menu items put back into the Extras menu
-     ("VWX Bridge Palette anzeigen", "VWX Bridge Start" with Ctrl+Shift+B,
-     "VWX Pump"). Migration drops them, because at migration time the native
-     plug-in and the .vsm are not installed yet.
+Two steps stay manual, because the automated versions were tried on 2027 and
+failed silently (2026-10-23):
+  - The "VWX Bridge Start" Python menu command. A .vsm copied from 2026 shows
+    up in the menu but never executes. It must be created in the new year's
+    Plug-in Manager.
+  - The Extras menu entries. Entries written into the .vww by hand show the
+    raw universal name and are not linked to the plug-in. They must be added
+    with the Workspace Editor.
+The script prints both procedures at the end.
 
 The native half (VwxBridge.vlb/.vwr into Program Files) is
-deploy_native_bridge.bat. Run this script with Vectorworks CLOSED: Vectorworks
-rewrites its workspace on quit, so a patch made while it runs is lost.
+deploy_native_bridge.bat.
 
 Usage:  powershell -NoProfile -ExecutionPolicy Bypass -File bridge\install_user_plugin.ps1 [-Year 2027]
 #>
@@ -30,14 +32,10 @@ if (-not $Year) {
 if (-not $Year) { throw 'No Vectorworks install found; pass -Year.' }
 Write-Host "Target: Vectorworks $Year"
 
-if (Get-Process -Name "Vectorworks$Year" -ErrorAction SilentlyContinue) {
-    throw "Vectorworks $Year is running. Close it (it rewrites the workspace on quit) and rerun."
-}
-
 $plugins = Join-Path $vwRoot "$Year\Plug-ins"
 if (-not (Test-Path $plugins)) { throw "$plugins does not exist. Start Vectorworks $Year once first." }
 
-# 1. Python side
+# Safe while Vectorworks runs: the pump hot-reloads vwx_pump.py and commands.py.
 $dst = Join-Path $plugins 'VW-MCP'
 New-Item -ItemType Directory -Force $dst | Out-Null
 foreach ($f in 'commands.py', 'vwx_pump.py', 'vwx_mcp_bridge.py', 'vs_index.json', 'BridgeStart_MenuCommand.py') {
@@ -45,59 +43,20 @@ foreach ($f in 'commands.py', 'vwx_pump.py', 'vwx_mcp_bridge.py', 'vs_index.json
     Write-Host "  VW-MCP\$f"
 }
 
-# 2. Python menu command
 $vsm = Join-Path $plugins 'VWX Bridge Start.vsm'
-if (Test-Path $vsm) {
-    Write-Host '  VWX Bridge Start.vsm already present'
-} else {
-    $src = Get-ChildItem $vwRoot -Directory | Where-Object { $_.Name -match '^\d{4}$' -and $_.Name -lt $Year } |
-        Sort-Object Name -Descending |
-        ForEach-Object { Join-Path $_.FullName 'Plug-ins\VWX Bridge Start.vsm' } |
-        Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($src) {
-        Copy-Item $src $vsm
-        Write-Host "  VWX Bridge Start.vsm  <- $src"
-    } else {
-        Write-Warning ('No older "VWX Bridge Start.vsm" found. Create it in the Plug-in Manager: ' +
-            'new Python menu command "VWX Bridge Start", script = vwx-plugin\BridgeStart_MenuCommand.py.')
-    }
-}
-
-# 3. Workspaces
-$item = 'net.vectorworks.workspaceitem.menuitem.'
-$anchor = 'BluebeamConnect'
-$names = 'ExtMenuShowVwxBridge', 'VWX_x20Bridge_x20Start', 'ExtMenuVwxPump'
-$wsDirs = 'Arbeitsumgebungen', 'Workspaces' | ForEach-Object { Join-Path $vwRoot "$Year\$_" } | Where-Object { Test-Path $_ }
-foreach ($ws in Get-ChildItem $wsDirs -Filter *.vww | Where-Object { $_.Name -notlike '*_backup*' }) {
-    $text = [IO.File]::ReadAllText($ws.FullName)
-    if ($text.Contains("$item$($names[0])")) {
-        Write-Host "  $($ws.Name): bridge menu items already present"
-        continue
-    }
-    $ref = "<$item$anchor/>"
-    $def = "</$item$anchor>"
-    if (-not ($text.Contains($ref) -and $text.Contains($def))) {
-        Write-Warning "$($ws.Name): no '$anchor' anchor in Extras; add the three items with the Workspace Editor."
-        continue
-    }
-    $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $refIndent = ([regex]::Match($text, "([ \t]*)" + [regex]::Escape($ref))).Groups[1].Value
-    $defIndent = ([regex]::Match($text, "([ \t]*)" + [regex]::Escape($def))).Groups[1].Value
-    $refs = ($names | ForEach-Object { "$nl$refIndent<$item$_/>" }) -join ''
-    $defs = ($names | ForEach-Object {
-        $shortcut = if ($_ -eq 'VWX_x20Bridge_x20Start') { "$nl$defIndent  <Shortcut Key=""B"" Modifiers=""3""/>" } else { '' }
-        "$nl$defIndent<$item$_>$nl$defIndent  <ResourceManagerID>0</ResourceManagerID>" +
-        "$nl$defIndent  <UniversalName>$_</UniversalName>$shortcut$nl$defIndent</$item$_>"
-    }) -join ''
-    $i = $text.IndexOf($ref) + $ref.Length
-    $text = $text.Insert($i, $refs)
-    $j = $text.IndexOf($def) + $def.Length
-    $text = $text.Insert($j, $defs)
-    Copy-Item $ws.FullName "$($ws.FullName).pre-vwx" -Force
-    [IO.File]::WriteAllText($ws.FullName, $text, (New-Object Text.UTF8Encoding($false)))
-    Write-Host "  $($ws.Name): bridge menu items added to Extras (backup .pre-vwx)"
-}
-
 Write-Host ''
-Write-Host "Done. Next: bridge\deploy_native_bridge.bat (native palette, UAC), then start Vectorworks $Year"
-Write-Host 'and open Extras -> "VWX Bridge Palette anzeigen".'
+if (Test-Path $vsm) {
+    Write-Host "Menu command present ($vsm). If it was copied from an older year, recreate it (step 1)."
+}
+Write-Host @"
+Manual steps in Vectorworks $Year (once per new major version):
+ 1. Extras > Plug-ins > Plug-in-Manager > Eigene Plug-ins > Neu... > Menuebefehl,
+    name exactly "VWX Bridge Start". Select it > Code... > language Python >
+    paste vwx-plugin\BridgeStart_MenuCommand.py > OK.
+ 2. Arbeitsumgebung anpassen > Menues: drag "VWX Bridge Palette anzeigen",
+    "VWX Bridge Start" (shortcut Ctrl+Umschalt+B) and "VWX Pump (intern)" into Extras.
+ 3. Native palette: bridge\deploy_native_bridge.bat (Vectorworks closed, UAC).
+ 4. Extras > VWX Bridge Palette anzeigen; leave it open (floating or docked).
+ 5. Restart the vwx-mcp server: it picks the plug-in folder at startup.
+Check: every runner start logs "start: invoked" in VW-MCP\bridge.log.
+"@

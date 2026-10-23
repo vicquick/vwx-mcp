@@ -11,7 +11,8 @@ The last Vectorworks 2026 state is archived as branch `vw2026` and tag
 | Embedded Python | 3.9 | 3.14.5 | all plug-in files compile under 3.14 with `-W error`; no removed stdlib modules used |
 | `vs.*` API | 3071 functions | 3098 functions | +28, −1, **no signature changes** among shared names |
 | Build props | MFC implicit | `UseOfMfc=false`, `/D_DISABLE_STRING_ANNOTATION /D_DISABLE_VECTOR_ANNOTATION` | picked up through `NNA_PluginBuild_RELEASE.props` |
-| Migration Manager | — | does not copy `Plug-ins\VW-MCP`, `VWX Bridge Start.vsm`, or the bridge menu items | `bridge/install_user_plugin.ps1` puts them back |
+| Migration Manager | — | does not copy `Plug-ins\VW-MCP` or the bridge menu items; a `VWX Bridge Start.vsm` copied from 2026 appears in the menu but **never executes** | `install_user_plugin.ps1` copies VW-MCP; recreate the menu command and the menu entries by hand (the script prints the steps) |
+| Palette docking | floating or docked | docked palettes fold into side tabs that report hidden on every fold | hiding no longer stops the bridge; use Pause |
 
 Added functions: `CC_GetCableTypeData`, `CC_GetCircuitDest`, `CC_GetCircuitSource`,
 `CC_GetConnectorData`, `CC_GetDevice`, `CC_GetEquipmentItem`, `CC_GetSignalData`,
@@ -50,16 +51,19 @@ bridge\deploy_native_bridge.bat
 
 SDK download: `https://release.vectorworks.net/latest/Vectorworks/2027-NNA-eng-win-SDK.zip`.
 
-`install_user_plugin.ps1` copies `vwx-plugin\*` to `%APPDATA%\...\2027\Plug-ins\VW-MCP`,
-carries `VWX Bridge Start.vsm` over from 2026, and adds the three bridge items
-back to the Extras menu of every 2027 workspace (backup `*.vww.pre-vwx`).
+`install_user_plugin.ps1` copies `vwx-plugin\*` to `%APPDATA%\...\2027\Plug-ins\VW-MCP`
+and prints the manual steps: create the `VWX Bridge Start` Python menu command in the
+2027 Plug-in Manager, and add the three bridge items to Extras with the Workspace Editor.
+Both were automated first (copying the 2026 `.vsm`, writing `.vww` entries) and both
+failed silently: the copied command never ran, the written entries were not linked.
 `deploy_native_bridge.bat` copies `native\Output\2027\Release\VwxBridge.vlb/.vwr`
 to `C:\Program Files\Vectorworks 2027\Plug-ins` (UAC). Then start Vectorworks
 and open Extras → "VWX Bridge Palette anzeigen".
 
-## Not yet verified live
+## Verified live (2026-10-23, VW2027 32.1.0)
 
-The bridge contexts (OnIdle-notification reads, background accelerator writes,
-error-dialog dismissal) were mapped on 2026. They must be re-checked on 2027
-before production use: ping, a read, a write, an error dialog, background mode
-with Vectorworks unfocused.
+Read jobs through the OnIdle notification; write jobs (`execute_script`,
+`draw_rectangle`, `delete_object`) through the recreated menu command;
+modal-dialog detection (Plug-in Manager, Script Editor). Still open: writes
+with Vectorworks in the background, and the foreground `keybd_event` trigger
+that can collide with an open menu.
