@@ -428,8 +428,83 @@ static void RestoreKeyState()
 	}
 }
 
-// Fire triggers. Called from the heartbeat timer when jobs are queued.
+// --------------------------------------------------------------------------------------------------------
+// Write trigger, v15: run 'VWX Bridge Start' BY NAME through the SDK.
+//
+// The keystroke paths above broke on VW2027: the accelerator never reached
+// the menu command, and the foreground path (keybd_event = GLOBAL input) hit
+// whatever the user had open — a menu flyout stayed stuck over the drawing
+// (2026-10-23). ISDK::DoMenuName runs the named menu command directly,
+// independent of focus, shortcuts and workspace position (SDK doc:
+// "DoMenuName can be called recursively").
+//
+// The timer never calls it. It posts a private message to a message-only
+// window; the call happens when VW's own message loop dispatches that
+// message, i.e. in ordinary UI-thread event context, not inside WM_TIMER,
+// a notification or a CEF callback (the contexts that crashed or hung VW).
+// Same route as the ReeceKalmar 2027 fork (thousands of jobs live).
+// VWX_TRIGGER=keys restores the old keystroke trigger.
+static const UINT kMsgRunPump  = WM_APP + 0x27B;
+static HWND       gBrokerWnd   = nullptr;
+static bool       gBrokerPosted = false;   // one message in flight at most
+static bool       gInDoMenu     = false;   // reentrancy guard (pump_all may pump messages)
+static short      gLastMenuRet  = -32768;
+static int        gMenuRuns     = 0;
+
+static bool UseKeyTrigger()
+{
+	const char* t = getenv( "VWX_TRIGGER" );
+	return t != nullptr && _stricmp( t, "keys" ) == 0;
+}
+
 static bool ModalDialogOpen();
+
+static LRESULT CALLBACK BrokerWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	if ( msg != kMsgRunPump )
+		return DefWindowProcW( wnd, msg, wp, lp );
+	gBrokerPosted = false;
+	if ( gInDoMenu || gPaused || ModalDialogOpen() || CountJobs( VwxPluginDir() ) <= 0 )
+		return 0;
+	gInDoMenu = true;
+	short ret = 0;
+	try {
+		ret = gSDK->DoMenuName( "VWX Bridge Start", 0 );
+	}
+	catch ( ... ) {
+		LogLine( "DoMenuName('VWX Bridge Start') threw" );
+	}
+	gInDoMenu = false;
+	gMenuRuns++;
+	gDispatchCount++;
+	if ( ret != gLastMenuRet ) {         // log the return code once per change, not per job
+		char m[96];
+		sprintf_s( m, "DoMenuName('VWX Bridge Start') returned %d", (int) ret );
+		LogLine( m );
+		gLastMenuRet = ret;
+	}
+	return 0;
+}
+
+static bool EnsureBrokerWindow()
+{
+	if ( gBrokerWnd != nullptr && IsWindow( gBrokerWnd ) )
+		return true;
+	HMODULE mod = nullptr;
+	GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                    (LPCWSTR) &BrokerWndProc, &mod );
+	const wchar_t* cls = L"VwxBridge.PumpBroker.v15";
+	WNDCLASSW wc = {};
+	wc.lpfnWndProc   = BrokerWndProc;
+	wc.hInstance     = mod;
+	wc.lpszClassName = cls;
+	RegisterClassW( &wc );                // ERROR_CLASS_ALREADY_EXISTS is fine
+	gBrokerWnd = CreateWindowExW( 0, cls, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, mod, nullptr );
+	LogLine( gBrokerWnd ? "trigger: SDK DoMenuName broker ready" : "trigger: broker window FAILED — keystroke fallback" );
+	return gBrokerWnd != nullptr;
+}
+
+// Fire triggers. Called from the heartbeat timer when jobs are queued.
 static void TriggerPump()
 {
 	DWORD now = GetTickCount();
@@ -454,6 +529,12 @@ static void TriggerPump()
 	//    edit VW's own thread key-state + PostMessage the key into VW's queue
 	//    so TranslateAccelerator fires it without VW being the foreground app.
 	//    No crash risk either way — pump_all runs only in DoInterface.
+	//    v15: by name through the SDK unless VWX_TRIGGER=keys (see above).
+	if ( !UseKeyTrigger() && EnsureBrokerWindow() ) {
+		if ( !gBrokerPosted && !gInDoMenu )
+			gBrokerPosted = ::PostMessageW( gBrokerWnd, kMsgRunPump, 0, 0 ) != FALSE;
+		return;
+	}
 	if ( VwIsForeground() )
 		SendForegroundHotkey();
 	else
