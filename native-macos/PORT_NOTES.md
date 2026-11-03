@@ -141,6 +141,17 @@ correctly. This means the "background-wake-while-unfocused" problem the
 Windows keystroke dance solves doesn't need solving separately on macOS —
 `DoMenuName` sidesteps it entirely.
 
+**Backoff.** `DoMenuName` fires every 120 ms while jobs are queued. If the
+queue hasn't shrunk after 8 calls (the Python command isn't loaded yet, a
+modal dialog blocks dispatch, or the pump is erroring), the write-trigger
+interval doubles up to 5 s and `bridge.log` gets one
+`native: no queue progress …` line; any progress or an empty queue logs
+`queue moving again` and resets it. The palette's `pump()` status reports
+the current interval as `backoffMs`. Read-only drains (the `OnIdle`
+notification path) always keep the 120 ms rate. Known gap: reads draining
+the queue count as progress, so a stuck write behind a steady stream of
+reads keeps firing at the fast rate.
+
 ## Known limitation / TODO
 
 **Auto-dismiss-error-dialogs is stubbed, not implemented**, on macOS. On
@@ -151,14 +162,15 @@ macOS equivalent without the Accessibility API (`AXUIElement`), which
 requires granting Vectorworks Accessibility permission in System Settings —
 a real, broad, persistent permission grant, not something to add casually.
 
-Deliberately left as a stub for now: `DismissErrorDialogs()` returns without
-using the macOS Accessibility API. Menu-command-ID lookup is unrelated:
-background writes use `DoMenuName` and work while Vectorworks is unfocused.
+Deliberately not ported for now: the macOS build has no dialog-dismiss code
+at all (and so needs no Accessibility permission). A modal dialog also blocks
+`DoMenuName`, which is what the write-trigger backoff above is for.
 Failure mode if auto-dismiss is ever needed is benign — a
 stuck job just times out client-side after ~55s; nothing corrupts or hangs
 Vectorworks itself. Revisit if it turns out to matter in practice.
 
-**VW 2026 only.** `VwxPluginDir()` in `VwxBridgePalette.cpp` and the step-5
-script both hard-code `Vectorworks/2026`. Upstream `main` now picks the
+**VW 2026 only.** The year is the single `VWX_VW_YEAR` macro in
+`VwxBridgePalette.cpp`, used by both `VwxPluginDir()` and the embedded
+pump script. Upstream `main` now picks the
 version at runtime (`VWX_VW_VERSION`, 2027 support). This port has not been
 built or tested against VW 2027 or its SDK.

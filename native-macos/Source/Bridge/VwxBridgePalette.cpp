@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <cstdint>
+#include <algorithm>
 #include <CoreFoundation/CoreFoundation.h>
 
 using namespace VwxBridge;
@@ -21,37 +22,36 @@ using namespace VwxBridge;
 // Definitive VW2026 context map (6 live tests):
 //   - CEF JS sync callback ... read Python OK; doc mutation CRASHES.
 //   - OnIdle notification .... read Python OK; opening a dialog CRASHES.
-//   - genuine dispatch ....... full capability (the pump menu command's
-//     DoInterface, reached by a real click / accelerator / posted WM_COMMAND).
+//   - genuine dispatch ....... full capability (a menu command's DoInterface,
+//     reached by a real click / shortcut / gSDK->DoMenuName).
 //
-// Rule enforced here: MUTATIONS RUN ONLY IN DoInterface. Background contexts
-// drain read-only jobs (pump_readonly) and never touch the document. So a
-// mutation that cannot reach DoInterface just stays queued (visible timeout) —
-// it is never executed unsafely and CANNOT crash VW.
+// Rule enforced here: MUTATIONS RUN ONLY IN GENUINE DISPATCH. Background
+// contexts drain read-only jobs (pump_readonly) and never touch the document.
+// So a mutation that cannot reach genuine dispatch just stays queued (visible
+// timeout) — it is never executed unsafely and CANNOT crash VW.
 //
 // Triggers fired from the heartbeat timer when jobs are queued:
-//   A. NotifyLayerChange(magic) -> our StatusProc runs pump_readonly() from
-//      OnIdle = true background reads (proven live: ping/list/get, unfocused).
-//   B. PostMessage(WM_COMMAND, pumpCmdId) -> genuine dispatch -> pump_all().
-//      pumpCmdId is discovered by walking EVERY VW top-level window's menu.
-//      This is the one background path that can also mutate; if VW's custom
-//      menubar exposes no HMENU/id it is simply unavailable (logged).
-//   C. Foreground keystroke (Ctrl+Shift+B) when VW is already the foreground
-//      app — reaches the accelerator -> DoInterface. Not background, but
-//      Win11 permits it since no foreground-steal is needed.
+//   A. NotifyLayerChange(magic) -> our notification proc runs pump_readonly()
+//      from OnIdle = true background reads.
+//   B. gSDK->DoMenuName("VWX Bridge Start") -> VW's command dispatcher runs the
+//      Python menu command -> pump_all() (reads + writes), focus-independent.
+//      If the queue makes no progress, B backs off (see TriggerPump).
 static CFRunLoopTimerRef gPumpTimer     = nullptr;
 static bool          gPaused        = false;
 static int           gLastQueue     = 0;
 static bool          gPumping       = false;   // reentrancy guard for the drain
 static bool          gNotifyInCall  = false;   // inside NotifyLayerChange => sync-delivery detector
-static double        gLastTrigTick  = 0.0;   // ms since plugin load (see NowMs)
-static uint32_t      gPumpCmdId     = 0;        // always 0 on macOS v1 (background WM_COMMAND write path not ported)
-static int           gDispatchCount = 0;        // times DoInterface actually ran (trigger proof)
-static bool          gKeyStateDirty = false;    // background-hotkey key state needs restoring
-static BYTE          gSavedKeyState[256] = {0};
+static double        gLastTrigTick  = 0.0;     // ms (see NowMs), last write trigger (B)
+static double        gLastReadTick  = 0.0;     // ms, last read-only trigger (A)
+static int           gDispatchCount = 0;       // times the native pump command's DoInterface ran
 static const StatusData kVwxMagic   = 0x56575850;   // 'VWXP' — filters our own notifications
 
 // --------------------------------------------------------------------------------------------------------
+// Vectorworks version whose user plug-in folder holds VW-MCP. The only place
+// the year appears (C++ and the embedded pump script both use it). The port is
+// built and tested against VW 2026 / its SDK only.
+#define VWX_VW_YEAR "2026"
+
 // Helpers: VW-MCP plugin folder (job queue home) + job counting via POSIX.
 
 static TXString VwxPluginDir()
@@ -61,7 +61,7 @@ static TXString VwxPluginDir()
 		return "";
 	for ( const char* name : { "VW-MCP", "VWX-MCP" } ) {
 		TXString dir;
-		dir << home << "/Library/Application Support/Vectorworks/2026/Plug-ins/" << name;
+		dir << home << "/Library/Application Support/Vectorworks/" VWX_VW_YEAR "/Plug-ins/" << name;
 		struct stat sb;
 		if ( stat( dir.GetCharPtr(), &sb ) == 0 && S_ISDIR(sb.st_mode) )
 			return dir;
@@ -142,9 +142,9 @@ static void LogLine(const char* msg)
 // pump_all() drains everything (genuine dispatch only).
 static const char* kPumpReadonlyScript =
 	"import os, sys, importlib\n"
-	"p = os.path.join(os.environ.get('HOME',''), 'Library', 'Application Support', 'Vectorworks', '2026', 'Plug-ins', 'VW-MCP')\n"
+	"p = os.path.join(os.environ.get('HOME',''), 'Library', 'Application Support', 'Vectorworks', '" VWX_VW_YEAR "', 'Plug-ins', 'VW-MCP')\n"
 	"if not os.path.isdir(p):\n"
-	"    p = os.path.join(os.environ.get('HOME',''), 'Library', 'Application Support', 'Vectorworks', '2026', 'Plug-ins', 'VWX-MCP')\n"
+	"    p = os.path.join(os.environ.get('HOME',''), 'Library', 'Application Support', 'Vectorworks', '" VWX_VW_YEAR "', 'Plug-ins', 'VWX-MCP')\n"
 	"if p not in sys.path:\n"
 	"    sys.path.insert(0, p)\n"
 	"try:\n"
@@ -181,7 +181,7 @@ static void VwxRunPumpReadonly() { RunScript( kPumpReadonlyScript ); }
 // Trigger A: deferred notification -> read-only drain from OnIdle.
 // VW distributes notifications from OnIdle (MCNotification.h) = top-level main
 // loop. pump_readonly() there is safe (no mutation, no dialog). If VW ever
-// delivered this synchronously (inside our WM_TIMER frame) gNotifyInCall would
+// delivered this synchronously (inside our timer callback) gNotifyInCall would
 // suppress it — but even then pump_readonly can't crash (read-only only).
 static void VwxNotifyProc(StatusID /*id*/, StatusData data)
 {
@@ -192,87 +192,97 @@ static void VwxNotifyProc(StatusID /*id*/, StatusData data)
 	VwxRunPumpReadonly();                        // background reads
 }
 
-// Stubbed out for macOS
-static void TryFindPumpMenuCommandId()
-{
-	LogLine("menu-command-ID lookup is unused on macOS; DoMenuName handles background writes");
-}
+static double NowMs() { return CFAbsoluteTimeGetCurrent() * 1000.0; }
 
-// Stubbed out for macOS
-static void PostBackgroundHotkey()
-{
-	LogLine("background-wake-via-keystroke not implemented on macOS (v1)");
-}
+// Write-trigger backoff. DoMenuName fires every kTrigMinMs while jobs are
+// queued. If the queue does not shrink after kStallAttempts calls (the
+// 'VWX Bridge Start' Python command isn't installed/loaded yet, a modal
+// dialog is blocking dispatch, or the pump is erroring), the interval doubles
+// up to kTrigMaxMs and the stall is logged once. Any progress, or an empty
+// queue, resets to the fast interval. Reads (trigger A) keep the fast rate.
+// Known gap: read drains shrinking the queue also count as progress, so a
+// stuck write behind a steady stream of reads keeps firing at the fast rate.
+static const double  kTrigMinMs     = 120.0;
+static const double  kTrigMaxMs     = 5000.0;
+static const int     kStallAttempts = 8;       // ~1 s at the fast interval
+static double        gTrigInterval  = kTrigMinMs;
+static int           gStallCount    = 0;       // DoMenuName calls since the queue last shrank
+static int           gQueueAtTrig   = -1;      // queue size at the previous trigger
+static bool          gStallLogged   = false;
 
-// Stubbed out for macOS
-static void RestoreKeyState()
+static void ResetTriggerBackoff()
 {
-	LogLine("background-wake-via-keystroke not implemented on macOS (v1)");
-}
-
-// Stubbed out for macOS
-static bool VwIsForeground()
-{
-	LogLine("background-wake-via-keystroke not implemented on macOS (v1)");
-	return false;
-}
-
-// Stubbed out for macOS
-static void SendForegroundHotkey()
-{
-	LogLine("background-wake-via-keystroke not implemented on macOS (v1)");
+	if ( gStallLogged )
+		LogLine( "queue moving again; write trigger back to normal rate" );
+	gTrigInterval = kTrigMinMs;
+	gStallCount   = 0;
+	gQueueAtTrig  = -1;
+	gStallLogged  = false;
 }
 
 // Fire triggers. Called from the heartbeat timer when jobs are queued.
-static bool ModalDialogOpen()
+static void TriggerPump(int queued)
 {
-	return false;
-}
+	if ( gQueueAtTrig >= 0 && queued < gQueueAtTrig )
+		ResetTriggerBackoff();                   // progress since last trigger
 
-static double NowMs() { return CFAbsoluteTimeGetCurrent() * 1000.0; }
-
-static void TriggerPump()
-{
 	double now = NowMs();
-	if ( now - gLastTrigTick < 120 )        // snappier writes (was 400ms)
-		return;
-	if ( ModalDialogOpen() )
-		return;                                  // a real modal is up — hold
-	gLastTrigTick = now;
 
 	// A) Read-only drains in the background via the deferred notification.
-	gNotifyInCall = true;
-	gSDK->NotifyLayerChange( kVwxMagic );
-	gNotifyInCall = false;
+	//    Always at the fast rate — never subject to the write backoff.
+	if ( now - gLastReadTick >= kTrigMinMs ) {
+		gLastReadTick = now;
+		gNotifyInCall = true;
+		gSDK->NotifyLayerChange( kVwxMagic );
+		gNotifyInCall = false;
+	}
 
-	// B) Writes: macOS has no keystroke-injection equivalent to the Windows
-	//    accelerator trick (that mechanism is stubbed, see PostBackgroundHotkey
-	//    et al above). Instead, call the SDK's own DoMenuName() to invoke the
-	//    'VWX Bridge Start' menu command directly through VW's real command
-	//    dispatcher -- the same genuine-dispatch context a user click or
-	//    keyboard shortcut would reach, focus-independent, no Accessibility
-	//    permission needed.
+	// B) Writes: call the SDK's own DoMenuName() to invoke the 'VWX Bridge
+	//    Start' Python menu command through VW's real command dispatcher --
+	//    the same genuine-dispatch context a user click or keyboard shortcut
+	//    would reach, focus-independent, no Accessibility permission needed.
+	if ( now - gLastTrigTick < gTrigInterval )
+		return;
+	gLastTrigTick = now;
+	gQueueAtTrig  = queued;
 	gSDK->DoMenuName( "VWX Bridge Start", 0 );
+
+	if ( ++gStallCount >= kStallAttempts ) {
+		if ( !gStallLogged ) {
+			TXString msg;
+			msg << "no queue progress after " << kStallAttempts << " DoMenuName('VWX Bridge Start') calls ("
+			    << queued << " job(s) queued); backing off. Check the Python menu command is installed "
+			    << "and no modal dialog is open.";
+			LogLine( msg.GetCharPtr() );
+			gStallLogged = true;
+		}
+		gTrigInterval = std::min( gTrigInterval * 2.0, kTrigMaxMs );
+	}
 }
 
 // --------------------------------------------------------------------------------------------------------
 // Palette heartbeat timer.
 //
 // HARD-WON LESSON: scripts / view-state calls (vs.Layer, …) must NOT run from
-// the web palette's JS sync callback NOR from a WM_TIMER — both are outside
-// VW's command frame. The JS context CRASHED VW; the WM_TIMER context HUNG VW
-// inside vs.Layer (both verified live). The only safe place to drive the app
-// is VW's genuine command dispatch = a menu command. So this timer does the
-// bare minimum (heartbeat + queue count) and the watchdog triggers the
-// "VWX Bridge Start" menu command to actually pump.
+// the web palette's JS sync callback NOR from a raw timer — both are outside
+// VW's command frame. The JS context CRASHED VW; a timer context HUNG VW
+// inside vs.Layer (both verified live, on Windows). The only safe place to
+// drive the app is VW's genuine command dispatch = a menu command. So this
+// timer does the bare minimum (heartbeat + queue count) and TriggerPump asks
+// VW to run the "VWX Bridge Start" menu command to actually pump.
 
 static void PumpTimerProc(CFRunLoopTimerRef, void*)
 {
 	TXString pluginDir = VwxPluginDir();
 	WriteAlive( pluginDir );
 	gLastQueue = CountJobs( pluginDir );
-	if ( gLastQueue > 0 && !gPaused && !gPumping )
-		TriggerPump();
+	if ( gLastQueue <= 0 ) {
+		if ( gStallCount > 0 || gStallLogged )
+			ResetTriggerBackoff();               // queue drained
+		return;
+	}
+	if ( !gPaused && !gPumping )
+		TriggerPump( gLastQueue );
 }
 
 void VwxBridge_StartPumpTimer()
@@ -282,7 +292,7 @@ void VwxBridge_StartPumpTimer()
 		gPumpTimer = CFRunLoopTimerCreate(kCFAllocatorDefault, CFAbsoluteTimeGetCurrent() + 0.1, 0.1, 0, 0, PumpTimerProc, &ctx);
 		CFRunLoopAddTimer(CFRunLoopGetMain(), gPumpTimer, kCFRunLoopCommonModes);
 		gSDK->RegisterNotificationProcedure( VwxNotifyProc, kNotifyLayerChange );
-		TryFindPumpMenuCommandId();
+		ResetTriggerBackoff();
 		LogLine( "bridge on (palette open)" );
 	}
 }
@@ -358,8 +368,8 @@ void CVwxJSProvider::OnPump(const TXString& objName, const TXString& functionNam
 	out["jobs"]     = CountJobs( VwxPluginDir() );
 	out["paused"]   = gPaused;
 	out["timer"]    = (gPumpTimer != nullptr);
-	out["cmdId"]    = (unsigned) gPumpCmdId;   // 0 = no background-write path
-	out["dispatch"] = gDispatchCount;          // times DoInterface ran (trigger proof)
+	out["dispatch"] = gDispatchCount;          // times the native pump command ran
+	out["backoffMs"] = gTrigInterval;          // write-trigger interval (> 120 = stalled)
 	out["pumping"]  = gPumping;
 	context->Resolve( out );
 }

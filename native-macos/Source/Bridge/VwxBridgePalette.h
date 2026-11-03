@@ -1,11 +1,13 @@
 //
 //	VwxBridgePalette.h — VWX Bridge Native
 //
-//	A modeless web palette whose JS polls vwxBridge.pump() (~250ms). The pump
-//	callback runs SYNC on the Vectorworks main thread (safe for the SDK): it
-//	checks ipc/jobs/ in the VW-MCP plugin folder and, when jobs exist, runs
-//	vwx_pump.py via IPythonScriptEngine — the same file protocol as the
-//	keystroke-triggered bridge v4, minus the keystroke.
+//	macOS port. A modeless web palette that, while open, runs a CFRunLoop
+//	heartbeat timer on the main run loop (~100 ms). The timer writes
+//	ipc/native.alive, counts ipc/jobs/ in the VW-MCP plug-in folder and, when
+//	jobs are queued, (A) posts a deferred notification whose OnIdle handler
+//	drains read-only jobs, and (B) calls gSDK->DoMenuName("VWX Bridge Start")
+//	so VW's command dispatcher runs the Python pump for writes. The palette's
+//	JS vwxBridge.pump()/status() calls only report status / toggle pause.
 //
 
 #pragma once
