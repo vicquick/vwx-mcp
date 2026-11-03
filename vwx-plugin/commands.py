@@ -3227,12 +3227,20 @@ def import_dwg(p):
     layer used to be accepted by the server and dropped here, so an import
     aimed at a specific layer landed on whatever was active and still reported
     ok. _with_layer_class/_restore is the same pattern the draw_* commands use.
+
+    vs.ImportDXFDWG takes NO arguments: it opens the interactive import UI, and
+    the old (path, False) call was an arity error that VW reports in a modal
+    Script Errors window, blocking the bridge (found by williamjvest/vwx-mcp
+    81edd7c). vs.ImportDXFDWGFile(fileName, isBatch) imports one given file;
+    isBatch=True runs it with the last-used import settings.
     """
     path = p.get('path', '')
     if not path: return {'error': 'path required'}
+    if not os.path.isfile(path):
+        return {'error': 'file not found', 'path': path}
     prev = _with_layer_class(p)
     try:
-        vs.ImportDXFDWG(path, False)
+        vs.ImportDXFDWGFile(path, True)
         return {'status': 'ok', 'path': path,
                 'layer': _safe(lambda: vs.GetLName(vs.ActLayer()))}
     except Exception as e:
@@ -3343,10 +3351,18 @@ def get_georeferencing(p):
 # ── Textures ────────────────────────────────────────────────────────────────
 
 def get_textures(p):
+    # Textures are resources: the 'T=TEXTURE' criteria walk visits drawing
+    # objects only and reported count 0 with textures present. Same bug class
+    # as get_symbols; BuildResourceList type 97 = texture.
+    # (williamjvest/vwx-mcp 88c07a3)
     txs = []
-    for h in _collect('T=TEXTURE'):
-        txs.append({'name': _safe(lambda: vs.GetName(h)),
-                    'object_id': _oid(h)})
+    for nm in _resource_names(97):
+        h = _safe(lambda: vs.GetObject(nm))
+        txs.append({'name': nm, 'object_id': _oid(h) if h else None})
+    if not txs:                                    # old path as a fallback
+        for h in _collect('T=TEXTURE'):
+            txs.append({'name': _safe(lambda: vs.GetName(h)),
+                        'object_id': _oid(h)})
     return {'textures': txs, 'count': len(txs)}
 
 def apply_texture(p):
