@@ -38,8 +38,12 @@ def _vw_roots():
     version-specific, and the failure mode on a new Vectorworks was silent —
     the path simply did not exist and every job timed out with no explanation.
     """
-    root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
-                        'Vectorworks')
+    if sys.platform == 'darwin':
+        root = os.path.join(os.path.expanduser('~'), 'Library',
+                            'Application Support', 'Vectorworks')
+    else:
+        root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
+                            'Vectorworks')
     forced = os.environ.get('VWX_VW_VERSION')
     versions = [forced] if forced else []
     if not versions:

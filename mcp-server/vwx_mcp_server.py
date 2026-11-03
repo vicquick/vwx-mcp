@@ -95,12 +95,14 @@ if VWX_TASKS and not _TASKS_AVAILABLE:
 # VWX_WAKE_TIMEOUT=0 to skip.
 VWX_WAKE_TIMEOUT = float(os.environ.get('VWX_WAKE_TIMEOUT', '25'))
 
-# Transport: 'file' (default on Windows) = job/result files in the VW plugin
-# dir; the watchdog fires the pump menu command per job, VW stays responsive
-# for the user (no modal bridge dialog). 'tcp' = classic dialog-pump bridge
-# on :9878 (the only option on macOS / remote setups).
-VWX_TRANSPORT = os.environ.get(
-    'VWX_TRANSPORT', 'file' if sys.platform == 'win32' else 'tcp').lower()
+def _vw_root():
+    """Per-user Vectorworks settings root (the parent of '<year>/Plug-ins')."""
+    if sys.platform == 'darwin':
+        return os.path.join(os.path.expanduser('~'), 'Library',
+                            'Application Support', 'Vectorworks')
+    return os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
+                        'Vectorworks')
+
 
 def vw_versions():
     """Vectorworks major versions installed for this user, newest first.
@@ -113,8 +115,7 @@ def vw_versions():
     forced = os.environ.get('VWX_VW_VERSION')
     if forced:
         return [forced]
-    root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
-                        'Vectorworks')
+    root = _vw_root()
     try:
         found = [d for d in os.listdir(root)
                  if len(d) == 4 and d.isdigit()
@@ -128,14 +129,24 @@ def _plugin_dir():
     base = os.environ.get('VWX_PLUGIN_DIR')
     if base and os.path.isdir(base):
         return base
-    appdata = os.environ.get('APPDATA', '')
+    root = _vw_root()
     for version in vw_versions():
         for name in ('VW-MCP', 'VWX-MCP'):
-            cand = os.path.join(appdata, 'Nemetschek', 'Vectorworks', version,
-                                'Plug-ins', name)
+            cand = os.path.join(root, version, 'Plug-ins', name)
             if os.path.isdir(cand):
                 return cand
     return None
+
+
+# Transport: 'file' = job/result files in the VW plugin dir; a native trigger
+# fires the pump menu command per job, VW stays responsive for the user (no
+# modal bridge dialog). Default on Windows, and on macOS when the plug-in dir
+# is installed locally (the native-macos palette triggers via DoMenuName).
+# 'tcp' = classic dialog-pump bridge on :9878 (remote setups).
+VWX_TRANSPORT = os.environ.get(
+    'VWX_TRANSPORT',
+    'file' if sys.platform == 'win32'
+    or (sys.platform == 'darwin' and _plugin_dir()) else 'tcp').lower()
 
 def _wake_file_path():
     base = _plugin_dir()
@@ -3256,9 +3267,14 @@ def screenshot(ctx: Context, max_width: int = 1400, fit_to_objects: bool = False
     Vectorworks has a single drawing surface — a background document cannot be
     photographed — so the bridge brings it to the front, holds it there for the
     capture (max 10 s) and lets the user's document come back afterwards.
-    Without a document this shows whatever is in front."""
-    if sys.platform != "win32":
-        return "Screenshots need the Windows build (window capture is Win32)."
+    Without a document this shows whatever is in front.
+
+    macOS: captures the largest on-screen Vectorworks window by window ID
+    (screencapture -l), so VW does not need to be in front, but the MCP host
+    needs Screen Recording permission. region='canvas' is not available there
+    (the whole window is returned), and modal dialogs are not detected."""
+    if sys.platform not in ("win32", "darwin"):
+        return "Screenshots need Windows or macOS."
 
     sid, _agent = _session_info()
     with _coord_lock:
@@ -3275,7 +3291,80 @@ def screenshot(ctx: Context, max_width: int = 1400, fit_to_objects: bool = False
             cmd("_release", {})
 
 
+# JXA via osascript: on-screen windows from CoreGraphics. Needs no
+# Accessibility permission and does not activate Vectorworks.
+_MAC_WINDOWS_JXA = (
+    'ObjC.import("CoreGraphics");'
+    'JSON.stringify(ObjC.deepUnwrap(ObjC.castRefToObject('
+    '$.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly'
+    ' | $.kCGWindowListExcludeDesktopElements, 0)))'
+    '.filter(w => w.kCGWindowLayer === 0'
+    ' && /^Vectorworks/.test(w.kCGWindowOwnerName || ""))'
+    '.map(w => ({id: w.kCGWindowNumber, title: w.kCGWindowName || "",'
+    ' w: w.kCGWindowBounds.Width, h: w.kCGWindowBounds.Height})))'
+)
+
+
+def _mac_vw_window():
+    """(window id, title) of the largest on-screen Vectorworks window, or None."""
+    import subprocess
+    out = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e",
+                          _MAC_WINDOWS_JXA], capture_output=True, text=True,
+                         timeout=10, check=True).stdout
+    wins = [w for w in json.loads(out or "[]") if w["w"] > 0 and w["h"] > 0]
+    if not wins:
+        return None
+    best = max(wins, key=lambda w: w["w"] * w["h"])
+    return best["id"], best["title"]
+
+
+def _screenshot_front_mac(max_width, fit_to_objects):
+    import subprocess, tempfile
+    try:
+        found = _mac_vw_window()
+    except Exception as e:
+        return f"Could not list windows: {e}"
+    if not found:
+        return ("No on-screen Vectorworks window found — is Vectorworks running "
+                "with a document open (and not minimized or on another Space)?")
+    if fit_to_objects:
+        cmd("run_menu_command", {"menu_name": "Fit to Objects"})
+        time.sleep(0.35)          # let VW finish redrawing before the capture
+    wid, title = found
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        r = subprocess.run(["/usr/sbin/screencapture", "-x", "-o", "-t", "png",
+                            f"-l{wid}", tmp], capture_output=True, text=True,
+                           timeout=15)
+        if r.returncode != 0 or os.path.getsize(tmp) == 0:
+            return ("Capture failed — grant Screen Recording permission to the "
+                    "app running the MCP server (System Settings > Privacy & "
+                    f"Security). {r.stderr.strip()}")
+        from PIL import Image as PILImage
+        img = PILImage.open(tmp).convert("RGB")
+        if max_width and img.width > max_width:
+            img = img.resize((max_width, round(img.height * max_width / img.width)),
+                             PILImage.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+    except Exception as e:
+        return f"Capture failed: {e}"
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    png = buf.getvalue()
+    logger.info(f"tool=screenshot window={title!r} {img.width}x{img.height} "
+                f"bytes={len(png)} platform=darwin")
+    from fastmcp.utilities.types import Image
+    return Image(data=png, format="png")
+
+
 def _screenshot_front(max_width, fit_to_objects, region):
+    if sys.platform == "darwin":
+        return _screenshot_front_mac(max_width, fit_to_objects)
     _dpi_aware()                   # before any rect is measured, not after
     doc, dialogs = _vw_windows()
     if not doc and not dialogs:

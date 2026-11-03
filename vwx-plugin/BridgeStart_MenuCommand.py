@@ -35,7 +35,12 @@ def _trace(msg, where=None):
 
 _dir = None
 try:
-    _root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek', 'Vectorworks')
+    if sys.platform == 'darwin':
+        _root = os.path.join(os.path.expanduser('~'), 'Library',
+                             'Application Support', 'Vectorworks')
+    else:
+        _root = os.path.join(os.environ.get('APPDATA', ''), 'Nemetschek',
+                             'Vectorworks')
     _forced = os.environ.get('VWX_VW_VERSION')
     if _forced:
         _versions = [_forced]
