@@ -21,14 +21,17 @@ ARITY_OVERRIDE = {}
 # check on VW2027 — the stub may be incomplete, or the call may be a real bug.
 # Remove a name once it is verified or fixed. New mismatches still fail.
 PENDING_LIVE_CHECK = {
-    'ConvertToPolyline', 'SetTextureRef', 'DTM6_RiseToSurface', 'MakeModifierClass',
-    'SetObjBeginningMarker', 'SetObjEndMarker', 'CircularDim', 'CreateChainDimension',
-    'CreateStaticHatchFromObject', 'CombinePolygons', 'CreateVP',
-    'SetVPClOvrdFillFore', 'SetVPClOvrdFillBack', 'SetVPClOvrdPenFore',
-    'SetVPClOvrdPenBack', 'SetVPClOvrdFillOpty', 'SetVPClOvrdPenOpty',
-    'SetVPClOvrdFillStyle', 'SetVPLrOvrdFillFore', 'SetVPLrOvrdPenFore',
-    'SetVPLrOvrdOpty',
+    # Not reached on 2026-11-03: VW2027 crashed in the test script that covered
+    # textures and viewport LAYER overrides.
+    'SetTextureRef',        # textureRef is an integer index, code passes a handle
+    'SetVPLrOvrdFillFore', 'SetVPLrOvrdPenFore', 'SetVPLrOvrdOpty',
+    'CreateStaticHatchFromObject', 'DTM6_RiseToSurface',
+    # Live: wrong in BOTH forms (bbox ran to x=782 m) — signature unclear.
+    'CircularDim',
 }
+# Verified live on VW2027 (2026-11-03): the extra/missing argument is ignored or
+# defaulted and the call does what the code expects.
+VERIFIED_HARMLESS = {'ConvertToPolyline', 'MakeModifierClass', 'CombinePolygons', 'CreateVP'}
 
 
 import re
@@ -86,7 +89,7 @@ def check():
                 if name not in ALLOW_MISSING:
                     problems.append(f'{rel}:{line}: vs.{name} is not in vs_index.json')
                 continue
-            if starred or name in PENDING_LIVE_CHECK:
+            if starred or name in PENDING_LIVE_CHECK or name in VERIFIED_HARMLESS:
                 continue
             if name in ARITY_OVERRIDE:
                 lo, hi = ARITY_OVERRIDE[name]

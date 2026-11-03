@@ -2577,8 +2577,12 @@ def set_marker(p):
     s = mmap.get(p.get('start_marker', ''), None)
     e = mmap.get(p.get('end_marker', ''), None)
     try:
-        if s is not None: vs.SetObjBeginningMarker(h, s, 0.1, 1.0, True, True)
-        if e is not None: vs.SetObjEndMarker(h, e, 0.1, 1.0, True, True)
+        # (object, style, angle, size, width, thicknessBasis, thickness, visibility).
+        # The old 6-arg call set size=1.0 and left visibility False, so the
+        # marker was invisible (verified live on VW2027, 2026-11-03).
+        size = float(p.get('size', 0.1))
+        if s is not None: vs.SetObjBeginningMarker(h, s, 15, size, size / 2, 0, 0, s != 0)
+        if e is not None: vs.SetObjEndMarker(h, e, 15, size, size / 2, 0, 0, e != 0)
         return {'status': 'ok'}
     except Exception as ex:
         return {'error': str(ex)}
@@ -4420,23 +4424,20 @@ def create_chain_dimension(p):
         dim_type = int(p.get('dim_type', 771))
         arrow = int(p.get('arrow', 770))
         text_flag = int(p.get('text_flag', 0))
-        try:
-            tpts = [(float(x), float(y)) for x, y in pts]
-            vs.CreateChainDimension(tpts, offset, dim_type, arrow, text_flag)
-        except AttributeError:
-            # Fallback: build pairwise LinearDims
-            created = 0
-            for i in range(len(pts) - 1):
-                a = (float(pts[i][0]), float(pts[i][1]))
-                b = (float(pts[i+1][0]), float(pts[i+1][1]))
-                try:
-                    vs.LinearDim(a, b, offset, dim_type, arrow, text_flag, offset)
-                    created += 1
-                except Exception: pass
-            return {'status': 'ok', 'method': 'fallback', 'created': created}
-        except Exception as e:
-            return {'error': str(e)}
-        return {'status': 'ok'}
+        # vs.CreateChainDimension(h1, h2) only joins two EXISTING dimensions;
+        # called with a point list it created nothing and this still answered
+        # ok (verified live on VW2027, 2026-11-03). Build pairwise LinearDims.
+        created = 0
+        for i in range(len(pts) - 1):
+            a = (float(pts[i][0]), float(pts[i][1]))
+            b = (float(pts[i+1][0]), float(pts[i+1][1]))
+            try:
+                vs.LinearDim(a, b, offset, dim_type, arrow, text_flag, offset)
+                created += 1
+            except Exception: pass
+        if not created:
+            return {'error': 'no dimension created'}
+        return {'status': 'ok', 'method': 'pairwise', 'created': created}
     finally:
         _restore(prev)
 
@@ -5032,29 +5033,32 @@ def add_vp_class_override(p):
     cls = p.get('class_name')
     if not cls: return {'error': 'class_name required'}
     try:
-        ovrd = vs.CreateVPClOvrd(vp, cls)
-        if not ovrd: return {'error': 'CreateVPClOvrd failed'}
+        # CreateVPClOvrd returns nothing, and the SetVPClOvrd* setters take
+        # (viewport, class name, ...) with RGB as three 16-bit values — the old
+        # code checked the return value (so it always failed) and passed an
+        # override handle + RGB tuple (verified live on VW2027, 2026-11-03).
+        vs.CreateVPClOvrd(vp, cls)
         if p.get('fill_fore_rgb'):
             r, g, b = p['fill_fore_rgb']
-            vs.SetVPClOvrdFillFore(ovrd, (_c8(r), _c8(g), _c8(b)))
+            vs.SetVPClOvrdFillFore(vp, cls, _c8(r), _c8(g), _c8(b))
         if p.get('fill_back_rgb'):
             r, g, b = p['fill_back_rgb']
-            vs.SetVPClOvrdFillBack(ovrd, (_c8(r), _c8(g), _c8(b)))
+            vs.SetVPClOvrdFillBack(vp, cls, _c8(r), _c8(g), _c8(b))
         if p.get('pen_fore_rgb'):
             r, g, b = p['pen_fore_rgb']
-            vs.SetVPClOvrdPenFore(ovrd, (_c8(r), _c8(g), _c8(b)))
+            vs.SetVPClOvrdPenFore(vp, cls, _c8(r), _c8(g), _c8(b))
         if p.get('pen_back_rgb'):
             r, g, b = p['pen_back_rgb']
-            vs.SetVPClOvrdPenBack(ovrd, (_c8(r), _c8(g), _c8(b)))
+            vs.SetVPClOvrdPenBack(vp, cls, _c8(r), _c8(g), _c8(b))
         if p.get('fill_opacity') is not None:
-            vs.SetVPClOvrdFillOpty(ovrd, int(p['fill_opacity']))
+            vs.SetVPClOvrdFillOpty(vp, cls, int(p['fill_opacity']))
         if p.get('pen_opacity') is not None:
-            vs.SetVPClOvrdPenOpty(ovrd, int(p['pen_opacity']))
+            vs.SetVPClOvrdPenOpty(vp, cls, int(p['pen_opacity']))
         if p.get('fill_style') is not None:
-            vs.SetVPClOvrdFillStyle(ovrd, int(p['fill_style']))
+            vs.SetVPClOvrdFillStyle(vp, cls, int(p['fill_style']))
         try: vs.UpdateVP(vp)
         except Exception: pass
-        return {'status': 'ok', 'override_id': _oid(ovrd)}
+        return {'status': 'ok', 'class': cls, **_vp_cl_props(vp, cls)}
     except Exception as e:
         return {'error': str(e)}
 
