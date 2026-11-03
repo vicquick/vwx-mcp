@@ -81,17 +81,25 @@ including while Vectorworks is in the background (unfocused).
 
 ### Pointing the MCP server at the macOS bridge
 
-`mcp-server/vwx_mcp_server.py` defaults to the `tcp` transport and looks
-for the plug-in folder under `%APPDATA%` when it is not on Windows. To use
-the file-queue transport this bridge serves, set two environment variables
-in your MCP client config:
+`mcp-server/vwx_mcp_server.py` finds the plug-in folder under
+`~/Library/Application Support/Vectorworks/<year>/Plug-ins/VW-MCP` (newest
+year that has one; `VWX_VW_VERSION` pins a year) and, when it finds one,
+defaults to the file-queue transport this bridge serves. Nothing to set for a
+standard install. For a non-standard location set it explicitly in your MCP
+client config:
 
 ```
 VWX_TRANSPORT=file
 VWX_PLUGIN_DIR=/Users/<you>/Library/Application Support/Vectorworks/2026/Plug-ins/VW-MCP
 ```
 
-No Python changes are needed for this. The bridge and `vwx_pump.py` use the
+The `screenshot` tool works on macOS too: it captures the largest on-screen
+Vectorworks window by window ID (`screencapture -l`), so Vectorworks does not
+have to be in front. The app running the MCP server needs **Screen
+Recording** permission. The canvas-only crop and modal-dialog detection are
+Windows-only; on macOS you get the whole window.
+
+The bridge and `vwx_pump.py` use the
 same `ipc/jobs`, `ipc/results` and `ipc/native.alive` files as on Windows.
 
 ## Bugs found and fixed during the port
