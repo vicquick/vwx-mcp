@@ -308,6 +308,16 @@ def _housekeep():
                 os.remove(p)
     except Exception:
         pass
+    # v16 document-operation answers nobody waits for (requests queued by the
+    # pump itself; the MCP server deletes the ones it reads)
+    try:
+        dd = os.path.join(_IPC, 'doc')
+        for fn in os.listdir(dd):
+            p = os.path.join(dd, fn)
+            if fn.startswith('res-') and now - os.path.getmtime(p) > 120:
+                os.remove(p)
+    except Exception:
+        pass
 
 
 # ── v14: document-targeted jobs (several agents, one Vectorworks) ──────────
@@ -605,6 +615,13 @@ def pump_all():
                         st['last_run'] = {'ts': time.time(),
                                           'prio': min(_prio, last.get('prio', 99))
                                           if time.time() - last.get('ts', 0) < STICKY_S else _prio}
+                    if _cmd == 'save_document_as':
+                        # The front document now has a new name/path. Follow
+                        # it, or the next run would take the rename for a
+                        # manual switch by the user and drop `home`.
+                        active = _active_doc()
+                        if st.get('bridge_doc'):
+                            st['bridge_doc'] = active[1] or active[0]
                     if _cmd == '_hold':
                         st['hold'] = {'doc': _effective_target(doc, st) or active[0],
                                       'until': time.time() + HOLD_MAX_S}
@@ -618,6 +635,8 @@ def pump_all():
             # next trigger re-reads the front document from scratch.
             st.pop('bridge_doc', None)
             done += ran
+            if st.get('home'):
+                _set_wake()               # fire again after the close: bring the user's document back
             _save_state(st)
             _log("close_document posted — drain stops here")
             return

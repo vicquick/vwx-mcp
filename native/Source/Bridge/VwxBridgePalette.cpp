@@ -715,9 +715,16 @@ static void HandleDocRequest()
 					res["error"] = "could not bring the document to the front — not closed";
 				}
 				else {
-					bool ok = gSDK->CloseDocument();
-					res["ok"] = ok;
-					if ( !ok ) res["error"] = "CloseDocument failed (unsaved changes?)";
+					// The return value is not reliable (false on VW2027 although
+					// the document closed, 2026-11-11) — judge by the open list.
+					bool rc = gSDK->CloseDocument();
+					bool still = false;
+					for ( const auto& x : OpenDocsJson() )
+						if ( x["ref"].get<int>() == ref )
+							still = true;
+					res["ok"] = !still;
+					res["rc"] = rc;
+					if ( still ) res["error"] = "document still open (unsaved changes?)";
 				}
 				gDocSettleUntil = GetTickCount() + kSettleMs;
 			}

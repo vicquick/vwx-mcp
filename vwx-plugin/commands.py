@@ -595,13 +595,10 @@ def close_document(p):
     requested one to the front and verified it). params: save (default True),
     force (close without saving — Vectorworks will ask if there are changes).
 
-    The close is POSTED (WM_CLOSE to the document window), not executed here:
-    this script runs inside the very document being closed, and tearing it
-    down underneath a running script is exactly the kind of context change VW
-    does not survive. The message is handled after the script returns. Saving
-    happens now, synchronously, via the Save menu command (same as
-    save_document). A never-saved document is refused — Save would open the
-    Save-As dialog and block the bridge.
+    v16: saves now (SaveActiveDocument, no dialog), then queues the close for
+    the native bridge, which runs Vectorworks' CloseDocument after this script
+    has returned — never underneath it. Never-saved documents and closing
+    without saving are refused: either would put a dialog inside the bridge.
     """
     name = _safe(vs.GetFName, '') or ''
     path = _safe(vs.GetFPathName, '') or ''
@@ -622,11 +619,16 @@ def close_document(p):
     docs = _native_docs()
     if docs is None:
         return {'error': _KEIN_NATIVE, 'code': 'DOC_NATIVE_MISSING'}
-    aktiv = next((d for d in docs if d.get('active')), None)
-    if not aktiv or _grundname(aktiv.get('name')) != _grundname(name):
-        return {'error': 'Aktives Dokument laut Vectorworks (%s) passt nicht zu %s — nicht '
-                         'geschlossen.' % ((aktiv or {}).get('name'), name),
-                'code': 'DOC_CLOSE_MISMATCH'}
+    # docs.json can be up to 2 s old (e.g. right after save_document_as it
+    # still shows the old name), so identify the document from VW itself and
+    # let the native side match it by path against a FRESH list.
+    if not path or not os.path.isfile(path):
+        # Never saved (new, or an older-version file VW converted on open —
+        # those show up as '<name>_v2027.vwx' with a path in the program
+        # folder). Saving "in place" would target that bogus path.
+        return {'error': '%s ist noch nie gespeichert worden (z. B. von VW konvertierte '
+                         'aeltere Datei) — erst save_document_as, dann schliessen.' % name,
+                'code': 'DOC_UNSAVED'}
     if save:
         # NOT DoMenuTextByName('Save'): like every menu command it is queued
         # and runs after this script — i.e. after the WM_CLOSE below, so
@@ -641,8 +643,7 @@ def close_document(p):
             return {'error': 'SaveActiveDocument nicht ausfuehrbar — nicht geschlossen, '
                              'damit kein Sichern-Dialog die Bridge blockiert.',
                     'code': 'DOC_SAVE_FAILED'}
-    rid = _doc_request('close', ref=aktiv.get('ref'), path=aktiv.get('path') or None,
-                       name=aktiv.get('name'))
+    rid = _doc_request('close', path=path, name=name)
     return {'status': 'angestossen', 'dokument': name, 'gespeichert': bool(save),
             'anfrage': rid,
             'hinweis': 'Die native Bridge schliesst das Dokument, sobald dieses Skript '
