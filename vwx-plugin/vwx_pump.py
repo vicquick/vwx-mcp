@@ -316,7 +316,7 @@ def _housekeep():
 # any other open document. So instead of one shared "front document" that
 # every agent fights over, each job may name its target in `_doc` (base file
 # name or full path). The pump runs all jobs for the active document first,
-# then asks for the next target to come to the front (posted WM_MDIACTIVATE,
+# then asks for the next target to come to the front (v16: a request for the native bridge,
 # same mechanism as switch_document) and returns; the palette re-triggers on
 # the next tick and the drain continues in the new document. Because VW runs
 # exactly one job at a time, nothing can interleave between "activate" and
@@ -480,13 +480,19 @@ def _ordered_jobs():
 
 def _request_switch(target):
     """Post the activation of `target`. Returns None or an error code+info."""
+    # v16: commands.switch_document only queues a request for the native
+    # bridge (SDK SwitchToOpenFile, run outside this script); it never posts
+    # window messages any more.
     try:
         commands = _get_commands()
-        r = commands.switch_document({'hwnd': target} if isinstance(target, int)
+        t = _norm_path(target)
+        r = commands.switch_document({'path': target} if '/' in t
                                      else {'name': _base(target)})
     except Exception as e:
         return 'DOC_SWITCH_FAILED', {'detail': repr(e)}
     if isinstance(r, dict) and r.get('error'):
+        if r.get('code') == 'DOC_NATIVE_MISSING':
+            return 'DOC_NATIVE_MISSING', {'detail': r.get('error')}
         if r.get('kandidaten'):
             return 'DOC_AMBIGUOUS', {'kandidaten': r.get('kandidaten')}
         return 'DOC_NOT_OPEN', {'offen': r.get('offen', [])}

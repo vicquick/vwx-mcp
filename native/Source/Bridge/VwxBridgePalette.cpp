@@ -3,6 +3,7 @@
 #include "VwxBridgePalette.h"
 
 #include "Interfaces/VectorWorks/Scripting/IPythonScriptEngine.h"
+#include "Interfaces/VectorWorks/Extension/IExtendedProps.h"
 
 #include <cstdio>
 #include <ctime>
@@ -451,6 +452,308 @@ static bool       gInDoMenu     = false;   // reentrancy guard (pump_all may pum
 static short      gLastMenuRet  = -32768;
 static int        gMenuRuns     = 0;
 
+// --------------------------------------------------------------------------------------------------------
+// v16: document list / switch / open / close through the SDK, from the broker.
+//
+// Until v15 the Python side switched documents by posting WM_MDIACTIVATE to
+// the MDI client from INSIDE the running pump script, and closed them with a
+// posted WM_CLOSE. That activation then landed while VW's Python menu-command
+// runner was still unwinding; with several large documents open it froze
+// Vectorworks for good (main thread in a kernel wait, 2026-10-22). Vectorworks
+// has its own calls for this — ISDK::GetOpenFilesList / SwitchToOpenFile /
+// CloseDocument and IExtendedProps::OpenOrActivateFile — and they run here,
+// from the broker's posted message: ordinary UI-thread event context, never
+// inside a script, a notification, a CEF callback or WM_TIMER, and never while
+// the pump command is running (gInDoMenu) or a modal dialog is up.
+//
+// Protocol (all under <plugin>\ipc\):
+//   docs.json             written by us: every open document {ref, path, name,
+//                         active, unsaved} — refreshed every ~2 s, before each
+//                         pump run and after every document operation
+//   doc\req-<id>.json     written by Python / the MCP server:
+//                         {"op": "switch"|"open"|"close"|"list", "ref", "path", "name"}
+//   doc\res-<id>.json     written by us: {"id", "ok", "error"?, "active"?, ...}
+static const UINT kMsgDocOp     = WM_APP + 0x27C;
+static bool       gDocPosted    = false;
+static DWORD      gLastDocsTick = 0;
+static DWORD      gDocSettleUntil = 0;     // let a switched/opened document settle
+static const DWORD kDocsEveryMs = 2000;
+static const DWORD kSettleMs    = 300;
+static int        gDocOps       = 0;
+
+static TXString IpcPath(const char* leaf)
+{
+	TXString dir = VwxPluginDir();
+	TXString p;
+	if ( !dir.IsEmpty() )
+		p << dir << "\\ipc\\" << leaf;
+	return p;
+}
+
+static void WriteFileAtomic(const TXString& path, const std::string& body)
+{
+	if ( path.IsEmpty() )
+		return;
+	TXString tmp;
+	tmp << path << ".tmp";
+	FILE* f = _wfopen( tmp.GetWCharPtr(), L"wb" );
+	if ( f == nullptr )
+		return;
+	fwrite( body.data(), 1, body.size(), f );
+	fclose( f );
+	MoveFileExW( tmp.GetWCharPtr(), path.GetWCharPtr(), MOVEFILE_REPLACE_EXISTING );
+}
+
+static bool ReadFileUtf8(const TXString& path, std::string& out)
+{
+	FILE* f = _wfopen( path.GetWCharPtr(), L"rb" );
+	if ( f == nullptr )
+		return false;
+	char buf[4096];
+	size_t n;
+	out.clear();
+	while ( (n = fread( buf, 1, sizeof(buf), f )) > 0 )
+		out.append( buf, n );
+	fclose( f );
+	return true;
+}
+
+static std::string Lower(std::string s)
+{
+	std::transform( s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) tolower(c); } );
+	return s;
+}
+
+static std::string BaseName(const std::string& p)
+{
+	size_t k = p.find_last_of( "\\/" );
+	return k == std::string::npos ? p : p.substr( k + 1 );
+}
+
+static nlohmann::json OpenDocsJson()
+{
+	nlohmann::json arr = nlohmann::json::array();
+	VectorWorks::TVWArray_OpenFileInformation info;
+	gSDK->GetOpenFilesList( info );
+	for ( size_t i = 0; i < info.GetSize(); i++ ) {
+		const VectorWorks::SOpenFileInformation& e = info.GetAt( i );
+		TXString full, name;
+		if ( e.fpFileID ) {
+			e.fpFileID->GetFileFullPath( full );
+			e.fpFileID->GetFileName( name );
+		}
+		nlohmann::json d;
+		d["ref"]     = (int) e.fFileRef;
+		d["path"]    = full.GetStdString();
+		d["name"]    = name.GetStdString();
+		d["active"]  = e.fIsActive;
+		d["unsaved"] = e.fIsInMemoryOnly;
+		arr.push_back( d );
+	}
+	return arr;
+}
+
+static nlohmann::json WriteOpenDocs()
+{
+	nlohmann::json docs = OpenDocsJson();
+	nlohmann::json out;
+	out["ts"]   = (long long) time( nullptr );
+	out["docs"] = docs;
+	WriteFileAtomic( IpcPath( "docs.json" ), out.dump() );
+	gLastDocsTick = GetTickCount();
+	return docs;
+}
+
+static bool OldestDocRequest(TXString& outPath, std::string& outId)
+{
+	TXString pattern = IpcPath( "doc\\req-*.json" );
+	if ( pattern.IsEmpty() )
+		return false;
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileW( pattern.GetWCharPtr(), &fd );
+	if ( h == INVALID_HANDLE_VALUE )
+		return false;
+	std::wstring best;
+	do {
+		std::wstring n = fd.cFileName;
+		if ( best.empty() || n < best )           // ids start with a timestamp
+			best = n;
+	} while ( FindNextFileW( h, &fd ) );
+	FindClose( h );
+	TXString dir = IpcPath( "doc\\" );
+	outPath = dir;
+	outPath << TXString( best );
+	std::string leaf = TXString( best ).GetStdString();      // req-<id>.json
+	outId = leaf.substr( 4, leaf.size() - 4 - 5 );
+	return true;
+}
+
+// Match a request against the open documents: ref > full path > base name.
+static const nlohmann::json* FindDoc(const nlohmann::json& docs, const nlohmann::json& req, std::string& why)
+{
+	if ( req.contains( "ref" ) && req["ref"].is_number_integer() ) {
+		for ( const auto& d : docs )
+			if ( d["ref"].get<int>() == req["ref"].get<int>() )
+				return &d;
+		why = "ref not open";
+		return nullptr;
+	}
+	std::string path = req.value( "path", std::string() );
+	if ( !path.empty() ) {
+		std::string want = Lower( path );
+		std::replace( want.begin(), want.end(), '/', '\\' );
+		for ( const auto& d : docs ) {
+			std::string p = Lower( d["path"].get<std::string>() );
+			std::replace( p.begin(), p.end(), '/', '\\' );
+			if ( !p.empty() && p == want )
+				return &d;
+		}
+	}
+	std::string name = Lower( BaseName( req.value( "name", path ) ) );
+	if ( name.empty() ) {
+		why = "no ref/path/name given";
+		return nullptr;
+	}
+	const nlohmann::json* hit = nullptr;
+	int n = 0;
+	for ( const auto& d : docs ) {
+		if ( Lower( d["name"].get<std::string>() ) == name ) {
+			hit = &d;
+			n++;
+		}
+	}
+	if ( n > 1 ) {
+		why = "ambiguous: several open documents with this name";
+		return nullptr;
+	}
+	if ( n == 0 )
+		why = "not open";
+	return hit;
+}
+
+static void HandleDocRequest()
+{
+	TXString reqPath;
+	std::string id;
+	if ( !OldestDocRequest( reqPath, id ) ) {
+		WriteOpenDocs();                          // periodic refresh
+		return;
+	}
+	std::string body;
+	bool readOk = ReadFileUtf8( reqPath, body );
+	_wremove( reqPath.GetWCharPtr() );           // consumed — a crash loses it (visible timeout), never repeats it
+	nlohmann::json req = nlohmann::json::parse( body, nullptr, false );
+	nlohmann::json res;
+	res["id"] = id;
+	if ( !readOk || req.is_discarded() || !req.is_object() ) {
+		res["ok"] = false;
+		res["error"] = "unreadable request";
+	}
+	else {
+		std::string op = req.value( "op", std::string( "list" ) );
+		res["op"] = op;
+		nlohmann::json docs = OpenDocsJson();
+		std::string why;
+		if ( op == "list" ) {
+			res["ok"] = true;
+		}
+		else if ( op == "switch" ) {
+			const nlohmann::json* d = FindDoc( docs, req, why );
+			if ( d == nullptr ) {
+				res["ok"] = false;
+				res["error"] = why;
+			}
+			else if ( (*d)["active"].get<bool>() ) {
+				res["ok"] = true;
+				res["already"] = true;
+			}
+			else {
+				bool ok = gSDK->SwitchToOpenFile( (*d)["ref"].get<int>() );
+				res["ok"] = ok;
+				if ( !ok ) res["error"] = "SwitchToOpenFile failed";
+				gDocSettleUntil = GetTickCount() + kSettleMs;
+			}
+		}
+		else if ( op == "open" ) {
+			std::string path = req.value( "path", std::string() );
+			if ( path.empty() ) {
+				res["ok"] = false;
+				res["error"] = "path required";
+			}
+			else {
+				using namespace VectorWorks::Extension;
+				VCOMPtr<IExtendedProps> ext( IID_ExtendedProps );
+				bool ok = false;
+				if ( ext )
+					ok = ext->OpenOrActivateFile( TXString( path, ETXEncoding::eUTF8 ) );
+				res["ok"] = ok;
+				if ( !ext ) res["error"] = "IExtendedProps unavailable";
+				else if ( !ok ) res["error"] = "OpenOrActivateFile failed";
+				gDocSettleUntil = GetTickCount() + kSettleMs;
+			}
+		}
+		else if ( op == "close" ) {
+			// Only ever closes the document named in the request: switch to it
+			// first and re-check, so a stale request cannot close the wrong one.
+			// Saving is the caller's job (Python saves before asking); a dirty
+			// document makes Vectorworks ask, which is refused below.
+			const nlohmann::json* d = FindDoc( docs, req, why );
+			if ( d == nullptr ) {
+				res["ok"] = false;
+				res["error"] = why;
+			}
+			else {
+				int ref = (*d)["ref"].get<int>();
+				bool front = (*d)["active"].get<bool>() || gSDK->SwitchToOpenFile( ref );
+				nlohmann::json now = OpenDocsJson();
+				bool verified = false;
+				for ( const auto& x : now )
+					if ( x["ref"].get<int>() == ref && x["active"].get<bool>() )
+						verified = true;
+				if ( !front || !verified ) {
+					res["ok"] = false;
+					res["error"] = "could not bring the document to the front — not closed";
+				}
+				else {
+					bool ok = gSDK->CloseDocument();
+					res["ok"] = ok;
+					if ( !ok ) res["error"] = "CloseDocument failed (unsaved changes?)";
+				}
+				gDocSettleUntil = GetTickCount() + kSettleMs;
+			}
+		}
+		else {
+			res["ok"] = false;
+			res["error"] = "unknown op";
+		}
+	}
+	res["docs"] = WriteOpenDocs();
+	for ( const auto& d : res["docs"] )
+		if ( d["active"].get<bool>() )
+			res["active"] = d;
+	TXString resPath = IpcPath( "doc\\res-" );
+	resPath << TXString( id ) << ".json";
+	WriteFileAtomic( resPath, res.dump() );
+	gDocOps++;
+	char m[200];
+	sprintf_s( m, "docop id=%s op=%s ok=%d", id.c_str(), res.value( "op", std::string( "?" ) ).c_str(),
+	           res.value( "ok", false ) ? 1 : 0 );
+	LogLine( m );
+}
+
+static bool DocRequestPending()
+{
+	TXString pattern = IpcPath( "doc\\req-*.json" );
+	if ( pattern.IsEmpty() )
+		return false;
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileW( pattern.GetWCharPtr(), &fd );
+	if ( h == INVALID_HANDLE_VALUE )
+		return false;
+	FindClose( h );
+	return true;
+}
+
 static bool UseKeyTrigger()
 {
 	const char* t = getenv( "VWX_TRIGGER" );
@@ -461,11 +764,29 @@ static bool ModalDialogOpen();
 
 static LRESULT CALLBACK BrokerWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+	if ( msg == kMsgDocOp ) {
+		gDocPosted = false;
+		// Never while the pump command runs (it may pump messages), never under
+		// a modal dialog. The request stays on disk; the next tick re-posts.
+		if ( gInDoMenu || gPumping || ModalDialogOpen() )
+			return 0;
+		gInDoMenu = true;                         // nothing else may start meanwhile
+		try {
+			HandleDocRequest();
+		}
+		catch ( ... ) {
+			LogLine( "document operation threw" );
+		}
+		gInDoMenu = false;
+		return 0;
+	}
 	if ( msg != kMsgRunPump )
 		return DefWindowProcW( wnd, msg, wp, lp );
 	gBrokerPosted = false;
 	if ( gInDoMenu || gPaused || ModalDialogOpen() || CountJobs( VwxPluginDir() ) <= 0 )
 		return 0;
+	if ( (LONG) (GetTickCount() - gDocSettleUntil) < 0 || DocRequestPending() )
+		return 0;                                 // document change first, then run jobs there
 	gInDoMenu = true;
 	short ret = 0;
 	try {
@@ -701,7 +1022,15 @@ static void CALLBACK PumpTimerProc(HWND, UINT, UINT_PTR, DWORD)
 		                          // so this need not run at tick resolution
 	}
 	gLastQueue = CountJobs( pluginDir );   // pickup path — must run every tick
-	if ( gLastQueue > 0 && !gPaused && !gPumping )
+
+	// v16 document operations (and the periodic docs.json refresh) go through
+	// the broker message as well — never executed from this WM_TIMER frame.
+	bool docReq = !gPaused && DocRequestPending();
+	if ( !gPaused && !gDocPosted && !gInDoMenu && EnsureBrokerWindow()
+	     && ( docReq || now - gLastDocsTick >= kDocsEveryMs ) )
+		gDocPosted = ::PostMessageW( gBrokerWnd, kMsgDocOp, 0, 0 ) != FALSE;
+
+	if ( gLastQueue > 0 && !gPaused && !gPumping && !docReq )
 		TriggerPump();
 
 	// Adaptive period: hot while there is work or shortly after, idle

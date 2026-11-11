@@ -923,32 +923,126 @@ def list_documents(ctx: Context) -> str:
     VectorScript cannot see past the active document — there is no
     GetDocumentCount and no NextDocument. This reads the window list of the
     Vectorworks process instead, so it works with several files open at once.
+    v16: answered from the native bridge's SDK list (full paths) when present.
     """
+    nd = _native_docs()
+    if nd is not None:
+        return json.dumps(nd, ensure_ascii=False, separators=(",", ":"))
     return cmd("list_documents")
 
 @vtool
-def switch_document(ctx: Context, name: str = None, hwnd: int = None) -> str:
+def switch_document(ctx: Context, name: str = None, path: str = None, ref: int = None) -> str:
     """Bring another open document to the front, by file name or window handle.
 
     With more than one agent, prefer use_document (or document= on vwx /
     execute_script): switching the front document here changes it for every
     agent that has not bound itself to a document.
 
-    QUEUED, NOT DONE: the switch takes effect after the call returns, so this
-    answer reports what was asked for, not what happened. Confirm with
-    confirm_active_document as the next call before writing anything — a
-    write in the wrong document is the expensive mistake here. Partial names
-    are accepted while unique; an ambiguous match (same base name, different
-    folder) is reported with candidate window handles instead of guessing.
+    v16: Vectorworks' own SwitchToOpenFile, run by the native bridge outside
+    any script; the answer names the document that is in front afterwards.
+    Partial names are accepted while unique; an ambiguous match (same base
+    name, different folder) is reported with candidates — call again with
+    path or ref from list_documents.
     """
+    if _native_docs() is not None:
+        # v16: done by the native bridge with Vectorworks' SwitchToOpenFile;
+        # the answer reports the real front document afterwards.
+        nd = _native_docs()
+        hits = [d for d in nd["dokumente"]
+                if (ref is not None and d.get("ref") == ref)
+                or (path and (d.get("pfad") or "").replace("\\", "/").lower()
+                    == path.replace("\\", "/").lower())
+                or (name and _doc_key(d.get("datei")) == _doc_key(name))]
+        if not hits and name:
+            hits = [d for d in nd["dokumente"] if (name or "").lower() in (d.get("datei") or "").lower()]
+        if len(hits) != 1:
+            return json.dumps({"error": "ambiguous" if hits else "not open",
+                               "kandidaten" if hits else "offen": hits or [d.get("datei") for d in nd["dokumente"]]},
+                              ensure_ascii=False)
+        res = _native_doc_op("switch", wait_s=60, ref=hits[0].get("ref"),
+                             path=hits[0].get("pfad") or None, name=hits[0].get("datei"))
+        if res.get("ok"):
+            return json.dumps({"status": "ok", "aktiv": (res.get("active") or {}).get("name"),
+                               "aktiv_pfad": (res.get("active") or {}).get("path"),
+                               "gewechselt": not res.get("already")}, ensure_ascii=False)
+        return json.dumps({"error": res.get("error"), "code": res.get("code") or "DOC_SWITCH_FAILED"},
+                          ensure_ascii=False)
     p = {}
     if name: p["name"] = name
-    if hwnd: p["hwnd"] = hwnd
+    if path: p["path"] = path
+    if ref is not None: p["ref"] = ref
     return cmd("switch_document", p)
 
 # ── v14 coordination: several agents in one Vectorworks ─────────────────────
 
+def _native_docs(max_age=30.0):
+    """v16: open documents straight from ipc/docs.json (native bridge, SDK
+    GetOpenFilesList) in list_documents shape — no VW round-trip. None when
+    the file is missing (older native bridge) or stale (palette off)."""
+    base = _plugin_dir()
+    if not base:
+        return None
+    try:
+        with open(os.path.join(base, "ipc", "docs.json"), encoding="utf-8") as fh:
+            d = json.load(fh)
+        if time.time() - float(d.get("ts", 0)) > max_age:
+            return None
+        docs = d.get("docs") or []
+    except Exception:
+        return None
+    aktiv = next((x for x in docs if x.get("active")), {}) or {}
+    return {"status": "ok", "quelle": "sdk", "aktiv": aktiv.get("name"),
+            "aktiv_pfad": aktiv.get("path"), "anzahl": len(docs),
+            "dokumente": [{"datei": x.get("name"), "pfad": x.get("path"), "ref": x.get("ref"),
+                           "aktiv": bool(x.get("active")), "ungespeichert": bool(x.get("unsaved"))}
+                          for x in docs]}
+
+
+def _native_doc_op(op, wait_s=30.0, **kw):
+    """Hand one document operation to the native bridge and wait for its answer.
+
+    The bridge runs it with Vectorworks' own calls (SwitchToOpenFile,
+    OpenOrActivateFile) from its broker message, outside any script."""
+    base = _plugin_dir()
+    if not base:
+        return {"error": "VW plugin dir not found"}
+    folder = os.path.join(base, "ipc", "doc")
+    os.makedirs(folder, exist_ok=True)
+    rid = "%017.6f-%s" % (time.time(), uuid.uuid4().hex[:6])
+    req = {"op": op}
+    req.update({k: v for k, v in kw.items() if v is not None})
+    tmp = os.path.join(folder, "tmp-" + rid)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(req, fh, ensure_ascii=False)
+    os.replace(tmp, os.path.join(folder, f"req-{rid}.json"))
+    res_path = os.path.join(folder, f"res-{rid}.json")
+    deadline = time.monotonic() + max(2.0, float(wait_s))
+    while time.monotonic() < deadline:
+        if os.path.exists(res_path):
+            try:
+                with open(res_path, encoding="utf-8") as fh:
+                    res = json.load(fh)
+                os.remove(res_path)
+                return res
+            except Exception:
+                pass
+        time.sleep(0.2)
+    req_path = os.path.join(folder, f"req-{rid}.json")
+    if os.path.exists(req_path):
+        try:
+            os.remove(req_path)        # never let a stale request fire later
+            return {"error": "native bridge did not pick up the request (palette closed, "
+                             "paused, or a dialog is open)", "code": "DOC_OP_UNCLAIMED"}
+        except Exception:
+            pass
+    return {"error": f"no answer within {wait_s:.0f}s (Vectorworks busy loading?)",
+            "code": "DOC_OP_TIMEOUT"}
+
+
 def _open_docs():
+    nd = _native_docs()
+    if nd is not None:
+        return nd, None
     try:
         r = get_vwx_connection().send_command("list_documents", {}, {"_free": 1, "_prio": 1})
     except Exception as e:
@@ -1109,8 +1203,24 @@ def open_document(ctx: Context, path: str, wait_s: float = 180) -> str:
         return json.dumps({"status": "ok", "document": os.path.basename(path),
                            "note": "already open"}, ensure_ascii=False)
     before = (docs or {}).get("aktiv")
+    before_path = (docs or {}).get("aktiv_pfad")
+    if _native_docs() is not None:
+        # v16: Vectorworks' own OpenOrActivateFile via the native bridge. It
+        # returns when VW has loaded the file (big plans: tens of seconds).
+        res = _native_doc_op("open", wait_s=wait_s, path=os.path.abspath(path))
+        if not res.get("ok"):
+            return json.dumps({"error": res.get("error") or "open failed",
+                               "code": res.get("code") or "DOC_OPEN_FAILED"}, ensure_ascii=False)
+        if before and _doc_key(before) != _doc_key(path):
+            back = _native_doc_op("switch", wait_s=30, path=before_path or None, name=before)
+            restored = before if back.get("ok") else None
+        else:
+            restored = None
+        _audit({"ts": round(time.time(), 3), "cmd": "open_document", "doc": path, "status": "ok"})
+        return json.dumps({"status": "ok", "document": os.path.basename(path),
+                           "front_restored_to": restored, "via": "sdk"}, ensure_ascii=False)
     try:
-        os.startfile(path)          # the shell hands it to the running VW instance
+        os.startfile(path)          # pre-v16 native bridge: the shell hands it to VW
     except Exception as e:
         return json.dumps({"error": f"could not hand the file to Windows: {e}"})
     deadline = time.monotonic() + max(5.0, float(wait_s))

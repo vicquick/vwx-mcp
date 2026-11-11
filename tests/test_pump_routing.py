@@ -5,7 +5,7 @@
 A fake `vs` module reports the "front" document; a fake commands.py records
 which document each job ran in and simulates switch_document as a POSTED
 message that only lands when the test calls tick() — exactly how the real
-WM_MDIACTIVATE behaves (the switch happens after the pump returns).
+native SwitchToOpenFile behaves (the switch happens after the pump returns).
 """
 import importlib, json, os, shutil, sys, tempfile, types
 
@@ -29,7 +29,8 @@ def close_document(p):
     return _rec("close_document", p)
 
 def switch_document(p):
-    name = (p.get("name") or "").lower()
+    # v16: the pump passes a full path for path targets (home), else a name
+    name = (p.get("name") or (p.get("path") or "").replace("\\", "/").rsplit("/", 1)[-1]).lower()
     if name not in [d.lower() for d in STATE["open"]]:
         return {"error": "Dieses Dokument ist nicht offen.", "offen": STATE["open"]}
     if STATE.get("ignore_switch"):

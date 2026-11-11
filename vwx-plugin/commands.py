@@ -412,8 +412,115 @@ def _grundname(s):
     return _entstern(s).strip().lower()
 
 
+# ── v16: documents through the native bridge (SDK), not window messages ──────
+#
+# Up to v15 switch_document posted WM_MDIACTIVATE (and close_document WM_CLOSE)
+# from inside this running script. With several large documents open that
+# froze Vectorworks for good (2026-10-22, main thread in a kernel wait). The
+# native palette now does it with Vectorworks' own calls
+# (ISDK::GetOpenFilesList / SwitchToOpenFile / CloseDocument,
+# IExtendedProps::OpenOrActivateFile) from its broker message — outside any
+# script. This side only reads ipc/docs.json and drops requests into ipc/doc/.
+# Without a v16 native bridge there is NO switching at all: the old path is
+# what hung Vectorworks, so it is not kept as a fallback.
+
+def _ipc_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ipc')
+
+
+def _native_docs(max_age=30.0):
+    """Open documents as reported by the native bridge, or None.
+
+    Each entry: {ref, path, name, active, unsaved}. None when docs.json is
+    missing (native bridge older than v16) or older than max_age seconds
+    (palette closed / paused)."""
+    pfad = os.path.join(_ipc_dir(), 'docs.json')
+    try:
+        with open(pfad, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    try:
+        import time as _t
+        if max_age is not None and _t.time() - float(d.get('ts', 0)) > max_age:
+            return None
+    except Exception:
+        return None
+    docs = d.get('docs')
+    return docs if isinstance(docs, list) else None
+
+
+def _doc_request(op, **kw):
+    """Queue a document operation for the native bridge. Returns its id."""
+    import time as _t, uuid
+    ordner = os.path.join(_ipc_dir(), 'doc')
+    os.makedirs(ordner, exist_ok=True)
+    rid = '%017.6f-%s' % (_t.time(), uuid.uuid4().hex[:6])
+    req = {'op': op}
+    req.update({k: v for k, v in kw.items() if v is not None})
+    tmp = os.path.join(ordner, 'tmp-' + rid)
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(req, f, ensure_ascii=False)
+    os.replace(tmp, os.path.join(ordner, 'req-%s.json' % rid))
+    return rid
+
+
+_KEIN_NATIVE = ('Dokumentwechsel braucht die native Bridge v16 (VwxBridge.vlb mit '
+                'docs.json). Der alte Weg per Fensternachricht hat Vectorworks '
+                'eingefroren und ist abgeschaltet. Bridge-Palette offen und nicht '
+                'pausiert? Sonst neue VwxBridge.vlb deployen.')
+
+
+def _doc_eintrag(d):
+    return {'datei': d.get('name') or os.path.basename(d.get('path') or ''),
+            'pfad': d.get('path') or '', 'ref': d.get('ref'),
+            'aktiv': bool(d.get('active')), 'ungespeichert': bool(d.get('unsaved'))}
+
+
+def _finde_doc(docs, p):
+    """(eintrag, fehler_dict) for params name | path | ref against native docs."""
+    if p.get('ref') is not None:
+        hit = [d for d in docs if d.get('ref') == int(p['ref'])]
+        if hit:
+            return hit[0], None
+        return None, {'error': 'Diese ref ist nicht (mehr) offen.',
+                      'offen': [_doc_eintrag(d) for d in docs]}
+    pfad = (p.get('path') or '').replace('\\', '/').strip().lower()
+    if pfad and '/' in pfad:
+        hit = [d for d in docs if (d.get('path') or '').replace('\\', '/').lower() == pfad]
+        if hit:
+            return hit[0], None
+    name = _grundname(p.get('name') or p.get('path') or '')
+    if not name:
+        return None, {'error': 'Bitte name, path oder ref angeben.',
+                      'offen': [_doc_eintrag(d) for d in docs]}
+    genau = [d for d in docs if _grundname(d.get('name')) == name]
+    if not genau:
+        genau = [d for d in docs if _namens_teiltreffer(name, _grundname(d.get('name')))]
+    if len(genau) > 1:
+        return None, {'error': 'Mehrdeutig: mehrere offene Dateien passen.',
+                      'kandidaten': [_doc_eintrag(d) for d in genau],
+                      'hinweis': 'Mit path (voller Pfad) oder ref erneut aufrufen.'}
+    if not genau:
+        return None, {'error': 'Dieses Dokument ist nicht offen.',
+                      'offen': [d.get('name') for d in docs]}
+    return genau[0], None
+
+
 def list_documents(p):
     """Every open Vectorworks document, and which one commands land in."""
+    docs = _native_docs()
+    if docs is not None:
+        aktiv = next((d for d in docs if d.get('active')), None)
+        return {'status': 'ok', 'quelle': 'sdk',
+                'aktiv': (aktiv or {}).get('name') or (_safe(vs.GetFName, '') or ''),
+                'aktiv_pfad': (aktiv or {}).get('path') or '',
+                'anzahl': len(docs), 'dokumente': [_doc_eintrag(d) for d in docs]}
+    return _list_documents_fenster(p)
+
+
+def _list_documents_fenster(p):
+    """Fallback without a v16 native bridge: read-only window enumeration."""
     aktiv = _safe(vs.GetFName, '') or ''
     fenster, _client, diagnose = _dokumentfenster()
     aktiv_hwnd = diagnose.get('aktiv_hwnd')
@@ -445,105 +552,31 @@ def list_documents(p):
 
 
 def switch_document(p):
-    """Bring another open document to the front. params: name | hwnd.
+    """Bring another open document to the front. params: name | path | ref.
 
-    The switch is queued, not done: it takes effect after this script
-    returns. Confirm with confirm_active_document (or get_document_info) as
-    the NEXT command — this one only reports what it asked for, never what
-    happened, because it posts WM_MDIACTIVATE rather than sending it (we run
-    on VW's main thread; a send would re-enter the UI mid-script).
+    Queued, not done: the native bridge switches with Vectorworks' own
+    SwitchToOpenFile after this script has returned. Confirm with
+    confirm_active_document (or get_document_info) as the NEXT command.
     """
-    teile = _win32()
-    if not teile:
-        return {'error': 'Dokumentwechsel gibt es nur unter Windows.'}
-    u, _pid, ctypes, _wt = teile
-
-    fenster, client, diagnose = _dokumentfenster()
-    if not fenster:
-        return {'error': 'Kein Dokumentfenster gefunden.', 'diagnose': diagnose}
-
-    ziel = None
-    if p.get('hwnd'):
-        gesucht = int(p['hwnd'])
-        ziel = next((f for f in fenster if f['hwnd'] == gesucht), None)
-        if not ziel:
-            return {'error': 'Dieses hwnd ist nicht (mehr) offen.',
-                    'offen': [{'hwnd': f['hwnd'], 'datei': f['datei']} for f in fenster]}
-    else:
-        name = _grundname(p.get('name', ''))
-        if not name:
-            return {'error': 'Bitte name oder hwnd angeben.',
-                    'offen': [f['datei'] for f in fenster if f['datei']]}
-
-        genau = [f for f in fenster if f['datei'] and _grundname(f['datei']) == name]
-        if len(genau) > 1:
-            # Gleicher Basisname, vermutlich verschiedene Ordner. Der
-            # Fenstertitel traegt keinen Pfad, und vs.GetFPathName() liefert
-            # nur den Pfad des AKTIVEN Dokuments — dieser Code kann von hier
-            # aus also grundsaetzlich nicht entscheiden, welches gemeint ist.
-            # Er gibt hwnds zurueck, damit gezielt per hwnd gewechselt (oder
-            # nacheinander gewechselt + mit confirm_active_document anhand
-            # des vollen Pfads geprueft) werden kann.
-            return {'error': 'Mehrdeutig: mehrere offene Dateien mit diesem '
-                              'Basisnamen (evtl. verschiedene Ordner).',
-                    'kandidaten': [{'hwnd': f['hwnd'], 'datei': f['datei'],
-                                     'titel': f['titel']} for f in genau],
-                    'hinweis': 'Mit hwnd erneut aufrufen, oder einzeln '
-                               'wechseln und mit confirm_active_document '
-                               '(expected=voller Pfad) pruefen.'}
-        ziel = genau[0] if genau else None
-
-        if not ziel:   # Teiltreffer, damit "Musterdatei" fuer 260717_Musterdatei.vwx reicht
-            treffer = [f for f in fenster
-                       if f['datei'] and _namens_teiltreffer(name, _grundname(f['datei']))]
-            if len(treffer) > 1:
-                return {'error': 'Mehrdeutig.',
-                        'kandidaten': [{'hwnd': f['hwnd'], 'datei': f['datei'],
-                                         'titel': f['titel']} for f in treffer],
-                        'hinweis': 'Mit hwnd erneut aufrufen.'}
-            ziel = treffer[0] if treffer else None
-
-    if not ziel:
-        unbenannt = [f for f in fenster if not f['datei']]
-        hinweis = None
-        if unbenannt:
-            hinweis = (f'{len(unbenannt)} Fenster ohne lesbaren Dateinamen '
-                       '(vermutlich maximiert, Titel mit Rahmenfenster '
-                       'verschmolzen) — per hwnd ansprechen, siehe "unbenannt".')
-        return {'error': 'Dieses Dokument ist nicht offen.',
-                'offen': [f['datei'] for f in fenster if f['datei']],
-                'unbenannt': [f['hwnd'] for f in unbenannt],
-                'hinweis': hinweis}
-
-    vorher = _safe(vs.GetFName, '') or ''
-    aktiv_hwnd = diagnose.get('aktiv_hwnd')
-    if aktiv_hwnd is not None:
-        # hwnd/Z-Order ist zuverlaessiger als der Namensvergleich, gerade
-        # weil zwei gleichnamige Dateien den Namensvergleich sonst fuer
-        # BEIDE Fenster faelschlich "bereits aktiv" melden koennten.
-        bereits_aktiv = (ziel['hwnd'] == aktiv_hwnd)
-    else:
-        bereits_aktiv = bool(ziel['datei']) and _grundname(ziel['datei']) == _grundname(vorher)
-
-    if bereits_aktiv:
-        return {'status': 'ok', 'aktiv': vorher, 'gewechselt': False,
+    if p.get('hwnd') and not (p.get('name') or p.get('path') or p.get('ref') is not None):
+        return {'error': 'hwnd wird nicht mehr unterstuetzt — name, path oder ref '
+                         'aus list_documents verwenden.'}
+    docs = _native_docs()
+    if docs is None:
+        return {'error': _KEIN_NATIVE, 'code': 'DOC_NATIVE_MISSING'}
+    ziel, fehler = _finde_doc(docs, p)
+    if fehler:
+        return fehler
+    if ziel.get('active'):
+        return {'status': 'ok', 'aktiv': ziel.get('name'), 'gewechselt': False,
                 'hinweis': 'Dieses Dokument ist bereits vorn.'}
-
-    WM_MDIACTIVATE = 0x0222
-    SW_RESTORE = 9
-    if client and ziel.get('quelle') in ('mdi', 'mdi-rahmen-titel'):
-        u.PostMessageW(client, WM_MDIACTIVATE, ziel['hwnd'], 0)
-    else:
-        if u.IsIconic(ziel['hwnd']):
-            u.ShowWindow(ziel['hwnd'], SW_RESTORE)
-        u.SetForegroundWindow(ziel['hwnd'])
-
-    return {'status': 'angestossen', 'ziel': ziel['datei'] or f"hwnd:{ziel['hwnd']}",
-            'ziel_hwnd': ziel['hwnd'], 'vorher': vorher,
-            'geraten': bool(ziel.get('geraten')),
+    vorher = _safe(vs.GetFName, '') or ''
+    rid = _doc_request('switch', ref=ziel.get('ref'), path=ziel.get('path') or None,
+                       name=ziel.get('name'))
+    return {'status': 'angestossen', 'ziel': ziel.get('name'), 'ziel_pfad': ziel.get('path'),
+            'ref': ziel.get('ref'), 'vorher': vorher, 'anfrage': rid,
             'hinweis': 'Der Wechsel greift, sobald dieses Skript zurueck ist. '
-                       'Mit confirm_active_document bestaetigen — diese '
-                       'Antwort belegt ihn nicht.'}
+                       'Mit confirm_active_document bestaetigen.'}
 
 
 def _hold(p):
@@ -580,14 +613,20 @@ def close_document(p):
         return {'error': 'save=False needs force=True: Vectorworks asks before '
                          'discarding changes, and that dialog blocks the bridge.',
                 'code': 'DOC_CLOSE_NEEDS_FORCE'}
-    teile = _win32()
-    if not teile:
-        return {'error': 'Schliessen gibt es nur unter Windows.'}
-    u, _pid, _ctypes, _wt = teile
-    fenster, _client, diagnose = _dokumentfenster()
-    aktiv_hwnd = diagnose.get('aktiv_hwnd')
-    if not aktiv_hwnd:
-        return {'error': 'aktives Dokumentfenster nicht gefunden', 'diagnose': diagnose}
+    if not save:
+        # The native close is Vectorworks' own CloseDocument: with unsaved
+        # changes it would ask, and that dialog would sit inside the bridge.
+        return {'error': 'Schliessen ohne Speichern macht die Bridge nicht — bitte '
+                         'von Hand schliessen (Vectorworks fragt nach).',
+                'code': 'DOC_CLOSE_NEEDS_USER'}
+    docs = _native_docs()
+    if docs is None:
+        return {'error': _KEIN_NATIVE, 'code': 'DOC_NATIVE_MISSING'}
+    aktiv = next((d for d in docs if d.get('active')), None)
+    if not aktiv or _grundname(aktiv.get('name')) != _grundname(name):
+        return {'error': 'Aktives Dokument laut Vectorworks (%s) passt nicht zu %s — nicht '
+                         'geschlossen.' % ((aktiv or {}).get('name'), name),
+                'code': 'DOC_CLOSE_MISMATCH'}
     if save:
         # NOT DoMenuTextByName('Save'): like every menu command it is queued
         # and runs after this script — i.e. after the WM_CLOSE below, so
@@ -602,11 +641,12 @@ def close_document(p):
             return {'error': 'SaveActiveDocument nicht ausfuehrbar — nicht geschlossen, '
                              'damit kein Sichern-Dialog die Bridge blockiert.',
                     'code': 'DOC_SAVE_FAILED'}
-    WM_CLOSE = 0x0010
-    u.PostMessageW(aktiv_hwnd, WM_CLOSE, 0, 0)
+    rid = _doc_request('close', ref=aktiv.get('ref'), path=aktiv.get('path') or None,
+                       name=aktiv.get('name'))
     return {'status': 'angestossen', 'dokument': name, 'gespeichert': bool(save),
-            'hinweis': 'Das Fenster schliesst, sobald dieses Skript zurueck ist; '
-                       'list_documents bestaetigt es.'}
+            'anfrage': rid,
+            'hinweis': 'Die native Bridge schliesst das Dokument, sobald dieses Skript '
+                       'zurueck ist; list_documents bestaetigt es.'}
 
 
 # ── Layers ──────────────────────────────────────────────────────────────────
